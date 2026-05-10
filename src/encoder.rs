@@ -63,6 +63,7 @@ impl UsdzEncoder {
     pub fn encode_with_report(&self, scene: &Scene3D) -> Result<EncodeReport> {
         let usda = usda_writer::write_layer(scene);
         let assets = usda_writer::collect_texture_assets(scene);
+        let audio_assets = usda_writer::collect_audio_assets(scene);
 
         let mut writer = Writer::new();
         // Default Layer must be the first archive entry per the
@@ -83,12 +84,28 @@ impl UsdzEncoder {
             texture_names.push(asset.name.clone());
         }
 
+        let mut pass_through_audio = 0usize;
+        let mut reencoded_audio = 0usize;
+        let mut audio_names = Vec::with_capacity(audio_assets.len());
+        for asset in &audio_assets {
+            writer.add_stored(&asset.name, &asset.bytes);
+            if asset.from_pass_through {
+                pass_through_audio += 1;
+            } else {
+                reencoded_audio += 1;
+            }
+            audio_names.push(asset.name.clone());
+        }
+
         Ok(EncodeReport {
             bytes: writer.finish(),
             usda,
             texture_names,
             pass_through_textures,
             reencoded_textures,
+            audio_names,
+            pass_through_audio,
+            reencoded_audio,
         })
     }
 }
@@ -119,6 +136,17 @@ pub struct EncodeReport {
     /// streaming `open()` fallback (no scheme match, or non-USDZ
     /// source).
     pub reencoded_textures: usize,
+    /// Inner-file names emitted into the archive for audio
+    /// sources, in the order they were embedded. Mirrors
+    /// [`Self::texture_names`] for the [`AudioSource`](oxideav_mesh3d::AudioSource)
+    /// pipeline added in round 4.
+    pub audio_names: Vec<String>,
+    /// Count of audio sources whose bytes were copied verbatim
+    /// from `AssetSource::raw_storage(scheme = "zip-stored")`.
+    pub pass_through_audio: usize,
+    /// Count of audio sources whose bytes were materialised via
+    /// the streaming `open()` fallback.
+    pub reencoded_audio: usize,
 }
 
 #[cfg(test)]

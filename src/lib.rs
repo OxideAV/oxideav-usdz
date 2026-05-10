@@ -44,13 +44,29 @@
 //!   into the output archive. USDZ → USDZ pipelines never re-encode
 //!   textures.
 //!
-//! Deferred to round 3+:
+//! Round 4 adds the **`UsdMediaSpatialAudio` reader + writer**:
+//!
+//! * `def SpatialAudio "<name>" { uniform asset filePath = @sound.wav@;
+//!   uniform token auralMode = "spatial"; uniform double gain = ...; ... }`
+//!   prims decode into `Node::audio_emitter`, populating an
+//!   [`AudioEmitter`](oxideav_mesh3d::AudioEmitter) +
+//!   [`AudioSource`](oxideav_mesh3d::AudioSource) on the scene.
+//!   In-archive `filePath` references resolve through
+//!   [`ZipStoredAsset`](crate::ZipStoredAsset) so the writer's
+//!   pass-through optimisation extends to audio bytes; external
+//!   paths land in
+//!   [`AudioData::External`](oxideav_mesh3d::AudioData::External).
+//! * The encoder serialises every `Node` carrying `audio_emitter`
+//!   back into a `def SpatialAudio` block, embedding the audio
+//!   asset bytes alongside textures into the output ZIP.
+//!
+//! Deferred to round 5+:
 //!
 //! * Binary `.usdc` "Crate" parser — Pixar publishes no prose spec
 //!   for the wire format; loading a `.usdc` Default Layer in r1
 //!   surfaces as `Error::Unsupported`.
 //! * `UsdSkelSkeleton` + `UsdSkelBindingAPI` skinning.
-//! * `UsdMediaSpatialAudio` → `AudioSource` + `AudioEmitter`.
+//! * Strips / fans / lines mesh tessellation in the writer.
 //! * `UsdGeomSubset` per-face material binding subsets.
 //! * Composition arcs (sub-layers, references, payloads) that pull
 //!   in external USD files; r1 handles a single self-contained USD

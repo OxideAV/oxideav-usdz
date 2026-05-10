@@ -30,8 +30,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use oxideav_mesh3d::{
-    AssetSource, Axis, ImageData, Indices, Material, Mesh, Node, Primitive, Scene3D, Texture,
-    TextureRef, Topology, Transform, Unit,
+    AssetSource, AudioData, AudioEmitter, AudioSource, AudioSourceId, AuralMode, Axis, ImageData,
+    Indices, Material, Mesh, Node, Primitive, Scene3D, SpatialAudio, Texture, TextureRef, Topology,
+    Transform, Unit,
 };
 
 use crate::asset_source::{mime_from_filename, ZipStoredAsset};
@@ -166,6 +167,22 @@ fn build_node(ctx: &mut Ctx, parent: &str, prim: &Prim) -> Result<Option<oxideav
     let path = join_path(parent, &prim.name);
     match prim.type_name.as_str() {
         "Material" | "Shader" => Ok(None),
+        "SpatialAudio" => {
+            let (source, emitter) = build_audio_emitter(ctx, &path, prim)?;
+            let source_id = ctx.scene.add_audio_source(source);
+            let emitter_with_src = AudioEmitter {
+                source: source_id,
+                ..emitter
+            };
+            let emitter_id = ctx.scene.add_audio_emitter(emitter_with_src);
+            let mut node = Node::new()
+                .with_name(prim.name.clone())
+                .with_audio_emitter(emitter_id);
+            node.transform = read_node_transform(prim);
+            stash_extras(&mut node.extras, prim);
+            let id = ctx.scene.add_node(node);
+            Ok(Some(id))
+        }
         "Xform" | "Scope" | "" => {
             let mut node = Node::new().with_name(prim.name.clone());
             node.transform = read_node_transform(prim);
@@ -279,6 +296,164 @@ fn build_mesh_group(
     node.transform = read_node_transform(head);
     stash_extras(&mut node.extras, head);
     Ok(ctx.scene.add_node(node))
+}
+
+/// Build an [`AudioSource`] + [`AudioEmitter`] pair from a
+/// `def SpatialAudio` prim per USD's `UsdMediaSpatialAudio` schema.
+///
+/// Field mapping (clean-room — built from the round-4 dispatch
+/// brief's prose, no USD library code consulted):
+///
+/// * `uniform asset filePath = @path@` — the audio asset reference.
+///   When `@path@` resolves against an inner ZIP entry the
+///   [`AudioSource::data`] becomes
+///   [`AudioData::Source`](`oxideav_mesh3d::AudioData::Source`)
+///   wrapping a [`ZipStoredAsset`] (so the writer's USDZ → USDZ
+///   pass-through fires for audio just like it does for textures).
+///   When the path is external (no ZIP match) the source becomes
+///   [`AudioData::External`](`oxideav_mesh3d::AudioData::External`)
+///   carrying the raw URI for downstream resolution.
+/// * `uniform token auralMode` — `"spatial"` →
+///   [`AuralMode::SpatialNonAcoustic`] (USD's positional default —
+///   panning + distance attenuation), `"nonSpatial"` →
+///   [`AuralMode::SpatialAcoustic`]. The original token is also
+///   stashed into `emitter.extras["usd:auralMode"]` so the writer
+///   can round-trip the exact spelling.
+/// * `uniform double gain` — clamped into
+///   [`AudioEmitter::gain`].
+/// * `uniform double startTime` / `endTime` / `mediaOffset` — held
+///   on the source's `extras` (`usd:startTime`, `usd:endTime`,
+///   `usd:mediaOffset`).
+/// * `uniform double fillBufferTime` — held on the emitter's
+///   `extras` (`usd:fillBufferTime`).
+///
+/// The emitter returned has a sentinel
+/// [`AudioSource`](oxideav_mesh3d::AudioSource) id of `0`; the
+/// caller registers the source with the scene and replaces the id
+/// before pushing the emitter — this keeps `build_audio_emitter`
+/// pure (no `Scene3D` mutation) so test cases can reuse the helper.
+fn build_audio_emitter(ctx: &Ctx, path: &str, prim: &Prim) -> Result<(AudioSource, AudioEmitter)> {
+    // filePath — required per the USD schema; without it the prim
+    // is malformed and we don't have anything to play.
+    let file_attr = prim
+        .attrs
+        .get("filePath")
+        .ok_or_else(|| invalid(format!("SpatialAudio `{path}` missing `filePath`")))?;
+    let asset_path = match &file_attr.value {
+        Value::Asset(s) => s.as_str(),
+        // Tolerate quoted-string spellings (rare but legal in USD
+        // because the type system also accepts `string`).
+        Value::String(s) => s.as_str(),
+        _ => {
+            return Err(invalid(format!(
+                "SpatialAudio `{path}` `filePath` must be an asset reference (`@...@`)"
+            )))
+        }
+    };
+
+    let mut source = if let Some(entry) = lookup_zip_entry(&ctx.entries, asset_path) {
+        // In-archive — wrap in ZipStoredAsset so the writer's
+        // pass-through optimisation fires.
+        let mime = mime_from_filename(&entry.name);
+        let asset = ZipStoredAsset::new(
+            ctx.archive.clone(),
+            entry.payload_offset,
+            entry.payload_len,
+            mime.clone(),
+        );
+        let arc: Arc<dyn AssetSource> = Arc::new(asset);
+        AudioSource {
+            name: Some(prim.name.clone()),
+            data: AudioData::Source(arc),
+            extras: HashMap::new(),
+        }
+    } else {
+        // External (or unresolved) — keep the URI so the consumer
+        // can fetch lazily.
+        AudioSource {
+            name: Some(prim.name.clone()),
+            data: AudioData::External {
+                uri: asset_path.to_string(),
+                mime: mime_from_filename(asset_path),
+            },
+            extras: HashMap::new(),
+        }
+    };
+
+    // auralMode — token; USD defaults to "spatial". Map both
+    // documented tokens, otherwise fall back to the "spatial"
+    // semantics.
+    let aural_token = prim
+        .attrs
+        .get("auralMode")
+        .and_then(|a| match &a.value {
+            Value::Token(s) | Value::String(s) => Some(s.clone()),
+            // The schema's listed type is `uniform token[]`; tolerate
+            // an array of one token.
+            Value::Array(items) => items.first().and_then(|v| match v {
+                Value::Token(s) | Value::String(s) => Some(s.clone()),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .unwrap_or_else(|| "spatial".to_string());
+    let aural_mode = aural_mode_from_token(&aural_token);
+
+    // gain — defaults to 1.0 per the schema.
+    let gain = prim
+        .attrs
+        .get("gain")
+        .and_then(|a| a.value.as_f32())
+        .unwrap_or(1.0);
+
+    // Per-source playback knobs go on AudioSource.extras so the
+    // writer can round-trip them.
+    for (key, dst_key) in [
+        ("startTime", "usd:startTime"),
+        ("endTime", "usd:endTime"),
+        ("mediaOffset", "usd:mediaOffset"),
+    ] {
+        if let Some(v) = prim.attrs.get(key).and_then(|a| value_to_json(&a.value)) {
+            source.extras.insert(dst_key.into(), v);
+        }
+    }
+
+    let mut emitter = AudioEmitter::new(AudioSourceId(0)).with_name(prim.name.clone());
+    emitter.gain = gain;
+    emitter.spatial = Some(SpatialAudio {
+        aural_mode,
+        ..SpatialAudio::default()
+    });
+    emitter.extras.insert(
+        "usd:auralMode".into(),
+        serde_json::Value::String(aural_token),
+    );
+
+    if let Some(v) = prim
+        .attrs
+        .get("fillBufferTime")
+        .and_then(|a| value_to_json(&a.value))
+    {
+        emitter.extras.insert("usd:fillBufferTime".into(), v);
+    }
+
+    Ok((source, emitter))
+}
+
+/// USD `auralMode` token → [`AuralMode`]. `"spatial"` is the
+/// schema default ("the audio source plays spatially in the
+/// scene"); `"nonSpatial"` requests global / non-positional
+/// playback. We map both into [`AuralMode`] variants so callers
+/// don't lose information; the original spelling is preserved in
+/// `emitter.extras["usd:auralMode"]` for byte-faithful round-trip.
+fn aural_mode_from_token(token: &str) -> AuralMode {
+    match token {
+        "spatial" => AuralMode::SpatialNonAcoustic,
+        "nonSpatial" => AuralMode::SpatialAcoustic,
+        // Forward-compatible default — unknown tokens keep the
+        // panning+distance behaviour the schema documents.
+        _ => AuralMode::SpatialNonAcoustic,
+    }
 }
 
 /// Reconstruct a [`Transform`] from the UsdGeomXformable opinion
@@ -804,6 +979,24 @@ mod tests {
         assert_eq!(mesh_name_stem("Body_1"), "Body");
         assert_eq!(mesh_name_stem("Body_12"), "Body");
         assert_eq!(mesh_name_stem("Body_123456"), "Body");
+    }
+
+    #[test]
+    fn aural_mode_token_round_trip() {
+        assert_eq!(
+            aural_mode_from_token("spatial"),
+            AuralMode::SpatialNonAcoustic
+        );
+        assert_eq!(
+            aural_mode_from_token("nonSpatial"),
+            AuralMode::SpatialAcoustic
+        );
+        // Unknown tokens default to SpatialNonAcoustic — matches
+        // USD's documented default semantics for the field.
+        assert_eq!(
+            aural_mode_from_token("unknownToken"),
+            AuralMode::SpatialNonAcoustic
+        );
     }
 
     #[test]

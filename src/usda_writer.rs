@@ -17,8 +17,8 @@
 use std::fmt::Write;
 
 use oxideav_mesh3d::{
-    Axis, ImageData, Indices, Material, Mesh, MeshId, NodeId, Primitive, Scene3D, Texture,
-    TextureRef, Topology, Transform, Unit,
+    AudioData, AudioEmitter, AudioSource, AuralMode, Axis, ImageData, Indices, Material, Mesh,
+    MeshId, NodeId, Primitive, Scene3D, Texture, TextureRef, Topology, Transform, Unit,
 };
 
 /// Serialise `scene` to a UTF-8 USDA text layer.
@@ -120,6 +120,76 @@ pub fn collect_texture_assets(scene: &Scene3D) -> Vec<EmittedAsset> {
         });
     }
     out
+}
+
+/// Walk every audio source in `scene` and pull its bytes out via
+/// the [`AssetSource`](oxideav_mesh3d::AssetSource) trait. The
+/// `raw_storage(scheme = "zip-stored")` pass-through path fires for
+/// audio sources that came in from a sibling USDZ archive (i.e.
+/// the reader's [`ZipStoredAsset`](crate::ZipStoredAsset)) — bytes
+/// flow straight through with no intermediate buffer. Sources
+/// pointing at external URIs ([`AudioData::External`]) are skipped;
+/// the writer leaves the asset reference dangling, which is
+/// legal USD (the consumer resolves at load).
+pub fn collect_audio_assets(scene: &Scene3D) -> Vec<EmittedAsset> {
+    let mut out = Vec::with_capacity(scene.audio_sources.len());
+    for (i, src) in scene.audio_sources.iter().enumerate() {
+        let name = audio_filename(src, i);
+        let (bytes, from_pass_through) = match &src.data {
+            AudioData::Source(asset) => {
+                if let Some(raw) = asset.raw_storage() {
+                    if raw.scheme == "zip-stored" {
+                        (raw.bytes.to_vec(), true)
+                    } else {
+                        (read_via_open(asset.as_ref()), false)
+                    }
+                } else {
+                    (read_via_open(asset.as_ref()), false)
+                }
+            }
+            AudioData::External { .. } => continue,
+            #[cfg(feature = "registry")]
+            AudioData::Embedded(_) => continue,
+        };
+        out.push(EmittedAsset {
+            name,
+            bytes,
+            from_pass_through,
+        });
+    }
+    out
+}
+
+/// Per-source filename used both for the USDA `filePath = @name@`
+/// reference and the inner-archive entry name. Mirrors
+/// [`texture_filename`] so the two collection paths stay
+/// symmetric.
+fn audio_filename(src: &AudioSource, idx: usize) -> String {
+    let stem = src
+        .name
+        .as_deref()
+        .map(sanitize_filename)
+        .unwrap_or_else(|| format!("audio_{idx}"));
+    let ext = match &src.data {
+        AudioData::Source(asset) => audio_mime_to_ext(asset.mime()),
+        AudioData::External { mime, .. } => audio_mime_to_ext(mime.as_deref()),
+        #[cfg(feature = "registry")]
+        AudioData::Embedded(_) => "wav".to_owned(),
+    };
+    format!("{stem}.{ext}")
+}
+
+fn audio_mime_to_ext(mime: Option<&str>) -> String {
+    match mime {
+        Some("audio/wav") | Some("audio/x-wav") => "wav",
+        Some("audio/mpeg") => "mp3",
+        Some("audio/mp4") => "m4a",
+        Some("audio/ogg") => "ogg",
+        Some("audio/flac") => "flac",
+        Some("audio/aac") => "aac",
+        _ => "wav",
+    }
+    .to_owned()
 }
 
 fn read_via_open(asset: &dyn oxideav_mesh3d::AssetSource) -> Vec<u8> {
@@ -255,6 +325,19 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
     if let Some(mesh_id) = node.mesh {
         if let Some(mesh) = scene.mesh(mesh_id) {
             write_mesh(w, scene, mesh, mesh_id, &path);
+        }
+    }
+
+    // Audio emitter attachment — emit a child `def SpatialAudio`
+    // per USD's `UsdMediaSpatialAudio` schema. The decoder side
+    // produces a sibling node carrying the emitter; on the writer
+    // side we nest it inside the parent Xform so the prim path
+    // matches the typical USDZ authoring tool's output.
+    if let Some(emitter_id) = node.audio_emitter {
+        if let Some(emitter) = scene.audio_emitter(emitter_id) {
+            if let Some(source) = scene.audio_source(emitter.source) {
+                write_spatial_audio(w, emitter, source);
+            }
         }
     }
 
@@ -435,6 +518,110 @@ fn write_one_mesh_prim(w: &mut Out, scene: &Scene3D, prim: &Primitive, prim_name
     w.indent -= 1;
     w.write_indent();
     writeln!(w.s, "}}").unwrap();
+}
+
+/// Emit a `def SpatialAudio "<name>" { ... }` block carrying one
+/// USD `UsdMediaSpatialAudio` prim for `emitter` referencing
+/// `source`.
+///
+/// Output covers the schema fields the round-4 reader picks up
+/// (`filePath`, `auralMode`, `gain`, `startTime`, `endTime`,
+/// `mediaOffset`, `fillBufferTime`). The `auralMode` token comes
+/// from `emitter.extras["usd:auralMode"]` when present (so the
+/// exact spelling round-trips), else falls back to the USD default
+/// `"spatial"`. Asset-source paths come from `audio_filename`
+/// when the source is in-archive
+/// ([`AudioData::Source`](oxideav_mesh3d::AudioData::Source)) or the
+/// raw URI when it's external
+/// ([`AudioData::External`](oxideav_mesh3d::AudioData::External)).
+fn write_spatial_audio(w: &mut Out, emitter: &AudioEmitter, source: &AudioSource) {
+    let raw_name = emitter
+        .name
+        .clone()
+        .or_else(|| source.name.clone())
+        .unwrap_or_else(|| format!("audio_{}", emitter.source.0));
+    let safe_name = sanitize_prim_name(&raw_name);
+
+    w.write_indent();
+    writeln!(w.s, "def SpatialAudio \"{safe_name}\" {{").unwrap();
+    w.indent += 1;
+
+    // filePath — in-archive sources use the per-source filename
+    // (matches the entry the encoder writes via
+    // `collect_audio_assets`); external URIs pass through verbatim.
+    let file_ref = match &source.data {
+        AudioData::Source(_) => audio_filename(source, emitter.source.0 as usize),
+        AudioData::External { uri, .. } => uri.clone(),
+        #[cfg(feature = "registry")]
+        AudioData::Embedded(_) => audio_filename(source, emitter.source.0 as usize),
+    };
+    w.write_indent();
+    writeln!(w.s, "uniform asset filePath = @{file_ref}@").unwrap();
+
+    // auralMode — prefer the round-trip token from extras when
+    // present (preserves the input file's exact spelling); fall
+    // back to mapping the typed `aural_mode` enum.
+    let aural_token = emitter
+        .extras
+        .get("usd:auralMode")
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_else(|| {
+            let mode = emitter
+                .spatial
+                .as_ref()
+                .map(|s| s.aural_mode)
+                .unwrap_or(AuralMode::SpatialNonAcoustic);
+            aural_mode_to_token(mode).to_string()
+        });
+    w.write_indent();
+    writeln!(w.s, "uniform token auralMode = \"{aural_token}\"").unwrap();
+
+    // gain — USD's schema default is 1.0 (and that's also our typed
+    // default), but we emit the value unconditionally so the
+    // round-trip is value-faithful even when a downstream tool
+    // tweaks it.
+    w.write_indent();
+    writeln!(
+        w.s,
+        "uniform double gain = {}",
+        format_float(emitter.gain as f64)
+    )
+    .unwrap();
+
+    // Per-source extras land back as their original USD attributes.
+    for (extra_key, attr_key) in [
+        ("usd:startTime", "startTime"),
+        ("usd:endTime", "endTime"),
+        ("usd:mediaOffset", "mediaOffset"),
+    ] {
+        if let Some(v) = source.extras.get(extra_key) {
+            if let Some(num) = v.as_f64() {
+                w.write_indent();
+                writeln!(w.s, "uniform double {attr_key} = {}", format_float(num)).unwrap();
+            }
+        }
+    }
+
+    if let Some(v) = emitter.extras.get("usd:fillBufferTime") {
+        if let Some(num) = v.as_f64() {
+            w.write_indent();
+            writeln!(w.s, "uniform double fillBufferTime = {}", format_float(num)).unwrap();
+        }
+    }
+
+    w.indent -= 1;
+    w.write_indent();
+    writeln!(w.s, "}}").unwrap();
+}
+
+/// Inverse of `aural_mode_from_token` in `usd_to_scene` — used as a
+/// fallback when the round-trip token isn't preserved in
+/// `emitter.extras`.
+fn aural_mode_to_token(m: AuralMode) -> &'static str {
+    match m {
+        AuralMode::SpatialNonAcoustic => "spatial",
+        AuralMode::SpatialAcoustic => "nonSpatial",
+    }
 }
 
 fn write_triangle_mesh(w: &mut Out, prim: &Primitive) {
@@ -784,6 +971,30 @@ mod tests {
         assert!(w.s.contains("xformOp:orient = (1, 0, 0, 0)"));
         assert!(w.s.contains("xformOp:scale = (1, 1, 1)"));
         assert!(w.s.contains("xformOpOrder = ["));
+    }
+
+    #[test]
+    fn aural_mode_token_mapping() {
+        assert_eq!(
+            aural_mode_to_token(AuralMode::SpatialNonAcoustic),
+            "spatial"
+        );
+        assert_eq!(
+            aural_mode_to_token(AuralMode::SpatialAcoustic),
+            "nonSpatial"
+        );
+    }
+
+    #[test]
+    fn audio_filename_uses_source_name_and_mime() {
+        use oxideav_mesh3d::AudioSource;
+        let mut s = AudioSource::from_uri("ignored").with_name("Bg Music");
+        // External-URI source with no MIME → defaults to .wav.
+        if let AudioData::External { mime, .. } = &mut s.data {
+            *mime = Some("audio/mpeg".into());
+        }
+        let name = audio_filename(&s, 7);
+        assert_eq!(name, "Bg_Music.mp3");
     }
 
     #[test]

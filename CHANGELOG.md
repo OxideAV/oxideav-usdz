@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 4 (UsdMediaSpatialAudio reader + writer)
+
+- **`UsdMediaSpatialAudio` reader.** `def SpatialAudio "<name>" {
+  ... }` prims now decode into `Node::audio_emitter` referencing
+  an `AudioEmitter` + `AudioSource` registered in the scene's
+  audio arenas. `filePath = @path@` resolves against in-archive
+  ZIP entries (wrapped in `ZipStoredAsset` so the writer's
+  `raw_storage("zip-stored")` pass-through path applies to
+  audio just like it does to textures); external paths land in
+  `AudioData::External { uri }`. The `auralMode` token maps to
+  `AuralMode::SpatialNonAcoustic` (`"spatial"`, USD's positional
+  default) or `AuralMode::SpatialAcoustic` (`"nonSpatial"`); the
+  raw token is also stashed into
+  `emitter.extras["usd:auralMode"]` so the writer can preserve
+  the exact spelling on round-trip. `gain` lands on
+  `AudioEmitter::gain`; `startTime` / `endTime` / `mediaOffset`
+  ride along on `AudioSource::extras`; `fillBufferTime` on
+  `AudioEmitter::extras`.
+- **`UsdMediaSpatialAudio` writer.** Each `Node` carrying
+  `audio_emitter` emits a `def SpatialAudio` block inside its
+  parent `Xform`. The new
+  `usda_writer::collect_audio_assets()` mirrors
+  `collect_texture_assets()`: `AudioSource`s with
+  `raw_storage(scheme = "zip-stored")` flow into the output ZIP
+  byte-identical (the USDZ → USDZ pass-through optimisation
+  extended to audio); `AudioData::External` URIs round-trip the
+  raw `filePath` string but are NOT packed into the archive.
+  `EncodeReport` gains `audio_names` / `pass_through_audio` /
+  `reencoded_audio` mirroring the existing texture counters.
+
 ### Added — Round 3 (per-mesh transforms + multi-primitive)
 
 - **Multi-primitive Mesh emission + sibling-fold decode.** A

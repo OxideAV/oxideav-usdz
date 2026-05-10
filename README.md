@@ -68,6 +68,35 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   `UsdPreviewSurface` shader children + `UsdUVTexture` shader
   children for every bound texture map.
 
+## Round 4 scope (UsdMediaSpatialAudio)
+
+- **`UsdMediaSpatialAudio` reader.** `def SpatialAudio "<name>" {
+  uniform asset filePath = @sound.wav@; uniform token auralMode =
+  "spatial"; uniform double gain = ...; ... }` decodes into a
+  `Node::audio_emitter` referencing an `AudioEmitter` + `AudioSource`
+  in the scene's audio arenas. In-archive `filePath` references
+  resolve through `ZipStoredAsset` so the writer's pass-through
+  optimisation extends to audio just like it does for textures;
+  external paths land in `AudioData::External { uri }`.
+  `auralMode = "spatial"` maps to `AuralMode::SpatialNonAcoustic`
+  (USD's default — panning + distance attenuation), `"nonSpatial"`
+  to `AuralMode::SpatialAcoustic`. Supplementary fields
+  (`startTime`, `endTime`, `mediaOffset`, `fillBufferTime`) survive
+  on `AudioSource::extras` / `AudioEmitter::extras` for
+  byte-faithful round-trip; the original `auralMode` token spelling
+  is also preserved in `emitter.extras["usd:auralMode"]`.
+- **`UsdMediaSpatialAudio` writer.** Symmetric to the reader: each
+  `Node` carrying `audio_emitter` emits a `def SpatialAudio` block
+  inside the parent Xform. In-archive `AudioSource`s land at the
+  per-source filename (`{name}.{ext}` with the MIME-derived
+  extension) and the bytes are appended to the output ZIP via the
+  same STORED + 64-byte alignment path the texture writer uses;
+  `AudioSource::raw_storage(scheme = "zip-stored")` wins the
+  pass-through optimisation when the source originated from a
+  sibling USDZ archive. `EncodeReport` now carries
+  `audio_names` / `pass_through_audio` / `reencoded_audio`
+  counters mirroring the texture reporting.
+
 ## Round 3 scope (per-mesh transforms + multi-primitive)
 
 - **Per-node transform xformOp serialisation.** Both encoder and
@@ -86,7 +115,7 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   Hand-authored sibling Mesh prims whose names don't match
   the stem convention stay unaffected.
 
-## Deferred to round 4+
+## Deferred to round 5+
 
 - **Binary `.usdc` "Crate" parser.** Pixar publishes no prose
   spec for the wire format; loading a `.usdc` Default Layer
@@ -94,10 +123,8 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   re-package with `usdcat -o foo.usda`.
 - **`UsdSkelSkeleton` + `UsdSkelBindingAPI`** skeletal-animation
   skinning.
-- **`UsdMediaSpatialAudio`** → `AudioSource` + `AudioEmitter`
-  (writer side too — same `raw_storage("zip-stored")`
-  pass-through optimisation will apply to audio assets once the
-  reader plumbs them in).
+- **Strips / fans / lines mesh tessellation** in the writer
+  (currently skips non-`Triangles` primitives silently).
 - **`UsdGeomSubset`** per-face material-binding subsets.
 - **Composition arcs** — sub-layers, references, payloads that
   pull in external USD files. Round 1/2 read+write a single
