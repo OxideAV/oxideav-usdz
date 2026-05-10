@@ -100,6 +100,25 @@ pub enum Value {
     Asset(String),
     /// Prim/property path `</A/B/C.attr>`.
     Path(String),
+    /// Typed dictionary `{ TYPE NAME = VALUE; ... }`. Apple's
+    /// `usdzconvert` writes `customLayerData` and similar in this
+    /// shape. We parse-and-discard via empty map for round 1: the
+    /// decoder doesn't need the values, and storing every entry
+    /// would force a typed-value variant we can ignore. The
+    /// presence of the key is preserved (so a `customLayerData`
+    /// metadata entry round-trips as `Value::Dict`).
+    Dict(BTreeMap<String, Value>),
+    /// Composition arc target — an asset path with an optional
+    /// in-asset prim selector. Apple emits `references = @file@</Prim>`
+    /// or `payload = @file@</Prim>`. We capture both pieces so
+    /// future composition support has them; round 1 only needs
+    /// the parser to accept the syntax.
+    AssetWithPath {
+        /// `@...@` portion (empty for path-only refs).
+        asset: String,
+        /// `<...>` portion (empty when omitted).
+        prim_path: String,
+    },
     /// Anything we didn't recognise; preserved verbatim.
     Raw(String),
     /// Empty value — attribute declared but not assigned (`token
@@ -114,6 +133,7 @@ impl Value {
             Self::Token(s) | Self::String(s) | Self::Asset(s) | Self::Path(s) | Self::Raw(s) => {
                 Some(s.as_str())
             }
+            Self::AssetWithPath { asset, .. } => Some(asset.as_str()),
             _ => None,
         }
     }
@@ -603,10 +623,25 @@ fn parse_value(t: &mut Tokenizer<'_>) -> Result<Value> {
     };
     match c {
         '"' | '\'' => Ok(Value::String(read_quoted_string(t)?)),
-        '@' => Ok(Value::Asset(read_asset(t)?)),
+        '@' => {
+            // Asset path, possibly followed by a `</prim>` selector
+            // (composition arc: `references = @file@</Prim>` /
+            // `payload = @file@</Prim>`). When the selector is
+            // present we surface a richer `AssetWithPath` so the
+            // syntax round-trips losslessly; otherwise fall back to
+            // a plain `Asset`.
+            let asset = read_asset(t)?;
+            if t.peek_char() == Some('<') {
+                let prim_path = read_path(t)?;
+                Ok(Value::AssetWithPath { asset, prim_path })
+            } else {
+                Ok(Value::Asset(asset))
+            }
+        }
         '<' => Ok(Value::Path(read_path(t)?)),
         '(' => Ok(Value::Tuple(read_tuple(t)?)),
         '[' => Ok(Value::Array(read_array(t)?)),
+        '{' => Ok(Value::Dict(read_dict(t)?)),
         '+' | '-' => read_number(t),
         c if c.is_ascii_digit() => read_number(t),
         c if is_ident_start(c) => {
@@ -622,6 +657,68 @@ fn parse_value(t: &mut Tokenizer<'_>) -> Result<Value> {
             "unexpected character `{c}` at offset {} where value expected",
             t.pos
         ))),
+    }
+}
+
+/// Read a `{ TYPE NAME = VALUE ; ... }` typed-dictionary literal.
+///
+/// Apple's `usdzconvert` emits these in `customLayerData` /
+/// `customData` / similar metadata positions:
+///
+/// ```text
+/// customLayerData = {
+///     string apple_metadata = "value"
+///     dictionary nested = {
+///         int count = 3
+///     }
+///     double[3] vec = (0, 1, 2)
+/// }
+/// ```
+///
+/// Each entry has shape `<TYPENAME> <name> = <value>`, with the
+/// special case of `dictionary <name> = { ... }` for nested dicts.
+/// Entries are separated by whitespace (newlines or semicolons).
+///
+/// Round 1 strategy: parse-and-discard. We need to *consume* the
+/// dictionary so the parser advances past Apple's headers, but the
+/// decoder doesn't read the contents — `Scene3D` translation
+/// ignores layer-metadata entries other than `defaultPrim` /
+/// `upAxis` / `metersPerUnit`, which are never wrapped in dicts.
+/// Returning the parsed entries (rather than truly discarding) lets
+/// future rounds plug in custom-data extraction without re-tokenising.
+fn read_dict(t: &mut Tokenizer<'_>) -> Result<BTreeMap<String, Value>> {
+    if !t.eat('{') {
+        return Err(invalid("expected `{` to start dictionary"));
+    }
+    let mut out = BTreeMap::new();
+    loop {
+        t.skip_trivia();
+        if t.eat('}') {
+            return Ok(out);
+        }
+        if t.eof() {
+            return Err(invalid("EOF inside `{ ... }` dictionary"));
+        }
+        // Tolerate a stray `;` separator between entries.
+        if t.eat(';') {
+            continue;
+        }
+        // Each entry leads with a type token (`string`, `int`,
+        // `double[3]`, `dictionary`, `token[]`, ...). We reuse the
+        // existing type-then-name reader so all USD type-spelling
+        // quirks (`uniform`, `[]` array suffix, etc.) are handled
+        // uniformly.
+        let (_type_token, name) = read_type_then_name(t)?;
+        t.skip_trivia();
+        if t.eat('=') {
+            t.skip_trivia();
+            let value = parse_value(t)?;
+            out.insert(name, value);
+        } else {
+            // Bare entry without `=` — store as `Value::None` so
+            // the key still round-trips.
+            out.insert(name, Value::None);
+        }
     }
 }
 
@@ -770,10 +867,27 @@ fn read_type_then_name(t: &mut Tokenizer<'_>) -> Result<(String, String)> {
         // Not a modifier — this is the actual element type.
         let ty = read_ident(t)?;
         let mut full = ty;
+        // Type suffix: `[]` for arbitrary-length arrays, or `[N]`
+        // for fixed-arity vector types (`double[3]`, `int[2]`).
+        // Apple's `usdzconvert` writes `double[3]` in dict literals
+        // for vector metadata; the `N` is the arity, captured for
+        // round-tripping in the type-token string.
         if t.rest().starts_with("[]") {
             full.push_str("[]");
             t.advance();
             t.advance();
+        } else if t.peek_char() == Some('[') {
+            full.push('[');
+            t.advance();
+            while let Some(c) = t.peek_char() {
+                if c == ']' {
+                    full.push(']');
+                    t.advance();
+                    break;
+                }
+                full.push(c);
+                t.advance();
+            }
         }
         type_parts.push(full);
         break;

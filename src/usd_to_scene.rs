@@ -1229,6 +1229,19 @@ fn value_to_json(v: &Value) -> Option<serde_json::Value> {
         Value::Tuple(seq) | Value::Array(seq) => {
             J::Array(seq.iter().filter_map(value_to_json).collect())
         }
+        // Round 1 just preserves the *shape* of dictionaries — the
+        // contents flatten to a JSON object that mirrors the typed
+        // entries (recursively) so a future custom-data extractor
+        // can read them back.
+        Value::Dict(map) => J::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), value_to_json(v).unwrap_or(J::Null)))
+                .collect(),
+        ),
+        // `references = @file@</Prim>` — flatten to "asset</prim>"
+        // for the JSON view; consumers wanting the parts can walk
+        // the prim tree directly.
+        Value::AssetWithPath { asset, prim_path } => J::String(format!("{asset}<{prim_path}>")),
         Value::None => J::Null,
     })
 }

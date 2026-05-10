@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Apple oracle parser unblock (CI run 25631625721)
+
+- **Typed-dictionary value literals** (`Value::Dict`). The USDA
+  value parser now recognises `{ TYPE NAME = VALUE; ... }` blocks
+  in metadata position, which Apple's `usdzconvert` emits as
+  `customLayerData = { string apple_metadata = "..." }`. Each
+  entry's value is parsed recursively (so nested `dictionary X = {
+  ... }` works); the type token is consumed but discarded since
+  Round 1's Scene3D mapping doesn't act on layer-custom data.
+  Previously the parser failed with `unexpected character '{' at
+  offset 34 where value expected` on every Apple-emitted USDZ.
+- **Composition-arc target with prim selector** (`Value::AssetWithPath`).
+  Asset paths immediately followed by a `</Prim>` selector — the
+  shape Apple uses for `references = @file.usd@</Prim>` and
+  `payload = @file.usd@</Prim>` — now parse into a structured
+  variant rather than erroring on the unexpected `<` after the
+  closing `@`. Plain `@file@` references still parse as
+  `Value::Asset`.
+- **Sized vector type suffix** (`double[3]`, `int[2]`). The
+  attribute-prefix parser previously only recognised `[]` for
+  unbounded arrays; sized suffixes (used by Apple inside dict
+  literals for vector metadata) now parse as part of the type
+  token without erroring at the `[`.
+
+### Tests
+
+- `tests/apple_style_usda.rs` — 11-case regression suite mirroring
+  the smallest viable Apple-shaped USDA snippets: typed-dict
+  metadata, references with prim selectors, sub-layer arrays,
+  per-attribute `colorSpace` blocks, prim `kind`/`active`
+  metadata, `over`/`class` specs, Pixar's same-line-or-next-line
+  brace layout, triple-quoted `doc` metadata.
+- `tests/apple_oracle_local.rs` — opportunistic smoke test that
+  builds an Apple-style USDZ via the system `usdcat` + Pixar's
+  `pxr.UsdUtils.CreateNewUsdzPackage`, then decodes it through
+  our `UsdzDecoder`. Skips with an `eprintln!` notice when either
+  binary is absent (per workspace rule "no `#[ignore]`").
+
 ### Added — Round 5 (topology dispatch + no_fold + per-Mesh transform)
 
 - **Strips / fans / lines / points dispatch in the writer.** Non-
