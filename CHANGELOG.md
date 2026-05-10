@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.1](https://github.com/OxideAV/oxideav-usdz/compare/v0.0.0...v0.0.1) - 2026-05-10
+
+### Other
+
+- Round 6: variantSet structured parsing + line/column errors
+- USDA parser: accept Apple-emitted layer-metadata syntax
+- Round 5: topology dispatch + no_fold flag + per-Mesh transform
+- Round 4: UsdMediaSpatialAudio reader + writer
+- Round 3: multi-primitive Mesh emission + sibling-fold decode
+- Round 3: per-node transform xformOp serialisation
+- Round 2: USDZ encoder + USDZ → USDZ pass-through optimisation
+
 ### Added — Round 6 (variantSet parsing + line/column errors)
 
 - **VariantSet structured parser.** `variantSet "name" = {
