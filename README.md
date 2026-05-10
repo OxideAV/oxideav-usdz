@@ -68,7 +68,17 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   `UsdPreviewSurface` shader children + `UsdUVTexture` shader
   children for every bound texture map.
 
-## Deferred to round 3+
+## Round 3 scope (per-mesh transforms + multi-primitive)
+
+- **Per-node transform xformOp serialisation.** Both encoder and
+  decoder round-trip `Node::transform` through the
+  `UsdGeomXformable` opinion schema:
+  `Transform::Trs` → `xformOp:translate` + `xformOp:orient`
+  (quatf, USD's wxyz layout) + `xformOp:scale`;
+  `Transform::Matrix(m)` → `xformOp:transform` (matrix4d);
+  identity emits no opinions.
+
+## Deferred to round 4+
 
 - **Binary `.usdc` "Crate" parser.** Pixar publishes no prose
   spec for the wire format; loading a `.usdc` Default Layer
@@ -84,9 +94,6 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
 - **Composition arcs** — sub-layers, references, payloads that
   pull in external USD files. Round 1/2 read+write a single
   self-contained USD layer per archive only.
-- **Per-mesh transforms.** The writer currently emits identity
-  transforms only; round 3 will serialise `Transform::Trs` and
-  `Transform::Matrix` as USD `xformOp:transform` opinions.
 
 ## Standalone build
 

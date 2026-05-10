@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use oxideav_mesh3d::{
     AssetSource, Axis, ImageData, Indices, Material, Mesh, Node, Primitive, Scene3D, Texture,
-    TextureRef, Topology, Unit,
+    TextureRef, Topology, Transform, Unit,
 };
 
 use crate::asset_source::{mime_from_filename, ZipStoredAsset};
@@ -155,6 +155,7 @@ fn build_node(ctx: &mut Ctx, parent: &str, prim: &Prim) -> Result<Option<oxideav
         "Material" | "Shader" => Ok(None),
         "Xform" | "Scope" | "" => {
             let mut node = Node::new().with_name(prim.name.clone());
+            node.transform = read_node_transform(prim);
             // Recurse children — collect the scene-graph children
             // first, push attribute extras after.
             let mut child_ids = Vec::new();
@@ -172,6 +173,7 @@ fn build_node(ctx: &mut Ctx, parent: &str, prim: &Prim) -> Result<Option<oxideav
             let mesh = build_mesh(ctx, &path, prim)?;
             let mesh_id = ctx.scene.add_mesh(mesh);
             let mut node = Node::new().with_name(prim.name.clone()).with_mesh(mesh_id);
+            node.transform = read_node_transform(prim);
             stash_extras(&mut node.extras, prim);
             let id = ctx.scene.add_node(node);
             Ok(Some(id))
@@ -188,6 +190,93 @@ fn build_node(ctx: &mut Ctx, parent: &str, prim: &Prim) -> Result<Option<oxideav
             Ok(Some(id))
         }
     }
+}
+
+/// Reconstruct a [`Transform`] from the UsdGeomXformable opinion
+/// schema living on `prim`'s attributes.
+///
+/// Supported opinion sets (driven by `xformOpOrder`):
+///
+/// * `["xformOp:translate", "xformOp:orient", "xformOp:scale"]` →
+///   [`Transform::Trs`]. Any of the three can be absent — missing
+///   slots fall back to identity (`(0,0,0)` translation, identity
+///   quaternion, `(1,1,1)` scale).
+/// * `["xformOp:transform"]` → [`Transform::Matrix`].
+///
+/// `quatf xformOp:orient` is laid out `(w, x, y, z)` per USD; we
+/// reorder into our internal xyzw form.
+///
+/// Anything we don't recognise (Euler triple, scale-only, mixed
+/// orderings) collapses to [`Transform::identity`] — round-trip
+/// fidelity stops there but we never produce a malformed
+/// transform for content the writer never emits anyway.
+fn read_node_transform(prim: &Prim) -> Transform {
+    // No opinions ⇒ identity. Common case for the unxformed Xforms
+    // r1's writer used to emit.
+    let order_attr = prim.attrs.get("xformOpOrder");
+    let Some(order) = order_attr.and_then(|a| a.value.as_seq()) else {
+        return Transform::identity();
+    };
+    let order: Vec<&str> = order.iter().filter_map(|v| v.as_text()).collect();
+    if order.is_empty() {
+        return Transform::identity();
+    }
+
+    if order.len() == 1 && order[0] == "xformOp:transform" {
+        if let Some(m) = prim
+            .attrs
+            .get("xformOp:transform")
+            .and_then(|a| read_matrix4(&a.value))
+        {
+            return Transform::Matrix(m);
+        }
+        return Transform::identity();
+    }
+
+    // TRS-style — accept any subset of `translate` / `orient` /
+    // `scale` so long as the listed ops are exactly those tokens.
+    let recognised = order
+        .iter()
+        .all(|t| matches!(*t, "xformOp:translate" | "xformOp:orient" | "xformOp:scale"));
+    if !recognised {
+        return Transform::identity();
+    }
+
+    let translation = prim
+        .attrs
+        .get("xformOp:translate")
+        .and_then(|a| a.value.as_floatn::<3>())
+        .unwrap_or([0.0; 3]);
+    let rotation = prim
+        .attrs
+        .get("xformOp:orient")
+        .and_then(|a| a.value.as_floatn::<4>())
+        .map(|wxyz| [wxyz[1], wxyz[2], wxyz[3], wxyz[0]])
+        .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+    let scale = prim
+        .attrs
+        .get("xformOp:scale")
+        .and_then(|a| a.value.as_floatn::<3>())
+        .unwrap_or([1.0, 1.0, 1.0]);
+    Transform::Trs {
+        translation,
+        rotation,
+        scale,
+    }
+}
+
+/// Read a `matrix4d` literal — a tuple of 4 row tuples, each with
+/// 4 floats. Returns `None` if the shape doesn't match.
+fn read_matrix4(v: &Value) -> Option<[[f32; 4]; 4]> {
+    let rows = v.as_seq()?;
+    if rows.len() != 4 {
+        return None;
+    }
+    let mut out = [[0f32; 4]; 4];
+    for (i, row) in rows.iter().enumerate() {
+        out[i] = row.as_floatn::<4>()?;
+    }
+    Some(out)
 }
 
 fn stash_extras(extras: &mut HashMap<String, serde_json::Value>, prim: &Prim) {

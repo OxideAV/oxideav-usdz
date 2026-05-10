@@ -18,7 +18,7 @@ use std::fmt::Write;
 
 use oxideav_mesh3d::{
     Axis, ImageData, Indices, Material, Mesh, MeshId, NodeId, Primitive, Scene3D, Texture,
-    TextureRef, Topology, Unit,
+    TextureRef, Topology, Transform, Unit,
 };
 
 /// Serialise `scene` to a UTF-8 USDA text layer.
@@ -243,6 +243,13 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
     writeln!(w.s, "def Xform \"{safe_name}\" {{").unwrap();
     w.indent += 1;
 
+    // Per-node transform → `xformOp:*` opinions. Identity TRS
+    // collapses to nothing (cleaner output + matches what the r1/r2
+    // reader produces for unxformed prims). Anything non-identity
+    // emits the opinion list + an `xformOpOrder` token array per the
+    // UsdGeomXformable contract.
+    write_node_transform(w, &node.transform);
+
     // Mesh attachment — emit an inner `def Mesh` so its prim path is
     // `<parent>/<node_name>/<mesh_name>`.
     if let Some(mesh_id) = node.mesh {
@@ -259,6 +266,123 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
     w.indent -= 1;
     w.write_indent();
     writeln!(w.s, "}}").unwrap();
+}
+
+/// Serialise the per-node transform as a list of `xformOp:*`
+/// opinions plus a matching `xformOpOrder` token array, per the
+/// UsdGeomXformable schema contract:
+///
+/// * [`Transform::Trs`] → three opinions
+///   (`xformOp:translate`, `xformOp:orient`, `xformOp:scale`) with
+///   `xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]`.
+///   The orient quaternion is written as `(w, x, y, z)` to match
+///   USD's `quatf` literal layout (USD stores the real component
+///   first; our internal `[x,y,z,w]` follows glTF's xyzw layout).
+/// * [`Transform::Matrix`] → a single `xformOp:transform` opinion
+///   carrying the 4x4 row-major matrix (USD's `matrix4d` literal).
+/// * Identity TRS — no opinions emitted (the reader treats an
+///   absent xformOpOrder as identity).
+fn write_node_transform(w: &mut Out, t: &Transform) {
+    if is_identity(t) {
+        return;
+    }
+    match *t {
+        Transform::Trs {
+            translation,
+            rotation,
+            scale,
+        } => {
+            w.write_indent();
+            writeln!(
+                w.s,
+                "double3 xformOp:translate = ({}, {}, {})",
+                format_float(translation[0] as f64),
+                format_float(translation[1] as f64),
+                format_float(translation[2] as f64)
+            )
+            .unwrap();
+            // Quaternion order: USD's `quatf` literal is
+            // `(w, x, y, z)`; our `Transform::Trs::rotation` is
+            // glTF/xyzw.
+            w.write_indent();
+            writeln!(
+                w.s,
+                "quatf xformOp:orient = ({}, {}, {}, {})",
+                format_float(rotation[3] as f64),
+                format_float(rotation[0] as f64),
+                format_float(rotation[1] as f64),
+                format_float(rotation[2] as f64)
+            )
+            .unwrap();
+            w.write_indent();
+            writeln!(
+                w.s,
+                "float3 xformOp:scale = ({}, {}, {})",
+                format_float(scale[0] as f64),
+                format_float(scale[1] as f64),
+                format_float(scale[2] as f64)
+            )
+            .unwrap();
+            w.write_indent();
+            writeln!(
+                w.s,
+                "uniform token[] xformOpOrder = [\"xformOp:translate\", \"xformOp:orient\", \"xformOp:scale\"]"
+            )
+            .unwrap();
+        }
+        Transform::Matrix(m) => {
+            w.write_indent();
+            write!(w.s, "matrix4d xformOp:transform = (").unwrap();
+            for (i, row) in m.iter().enumerate() {
+                if i > 0 {
+                    w.s.push_str(", ");
+                }
+                write!(
+                    w.s,
+                    "({}, {}, {}, {})",
+                    format_float(row[0] as f64),
+                    format_float(row[1] as f64),
+                    format_float(row[2] as f64),
+                    format_float(row[3] as f64)
+                )
+                .unwrap();
+            }
+            writeln!(w.s, ")").unwrap();
+            w.write_indent();
+            writeln!(
+                w.s,
+                "uniform token[] xformOpOrder = [\"xformOp:transform\"]"
+            )
+            .unwrap();
+        }
+    }
+}
+
+/// `true` iff the transform is the identity TRS produced by
+/// [`Transform::identity`]. We compare exact bit patterns rather
+/// than fuzzy: the writer's job is to mirror the in-memory
+/// `Scene3D` and the reader-side identity comes through as exact
+/// `Transform::identity()` already.
+fn is_identity(t: &Transform) -> bool {
+    match *t {
+        Transform::Trs {
+            translation,
+            rotation,
+            scale,
+        } => {
+            translation == [0.0, 0.0, 0.0]
+                && rotation == [0.0, 0.0, 0.0, 1.0]
+                && scale == [1.0, 1.0, 1.0]
+        }
+        Transform::Matrix(m) => {
+            m == [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
+        }
+    }
 }
 
 fn write_mesh(w: &mut Out, scene: &Scene3D, mesh: &Mesh, _id: MeshId, parent_path: &str) {
@@ -611,5 +735,51 @@ mod tests {
         assert_eq!(sanitize_prim_name("3d"), "_3d");
         assert_eq!(sanitize_prim_name("foo bar"), "foo_bar");
         assert_eq!(sanitize_prim_name(""), "Unnamed");
+    }
+
+    #[test]
+    fn write_node_transform_skips_identity() {
+        let mut w = Out::default();
+        write_node_transform(&mut w, &Transform::identity());
+        assert!(
+            w.s.is_empty(),
+            "identity should write nothing, got `{}`",
+            w.s
+        );
+    }
+
+    #[test]
+    fn write_node_transform_trs_emits_three_ops_plus_order() {
+        let mut w = Out::default();
+        write_node_transform(
+            &mut w,
+            &Transform::Trs {
+                translation: [1.0, 2.0, 3.0],
+                // identity quaternion (xyzw)
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                scale: [1.0, 1.0, 1.0],
+            },
+        );
+        assert!(w.s.contains("xformOp:translate = (1, 2, 3)"));
+        // USD orient is wxyz — identity quat serialises as
+        // (1, 0, 0, 0).
+        assert!(w.s.contains("xformOp:orient = (1, 0, 0, 0)"));
+        assert!(w.s.contains("xformOp:scale = (1, 1, 1)"));
+        assert!(w.s.contains("xformOpOrder = ["));
+    }
+
+    #[test]
+    fn write_node_transform_matrix_emits_4x4_then_order() {
+        let mut w = Out::default();
+        let m = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [10.0, 20.0, 30.0, 1.0],
+        ];
+        write_node_transform(&mut w, &Transform::Matrix(m));
+        assert!(w.s.contains("matrix4d xformOp:transform = ("));
+        assert!(w.s.contains("(10, 20, 30, 1)"));
+        assert!(w.s.contains("xformOpOrder = [\"xformOp:transform\"]"));
     }
 }

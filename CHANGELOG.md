@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 3 (per-mesh transforms + multi-primitive)
+
+- **Per-node transform serialisation.** Both encoder and decoder
+  now round-trip `Node::transform` through the
+  `UsdGeomXformable` opinion schema:
+  - `Transform::Trs { translation, rotation, scale }` →
+    `xformOp:translate` (double3) + `xformOp:orient` (quatf,
+    USD's `(w, x, y, z)` layout) + `xformOp:scale` (float3),
+    driven by
+    `xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]`.
+  - `Transform::Matrix(m)` → `xformOp:transform` (matrix4d)
+    driven by `xformOpOrder = ["xformOp:transform"]`.
+  - `Transform::identity()` emits no opinions (keeps r1/r2
+    output minimal); decoder treats absent `xformOpOrder` as
+    identity.
+
 ### Added — Round 2 (USDZ writer)
 
 - `UsdzEncoder` implementing
