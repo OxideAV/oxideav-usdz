@@ -1,0 +1,36 @@
+[package]
+name = "oxideav-usdz"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+authors = ["Mark Karpeles <admin@echelle.co.jp>"]
+description = "Pure-Rust USDZ (Universal Scene Description, zipped) reader — implements oxideav-mesh3d's Decoder trait"
+repository = "https://github.com/OxideAV/oxideav-usdz"
+homepage = "https://github.com/OxideAV/oxideav-usdz"
+readme = "README.md"
+keywords = ["usdz", "usd", "openusd", "3d", "ar"]
+categories = ["multimedia::encoding", "rendering::data-formats"]
+
+[dependencies]
+# `oxideav-core` is gated behind the default-on `registry` feature so
+# 3D-library consumers can depend on `oxideav-usdz` with
+# `default-features = false` and avoid the framework dependency tree
+# entirely. Without `registry` the crate exposes the Decoder against
+# `oxideav_mesh3d`'s standalone `Mesh3DDecoder` trait + crate-local
+# `Error` type.
+oxideav-core = { version = "0.1", optional = true }
+# Type model + Decoder trait + AssetSource. Default features pulled
+# in only when our own `registry` feature is active so a no-default
+# build chains all the way through.
+oxideav-mesh3d = { version = "0.0", default-features = false }
+serde_json = "1"
+
+[features]
+default = ["registry"]
+
+# Wires up the `Mesh3DDecoder` impl + the `register` entry point
+# against `oxideav-core`. Default-on; turn off for 3D-library
+# use-cases that just want the standalone decoder API + `Scene3D`
+# typed model.
+registry = ["dep:oxideav-core", "oxideav-mesh3d/registry"]

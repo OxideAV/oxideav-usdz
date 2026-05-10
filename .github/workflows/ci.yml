@@ -1,0 +1,36 @@
+name: CI
+
+# Thin shim around the OxideAV org-level reusable workflow. See
+# https://github.com/OxideAV/.github for the actual job definitions and
+# the input surface. Miri runs by default per the org-wide policy.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  ci:
+    uses: OxideAV/.github/.github/workflows/crate-ci.yml@master
+    secrets: inherit
+
+  # Standalone (no-`registry`) build verification. Mirrors the pattern
+  # used by other dual-mode sibling crates: the reusable workflow's
+  # `extra_test_args` doesn't reach the build step, so the standalone
+  # build needs its own inline job. Image-library / 3D-library
+  # consumers depend on `oxideav-usdz` with `default-features = false`
+  # to skip the `oxideav-core` framework dep tree entirely.
+  standalone:
+    name: Build (no registry)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: standalone
+      - name: cargo build --lib --no-default-features
+        run: cargo build --lib --no-default-features --verbose
+      - name: cargo test --no-default-features
+        run: cargo test --no-default-features --verbose
