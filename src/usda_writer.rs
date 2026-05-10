@@ -483,19 +483,45 @@ fn write_mesh(w: &mut Out, scene: &Scene3D, mesh: &Mesh, _id: MeshId, parent_pat
     // folds these siblings back into a single Scene3D Mesh
     // when the prim names match the `<stem>` / `<stem>_<N>`
     // convention emitted here, preserving the typed model.
+    //
+    // Topology dispatch (r5):
+    //
+    // * `Triangles` → `def Mesh` (UsdGeomMesh).
+    // * `TriangleStrip` / `TriangleFan` → expanded to a triangle
+    //   list in-place + emitted as `def Mesh`. The original
+    //   topology token is preserved in
+    //   `extras["usd:original_topology"]` so a downstream consumer
+    //   can recover the source spelling.
+    // * `Lines` / `LineStrip` / `LineLoop` → `def BasisCurves`
+    //   (UsdGeomBasisCurves) with `type = "linear"` plus the
+    //   matching `wrap` token (`nonperiodic` for Lines / LineStrip,
+    //   `periodic` for LineLoop). `Lines` collapses to one curve
+    //   segment per pair of indices, mirroring USD's per-curve
+    //   `curveVertexCounts` schema.
+    // * `Points` → `def Points` (UsdGeomPoints) carrying just the
+    //   `points` array (no per-point widths in r5; downstream tools
+    //   default to a sensible point size when none is authored).
     for (i, prim) in mesh.primitives.iter().enumerate() {
-        if !matches!(prim.topology, Topology::Triangles) {
-            // Strips / fans / points / lines need conversion into
-            // triangles first; skip rather than emit a broken
-            // mesh prim. Round-4 followup tracked in r3 handoff.
-            continue;
-        }
         let prim_name = if i == 0 {
             mesh_name.clone()
         } else {
             format!("{mesh_name}_{i}")
         };
-        write_one_mesh_prim(w, scene, prim, &prim_name);
+        match prim.topology {
+            Topology::Triangles => write_one_mesh_prim(w, scene, prim, &prim_name, None),
+            Topology::TriangleStrip => {
+                let expanded = expand_strip_to_triangle_list(prim);
+                write_one_mesh_prim(w, scene, &expanded, &prim_name, Some("triangleStrip"));
+            }
+            Topology::TriangleFan => {
+                let expanded = expand_fan_to_triangle_list(prim);
+                write_one_mesh_prim(w, scene, &expanded, &prim_name, Some("triangleFan"));
+            }
+            Topology::Lines | Topology::LineStrip | Topology::LineLoop => {
+                write_basis_curves_prim(w, scene, prim, &prim_name);
+            }
+            Topology::Points => write_points_prim(w, scene, prim, &prim_name),
+        }
     }
 }
 
@@ -503,11 +529,399 @@ fn write_mesh(w: &mut Out, scene: &Scene3D, mesh: &Mesh, _id: MeshId, parent_pat
 /// USD `UsdGeomMesh`. Wraps [`write_triangle_mesh`] with the
 /// prim-frame braces + the optional `material:binding`
 /// relationship.
-fn write_one_mesh_prim(w: &mut Out, scene: &Scene3D, prim: &Primitive, prim_name: &str) {
+///
+/// `original_topology_hint`, when `Some`, marks the emitted prim
+/// with a `(usd:original_topology = "<token>")` metadata block so
+/// the source topology survives the conversion. Set by the
+/// strip/fan tessellation paths in [`write_mesh`].
+fn write_one_mesh_prim(
+    w: &mut Out,
+    scene: &Scene3D,
+    prim: &Primitive,
+    prim_name: &str,
+    original_topology_hint: Option<&str>,
+) {
+    let mut metadata_lines: Vec<String> = Vec::new();
+    if let Some(token) = original_topology_hint {
+        metadata_lines.push(format!("usd:original_topology = \"{token}\""));
+    }
+    if extras_no_fold(&prim.extras) {
+        metadata_lines.push("usd:no_fold = 1".to_string());
+    }
     w.write_indent();
-    writeln!(w.s, "def Mesh \"{prim_name}\" {{").unwrap();
+    if metadata_lines.is_empty() {
+        writeln!(w.s, "def Mesh \"{prim_name}\" {{").unwrap();
+    } else {
+        writeln!(
+            w.s,
+            "def Mesh \"{prim_name}\" ({}) {{",
+            metadata_lines.join(" ")
+        )
+        .unwrap();
+    }
     w.indent += 1;
+    // Per-Primitive transform on the inner def Mesh — only emit
+    // when the source carries a `usd:mesh_transform` extras entry.
+    // Mirrors `write_node_transform` but writes onto the Mesh prim
+    // directly per the UsdGeomXformable schema (which Mesh inherits).
+    if let Some(t) = transform_from_extras(&prim.extras) {
+        write_node_transform(w, &t);
+    }
     write_triangle_mesh(w, prim);
+    if let Some(mat_id) = prim.material {
+        if let Some(mat) = scene.materials.get(mat_id.0 as usize) {
+            let mat_name = material_prim_name(mat, mat_id.0 as usize);
+            w.write_indent();
+            writeln!(w.s, "rel material:binding = </Materials/{mat_name}>").unwrap();
+        }
+    }
+    w.indent -= 1;
+    w.write_indent();
+    writeln!(w.s, "}}").unwrap();
+}
+
+/// `true` iff the primitive's extras carry the `usd:no_fold = true`
+/// hint emitted by the round-5 sibling-collision flow.
+fn extras_no_fold(extras: &std::collections::HashMap<String, serde_json::Value>) -> bool {
+    extras
+        .get("usd:no_fold")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Decode a per-primitive `usd:mesh_transform` extras entry into a
+/// [`Transform`]. Two shapes are recognised:
+///
+/// * `{"matrix": [[a,b,c,d], [e,f,g,h], [i,j,k,l], [m,n,o,p]]}`
+///   → [`Transform::Matrix`]. Row-major (USD's `matrix4d` literal
+///   layout).
+/// * `{"trs": {"translation": [x,y,z], "rotation": [x,y,z,w],
+///   "scale": [sx,sy,sz]}}` → [`Transform::Trs`]. Quaternion order
+///   matches our internal xyzw.
+///
+/// Returns `None` for anything else (including malformed JSON or
+/// the extras key being absent), causing the writer to skip the
+/// inner xformOp emission entirely.
+fn transform_from_extras(
+    extras: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<Transform> {
+    let v = extras.get("usd:mesh_transform")?;
+    if let Some(rows) = v.get("matrix").and_then(|m| m.as_array()) {
+        if rows.len() != 4 {
+            return None;
+        }
+        let mut m = [[0f32; 4]; 4];
+        for (i, row) in rows.iter().enumerate() {
+            let r = row.as_array()?;
+            if r.len() != 4 {
+                return None;
+            }
+            for (j, c) in r.iter().enumerate() {
+                m[i][j] = c.as_f64()? as f32;
+            }
+        }
+        return Some(Transform::Matrix(m));
+    }
+    if let Some(trs) = v.get("trs") {
+        let t = json_array_n::<3>(trs.get("translation"))?;
+        let r = json_array_n::<4>(trs.get("rotation"))?;
+        let s = json_array_n::<3>(trs.get("scale"))?;
+        return Some(Transform::Trs {
+            translation: t,
+            rotation: r,
+            scale: s,
+        });
+    }
+    None
+}
+
+fn json_array_n<const N: usize>(v: Option<&serde_json::Value>) -> Option<[f32; N]> {
+    let arr = v?.as_array()?;
+    if arr.len() != N {
+        return None;
+    }
+    let mut out = [0f32; N];
+    for (i, c) in arr.iter().enumerate() {
+        out[i] = c.as_f64()? as f32;
+    }
+    Some(out)
+}
+
+/// Expand a `TriangleStrip` primitive into a triangle-list
+/// primitive, preserving alternating winding per OpenGL/glTF
+/// semantics (`(i, i+1, i+2)` for even `i`, `(i+1, i, i+2)` for
+/// odd). The returned [`Primitive`] is a fresh
+/// [`Topology::Triangles`] instance whose `positions` (and any
+/// per-vertex attribute) is unchanged; only `indices` is rebuilt.
+/// When the source has no index buffer we fabricate a `0..N`
+/// running sequence first so the strip→list rewrite has something
+/// to rewire.
+fn expand_strip_to_triangle_list(prim: &Primitive) -> Primitive {
+    let n = prim
+        .indices
+        .as_ref()
+        .map(|i| i.len())
+        .unwrap_or(prim.positions.len());
+    let src: Vec<u32> = match &prim.indices {
+        Some(Indices::U16(v)) => v.iter().map(|&x| x as u32).collect(),
+        Some(Indices::U32(v)) => v.clone(),
+        None => (0..n as u32).collect(),
+    };
+    let mut out = Vec::with_capacity(n.saturating_sub(2) * 3);
+    for i in 0..src.len().saturating_sub(2) {
+        let (a, b, c) = if i % 2 == 0 {
+            (src[i], src[i + 1], src[i + 2])
+        } else {
+            (src[i + 1], src[i], src[i + 2])
+        };
+        out.push(a);
+        out.push(b);
+        out.push(c);
+    }
+    let mut new_prim = clone_prim_metadata(prim);
+    new_prim.topology = Topology::Triangles;
+    new_prim.positions = prim.positions.clone();
+    new_prim.normals = prim.normals.clone();
+    new_prim.tangents = prim.tangents.clone();
+    new_prim.uvs = prim.uvs.clone();
+    new_prim.colors = prim.colors.clone();
+    new_prim.joints = prim.joints.clone();
+    new_prim.weights = prim.weights.clone();
+    new_prim.material = prim.material;
+    new_prim.indices = Some(if prim.positions.len() <= u16::MAX as usize {
+        Indices::U16(out.iter().map(|&i| i as u16).collect())
+    } else {
+        Indices::U32(out)
+    });
+    new_prim
+}
+
+/// Expand a `TriangleFan` primitive into a triangle-list primitive.
+/// Each interior triangle is `(0, i, i+1)` per the GL fan winding
+/// convention.
+fn expand_fan_to_triangle_list(prim: &Primitive) -> Primitive {
+    let n = prim
+        .indices
+        .as_ref()
+        .map(|i| i.len())
+        .unwrap_or(prim.positions.len());
+    let src: Vec<u32> = match &prim.indices {
+        Some(Indices::U16(v)) => v.iter().map(|&x| x as u32).collect(),
+        Some(Indices::U32(v)) => v.clone(),
+        None => (0..n as u32).collect(),
+    };
+    let mut out = Vec::with_capacity(n.saturating_sub(2) * 3);
+    if src.len() >= 3 {
+        let v0 = src[0];
+        for i in 1..(src.len() - 1) {
+            out.push(v0);
+            out.push(src[i]);
+            out.push(src[i + 1]);
+        }
+    }
+    let mut new_prim = clone_prim_metadata(prim);
+    new_prim.topology = Topology::Triangles;
+    new_prim.positions = prim.positions.clone();
+    new_prim.normals = prim.normals.clone();
+    new_prim.tangents = prim.tangents.clone();
+    new_prim.uvs = prim.uvs.clone();
+    new_prim.colors = prim.colors.clone();
+    new_prim.joints = prim.joints.clone();
+    new_prim.weights = prim.weights.clone();
+    new_prim.material = prim.material;
+    new_prim.indices = Some(if prim.positions.len() <= u16::MAX as usize {
+        Indices::U16(out.iter().map(|&i| i as u16).collect())
+    } else {
+        Indices::U32(out)
+    });
+    new_prim
+}
+
+/// Helper: clone the per-primitive metadata (extras + material)
+/// without copying the bulky vertex buffers — the strip/fan paths
+/// do their own buffer copies.
+fn clone_prim_metadata(prim: &Primitive) -> Primitive {
+    let mut p = Primitive::new(Topology::Triangles);
+    p.extras = prim.extras.clone();
+    p.material = prim.material;
+    p
+}
+
+/// Emit a `def BasisCurves "<name>" { ... }` block carrying one
+/// USD `UsdGeomBasisCurves` for a Lines / LineStrip / LineLoop
+/// primitive.
+///
+/// Schema basics (clean-room, drawn from the public UsdGeom prim
+/// type contract):
+///
+/// * `type = "linear"` — every variant we emit is straight-segment.
+/// * `wrap = "nonperiodic"` for Lines / LineStrip; `wrap = "periodic"`
+///   for LineLoop (the closing segment is implicit per UsdGeom's
+///   periodic-curve rule).
+/// * `curveVertexCounts` — for Lines: one `2` per index pair (each
+///   pair is its own straight curve); for LineStrip / LineLoop: a
+///   single count equal to the index/vertex count.
+/// * `points` — the position array (one entry per index when
+///   `indices` is present, else just the source positions).
+/// * `material:binding` — same per-primitive binding shape used by
+///   `write_one_mesh_prim`.
+fn write_basis_curves_prim(w: &mut Out, scene: &Scene3D, prim: &Primitive, prim_name: &str) {
+    let mut metadata_lines: Vec<String> = Vec::new();
+    let original = match prim.topology {
+        Topology::Lines => "lines",
+        Topology::LineStrip => "lineStrip",
+        Topology::LineLoop => "lineLoop",
+        _ => "lines",
+    };
+    metadata_lines.push(format!("usd:original_topology = \"{original}\""));
+    if extras_no_fold(&prim.extras) {
+        metadata_lines.push("usd:no_fold = 1".to_string());
+    }
+    w.write_indent();
+    writeln!(
+        w.s,
+        "def BasisCurves \"{prim_name}\" ({}) {{",
+        metadata_lines.join(" ")
+    )
+    .unwrap();
+    w.indent += 1;
+
+    // Optional per-primitive transform.
+    if let Some(t) = transform_from_extras(&prim.extras) {
+        write_node_transform(w, &t);
+    }
+
+    // Materialise the index list (synthesise 0..N when absent so the
+    // emitted positions array matches `curveVertexCounts`).
+    let n = prim
+        .indices
+        .as_ref()
+        .map(|i| i.len())
+        .unwrap_or(prim.positions.len());
+    let idx: Vec<u32> = match &prim.indices {
+        Some(Indices::U16(v)) => v.iter().map(|&x| x as u32).collect(),
+        Some(Indices::U32(v)) => v.clone(),
+        None => (0..n as u32).collect(),
+    };
+
+    // curveVertexCounts.
+    w.write_indent();
+    write!(w.s, "int[] curveVertexCounts = [").unwrap();
+    match prim.topology {
+        Topology::Lines => {
+            // One straight curve per index pair.
+            let segments = idx.len() / 2;
+            for i in 0..segments {
+                if i > 0 {
+                    w.s.push_str(", ");
+                }
+                w.s.push('2');
+            }
+        }
+        Topology::LineStrip | Topology::LineLoop => {
+            write!(w.s, "{}", idx.len()).unwrap();
+        }
+        _ => unreachable!("write_basis_curves_prim only handles line topologies"),
+    }
+    writeln!(w.s, "]").unwrap();
+
+    // points — emit the actual coordinates referenced by `idx`.
+    w.write_indent();
+    write!(w.s, "point3f[] points = [").unwrap();
+    for (i, &v) in idx.iter().enumerate() {
+        if i > 0 {
+            w.s.push_str(", ");
+        }
+        let p = prim
+            .positions
+            .get(v as usize)
+            .copied()
+            .unwrap_or([0.0, 0.0, 0.0]);
+        write!(
+            w.s,
+            "({}, {}, {})",
+            format_float(p[0] as f64),
+            format_float(p[1] as f64),
+            format_float(p[2] as f64)
+        )
+        .unwrap();
+    }
+    writeln!(w.s, "]").unwrap();
+
+    // type + wrap.
+    w.write_indent();
+    writeln!(w.s, "uniform token type = \"linear\"").unwrap();
+    w.write_indent();
+    let wrap = if matches!(prim.topology, Topology::LineLoop) {
+        "periodic"
+    } else {
+        "nonperiodic"
+    };
+    writeln!(w.s, "uniform token wrap = \"{wrap}\"").unwrap();
+
+    if let Some(mat_id) = prim.material {
+        if let Some(mat) = scene.materials.get(mat_id.0 as usize) {
+            let mat_name = material_prim_name(mat, mat_id.0 as usize);
+            w.write_indent();
+            writeln!(w.s, "rel material:binding = </Materials/{mat_name}>").unwrap();
+        }
+    }
+    w.indent -= 1;
+    w.write_indent();
+    writeln!(w.s, "}}").unwrap();
+}
+
+/// Emit a `def Points "<name>" { ... }` block carrying one USD
+/// `UsdGeomPoints` prim.
+///
+/// One point per source vertex (or per index entry when an index
+/// buffer is present). No per-point `widths` are authored in r5;
+/// downstream renderers fall back to a sensible default.
+fn write_points_prim(w: &mut Out, scene: &Scene3D, prim: &Primitive, prim_name: &str) {
+    let mut metadata_lines = vec!["usd:original_topology = \"points\"".to_string()];
+    if extras_no_fold(&prim.extras) {
+        metadata_lines.push("usd:no_fold = 1".to_string());
+    }
+    w.write_indent();
+    writeln!(
+        w.s,
+        "def Points \"{prim_name}\" ({}) {{",
+        metadata_lines.join(" ")
+    )
+    .unwrap();
+    w.indent += 1;
+
+    if let Some(t) = transform_from_extras(&prim.extras) {
+        write_node_transform(w, &t);
+    }
+
+    let idx: Vec<u32> = match &prim.indices {
+        Some(Indices::U16(v)) => v.iter().map(|&x| x as u32).collect(),
+        Some(Indices::U32(v)) => v.clone(),
+        None => (0..prim.positions.len() as u32).collect(),
+    };
+    w.write_indent();
+    write!(w.s, "point3f[] points = [").unwrap();
+    for (i, &v) in idx.iter().enumerate() {
+        if i > 0 {
+            w.s.push_str(", ");
+        }
+        let p = prim
+            .positions
+            .get(v as usize)
+            .copied()
+            .unwrap_or([0.0, 0.0, 0.0]);
+        write!(
+            w.s,
+            "({}, {}, {})",
+            format_float(p[0] as f64),
+            format_float(p[1] as f64),
+            format_float(p[2] as f64)
+        )
+        .unwrap();
+    }
+    writeln!(w.s, "]").unwrap();
+
     if let Some(mat_id) = prim.material {
         if let Some(mat) = scene.materials.get(mat_id.0 as usize) {
             let mat_name = material_prim_name(mat, mat_id.0 as usize);

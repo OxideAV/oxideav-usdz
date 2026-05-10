@@ -191,27 +191,51 @@ fn build_node(ctx: &mut Ctx, parent: &str, prim: &Prim) -> Result<Option<oxideav
             // sharing a common stem fold into a single Mesh per
             // the r3 multi-primitive convention; everything else
             // recurses into `build_node` one-at-a-time.
+            //
+            // Round-5 wrinkle: a `def Mesh` prim carrying the
+            // `(usd:no_fold = 1)` metadata flag opts out of the
+            // fold heuristic — it always becomes its own Scene3D
+            // Mesh + Node, even when sibling stems would otherwise
+            // group it. Mirrors the encoder side, which sets the
+            // flag when re-emitting `Primitive::extras["usd:no_fold"]`.
             let mut child_ids = Vec::new();
             let mut i = 0usize;
             while i < prim.children.len() {
                 let child = &prim.children[i];
-                if child.spec == "def" && child.type_name == "Mesh" {
-                    // Look ahead for additional Mesh siblings
-                    // sharing the same stem so they fold into one
-                    // Scene3D Mesh.
-                    let stem = mesh_name_stem(&child.name);
-                    let mut group_end = i + 1;
-                    while group_end < prim.children.len()
-                        && prim.children[group_end].spec == "def"
-                        && prim.children[group_end].type_name == "Mesh"
-                        && mesh_name_stem(&prim.children[group_end].name) == stem
-                    {
-                        group_end += 1;
+                if child.spec == "def"
+                    && (child.type_name == "Mesh"
+                        || child.type_name == "BasisCurves"
+                        || child.type_name == "Points")
+                {
+                    if child.type_name == "Mesh" && !prim_no_fold(child) {
+                        // Look ahead for additional Mesh siblings
+                        // sharing the same stem so they fold into one
+                        // Scene3D Mesh — but only when none of them
+                        // carries the `usd:no_fold` opt-out.
+                        let stem = mesh_name_stem(&child.name);
+                        let mut group_end = i + 1;
+                        while group_end < prim.children.len()
+                            && prim.children[group_end].spec == "def"
+                            && prim.children[group_end].type_name == "Mesh"
+                            && mesh_name_stem(&prim.children[group_end].name) == stem
+                            && !prim_no_fold(&prim.children[group_end])
+                        {
+                            group_end += 1;
+                        }
+                        let group = &prim.children[i..group_end];
+                        let id = build_mesh_group(ctx, &path, group)?;
+                        child_ids.push(id);
+                        i = group_end;
+                    } else {
+                        // Standalone primitive — build a single
+                        // Scene3D Mesh + Node directly. Covers the
+                        // `usd:no_fold` Mesh opt-out, plus
+                        // BasisCurves / Points which the fold
+                        // convention doesn't apply to anyway.
+                        let id = build_standalone_mesh_node(ctx, &path, child)?;
+                        child_ids.push(id);
+                        i += 1;
                     }
-                    let group = &prim.children[i..group_end];
-                    let id = build_mesh_group(ctx, &path, group)?;
-                    child_ids.push(id);
-                    i = group_end;
                 } else if let Some(id) = build_node(ctx, &path, child)? {
                     child_ids.push(id);
                     i += 1;
@@ -224,17 +248,12 @@ fn build_node(ctx: &mut Ctx, parent: &str, prim: &Prim) -> Result<Option<oxideav
             let id = ctx.scene.add_node(node);
             Ok(Some(id))
         }
-        "Mesh" => {
-            // Top-level Mesh prim with no enclosing Xform — the
+        "Mesh" | "BasisCurves" | "Points" => {
+            // Top-level prim with no enclosing Xform — the
             // sibling-fold doesn't apply (we have no parent's
             // child list to scan). Build it as a single-primitive
             // Mesh + Node, matching r1/r2 behaviour.
-            let mesh = build_mesh(ctx, &path, prim)?;
-            let mesh_id = ctx.scene.add_mesh(mesh);
-            let mut node = Node::new().with_name(prim.name.clone()).with_mesh(mesh_id);
-            node.transform = read_node_transform(prim);
-            stash_extras(&mut node.extras, prim);
-            let id = ctx.scene.add_node(node);
+            let id = build_standalone_mesh_node(ctx, &path, prim)?;
             Ok(Some(id))
         }
         other => {
@@ -296,6 +315,43 @@ fn build_mesh_group(
     node.transform = read_node_transform(head);
     stash_extras(&mut node.extras, head);
     Ok(ctx.scene.add_node(node))
+}
+
+/// Build a single Scene3D Mesh + Node from one Mesh / BasisCurves /
+/// Points prim — the unfolded path used both for top-level prims
+/// and for any inner def-Mesh that opted out of the fold via
+/// `usd:no_fold`.
+fn build_standalone_mesh_node(
+    ctx: &mut Ctx,
+    parent_path: &str,
+    prim: &Prim,
+) -> Result<oxideav_mesh3d::NodeId> {
+    let path = join_path(parent_path, &prim.name);
+    let mesh = build_mesh(ctx, &path, prim)?;
+    let mesh_id = ctx.scene.add_mesh(mesh);
+    let mut node = Node::new().with_name(prim.name.clone()).with_mesh(mesh_id);
+    node.transform = read_node_transform(prim);
+    stash_extras(&mut node.extras, prim);
+    Ok(ctx.scene.add_node(node))
+}
+
+/// `true` when the prim's metadata block carries
+/// `usd:no_fold = 1` (or `usd:no_fold = true` — we accept either
+/// spelling). Set by the round-5 encoder on `Primitive::extras`
+/// round-trip; honoured by the decoder to skip the sibling-fold
+/// heuristic.
+fn prim_no_fold(prim: &Prim) -> bool {
+    let Some(v) = prim.metadata.get("usd:no_fold") else {
+        return false;
+    };
+    match v {
+        Value::Bool(b) => *b,
+        Value::Float(f) => *f != 0.0,
+        Value::Token(s) | Value::String(s) => {
+            matches!(s.as_str(), "true" | "1" | "yes" | "on")
+        }
+        _ => false,
+    }
 }
 
 /// Build an [`AudioSource`] + [`AudioEmitter`] pair from a
@@ -555,8 +611,50 @@ fn stash_extras(extras: &mut HashMap<String, serde_json::Value>, prim: &Prim) {
     }
 }
 
-/// Build a `Mesh + Primitive` from a USD `Mesh` prim.
+/// Build a `Mesh + Primitive` from a USD `Mesh` / `BasisCurves` /
+/// `Points` prim.
+///
+/// The Scene3D model collapses all three USD geometry prim types
+/// into a [`Primitive`] keyed off [`Topology`]. The dispatch below
+/// mirrors the writer's encoding rules:
+///
+/// * `Mesh` → `Topology::Triangles` (USD always sends triangle
+///   lists via `faceVertexCounts` after fan-triangulation).
+/// * `BasisCurves` → `Topology::Lines / LineStrip / LineLoop` per
+///   the schema's `wrap` token (`periodic` → LineLoop) and
+///   `curveVertexCounts` shape (`[2,2,2,…]` → Lines, single count
+///   → LineStrip).
+/// * `Points` → `Topology::Points`.
+///
+/// Round-5 hints picked up from the prim's `(...)` metadata block:
+///
+/// * `usd:original_topology` — when the writer rewrote a strip /
+///   fan / lines / points source into the schema-typed prim, the
+///   original token is preserved here. We surface it on
+///   `Primitive::extras["usd:original_topology"]`.
+/// * `usd:no_fold` — surfaces on
+///   `Primitive::extras["usd:no_fold"] = true` so a re-encode
+///   propagates the opt-out.
+/// * `usd:mesh_transform` — per-prim transform serialised via
+///   `xformOp:transform` directly on the def Mesh (rather than the
+///   parent Xform). Read back into
+///   `Primitive::extras["usd:mesh_transform"]` as a Matrix-shaped
+///   JSON object.
 fn build_mesh(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Mesh> {
+    let prim_out = match prim.type_name.as_str() {
+        "BasisCurves" => build_basis_curves_primitive(ctx, path, prim)?,
+        "Points" => build_points_primitive(ctx, path, prim)?,
+        // "Mesh" or anything else routes through the triangle path.
+        _ => build_triangle_primitive(ctx, path, prim)?,
+    };
+
+    let mesh = Mesh::new(Some(prim.name.clone())).with_primitive(prim_out);
+    Ok(mesh)
+}
+
+/// Build a `Topology::Triangles` primitive from a USD `Mesh` prim.
+/// Inverse of [`crate::usda_writer::write_one_mesh_prim`].
+fn build_triangle_primitive(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Primitive> {
     let mut prim_out = Primitive::new(Topology::Triangles);
 
     let positions = prim
@@ -620,8 +718,218 @@ fn build_mesh(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Mesh> {
         }
     }
 
-    let mesh = Mesh::new(Some(prim.name.clone())).with_primitive(prim_out);
-    Ok(mesh)
+    apply_mesh_metadata_to_primitive(prim, &mut prim_out);
+    Ok(prim_out)
+}
+
+/// Build a Lines / LineStrip / LineLoop primitive from a USD
+/// `BasisCurves` prim. Inverse of
+/// [`crate::usda_writer::write_basis_curves_prim`].
+///
+/// Topology choice:
+///
+/// * `wrap = "periodic"` → `Topology::LineLoop`.
+/// * `curveVertexCounts` is all `2`s → `Topology::Lines` (one
+///   straight segment per pair).
+/// * Otherwise → `Topology::LineStrip`.
+///
+/// Width (`widths` attribute) is currently dropped — the typed
+/// model has no per-point thickness slot.
+fn build_basis_curves_primitive(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Primitive> {
+    let positions = prim.attrs.get("points").ok_or_else(|| {
+        invalid(format!(
+            "BasisCurves `{path}` is missing `points` attribute"
+        ))
+    })?;
+    let positions = read_vec3_array(&positions.value)
+        .ok_or_else(|| invalid(format!("BasisCurves `{path}` has malformed `points`")))?;
+
+    let counts_attr = prim.attrs.get("curveVertexCounts").ok_or_else(|| {
+        invalid(format!(
+            "BasisCurves `{path}` is missing `curveVertexCounts`"
+        ))
+    })?;
+    let counts = read_int_array(&counts_attr.value).ok_or_else(|| {
+        invalid(format!(
+            "BasisCurves `{path}` has malformed `curveVertexCounts`"
+        ))
+    })?;
+
+    let wrap = prim
+        .attrs
+        .get("wrap")
+        .and_then(|a| a.value.as_text())
+        .unwrap_or("nonperiodic");
+    let topology = if wrap == "periodic" {
+        Topology::LineLoop
+    } else if !counts.is_empty() && counts.iter().all(|&c| c == 2) {
+        Topology::Lines
+    } else {
+        Topology::LineStrip
+    };
+
+    let mut prim_out = Primitive::new(topology);
+    prim_out.positions = positions;
+    // Synthesise a 0..N index buffer so the consumer can iterate
+    // the geometry uniformly with the Mesh path's index-based
+    // primitives.
+    let n = prim_out.positions.len();
+    prim_out.indices = Some(if n <= u16::MAX as usize {
+        Indices::U16((0..n as u16).collect())
+    } else {
+        Indices::U32((0..n as u32).collect())
+    });
+
+    if let Some(rel) = prim
+        .attrs
+        .get("material:binding")
+        .and_then(|a| a.value.as_text())
+    {
+        if let Some(&mid) = ctx.materials_by_path.get(rel) {
+            prim_out.material = Some(mid);
+        }
+    }
+
+    apply_mesh_metadata_to_primitive(prim, &mut prim_out);
+    Ok(prim_out)
+}
+
+/// Build a `Topology::Points` primitive from a USD `Points` prim.
+/// Inverse of [`crate::usda_writer::write_points_prim`].
+fn build_points_primitive(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Primitive> {
+    let positions = prim
+        .attrs
+        .get("points")
+        .ok_or_else(|| invalid(format!("Points `{path}` is missing `points` attribute")))?;
+    let positions = read_vec3_array(&positions.value)
+        .ok_or_else(|| invalid(format!("Points `{path}` has malformed `points`")))?;
+
+    let mut prim_out = Primitive::new(Topology::Points);
+    let n = positions.len();
+    prim_out.positions = positions;
+    prim_out.indices = Some(if n <= u16::MAX as usize {
+        Indices::U16((0..n as u16).collect())
+    } else {
+        Indices::U32((0..n as u32).collect())
+    });
+
+    if let Some(rel) = prim
+        .attrs
+        .get("material:binding")
+        .and_then(|a| a.value.as_text())
+    {
+        if let Some(&mid) = ctx.materials_by_path.get(rel) {
+            prim_out.material = Some(mid);
+        }
+    }
+
+    apply_mesh_metadata_to_primitive(prim, &mut prim_out);
+    Ok(prim_out)
+}
+
+/// Surface the round-5 prim-metadata hints
+/// (`usd:no_fold`, `usd:original_topology`, `usd:mesh_transform`)
+/// onto `Primitive::extras` so a re-encode round-trips them.
+///
+/// Also lifts a Mesh-level `xformOp:transform` opinion (the
+/// per-Mesh transform path) into a JSON-shaped
+/// `usd:mesh_transform = {"matrix": [[...], …]}` extras entry.
+fn apply_mesh_metadata_to_primitive(prim: &Prim, out: &mut Primitive) {
+    if prim_no_fold(prim) {
+        out.extras
+            .insert("usd:no_fold".into(), serde_json::Value::Bool(true));
+    }
+    if let Some(v) = prim.metadata.get("usd:original_topology") {
+        if let Some(s) = v.as_text() {
+            out.extras.insert(
+                "usd:original_topology".into(),
+                serde_json::Value::String(s.to_string()),
+            );
+        }
+    }
+    if let Some(t) = read_inner_mesh_transform(prim) {
+        out.extras.insert("usd:mesh_transform".into(), t);
+    }
+}
+
+/// Read an inner-def-Mesh `xformOp:transform` opinion (or the
+/// matching TRS triple) into a JSON-shaped value suitable for the
+/// `usd:mesh_transform` extras slot.
+///
+/// Output schema mirrors what
+/// [`crate::usda_writer::transform_from_extras`] consumes:
+///
+/// * Matrix opinion → `{"matrix": [[a,b,c,d], …]}` (4 rows of 4).
+/// * TRS triple → `{"trs": {"translation": [...], "rotation": [...],
+///   "scale": [...]}}`.
+///
+/// Returns `None` when the prim doesn't carry an `xformOpOrder`
+/// (the common case — most authoring tools put the transform on
+/// the parent Xform, not the inner def Mesh).
+fn read_inner_mesh_transform(prim: &Prim) -> Option<serde_json::Value> {
+    let order_attr = prim.attrs.get("xformOpOrder")?;
+    let order_seq = order_attr.value.as_seq()?;
+    let order: Vec<&str> = order_seq.iter().filter_map(|v| v.as_text()).collect();
+    if order.is_empty() {
+        return None;
+    }
+    if order.len() == 1 && order[0] == "xformOp:transform" {
+        let m_attr = prim.attrs.get("xformOp:transform")?;
+        let m = read_matrix4(&m_attr.value)?;
+        let rows: Vec<serde_json::Value> = m
+            .iter()
+            .map(|row| {
+                serde_json::Value::Array(
+                    row.iter()
+                        .filter_map(|c| {
+                            serde_json::Number::from_f64(*c as f64).map(serde_json::Value::Number)
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        let mut obj = serde_json::Map::new();
+        obj.insert("matrix".into(), serde_json::Value::Array(rows));
+        return Some(serde_json::Value::Object(obj));
+    }
+    if order
+        .iter()
+        .all(|t| matches!(*t, "xformOp:translate" | "xformOp:orient" | "xformOp:scale"))
+    {
+        let translation = prim
+            .attrs
+            .get("xformOp:translate")
+            .and_then(|a| a.value.as_floatn::<3>())
+            .unwrap_or([0.0; 3]);
+        let rotation = prim
+            .attrs
+            .get("xformOp:orient")
+            .and_then(|a| a.value.as_floatn::<4>())
+            .map(|wxyz| [wxyz[1], wxyz[2], wxyz[3], wxyz[0]])
+            .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+        let scale = prim
+            .attrs
+            .get("xformOp:scale")
+            .and_then(|a| a.value.as_floatn::<3>())
+            .unwrap_or([1.0, 1.0, 1.0]);
+        let to_arr = |xs: &[f32]| {
+            serde_json::Value::Array(
+                xs.iter()
+                    .filter_map(|c| {
+                        serde_json::Number::from_f64(*c as f64).map(serde_json::Value::Number)
+                    })
+                    .collect(),
+            )
+        };
+        let mut trs = serde_json::Map::new();
+        trs.insert("translation".into(), to_arr(&translation));
+        trs.insert("rotation".into(), to_arr(&rotation));
+        trs.insert("scale".into(), to_arr(&scale));
+        let mut obj = serde_json::Map::new();
+        obj.insert("trs".into(), serde_json::Value::Object(trs));
+        return Some(serde_json::Value::Object(obj));
+    }
+    None
 }
 
 /// Fan-triangulate a polygon soup described by USD's `(counts,

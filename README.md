@@ -115,7 +115,38 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   Hand-authored sibling Mesh prims whose names don't match
   the stem convention stay unaffected.
 
-## Deferred to round 5+
+## Round 5 scope (topology dispatch + no_fold + per-Mesh transform)
+
+- **Strips / fans / lines / points dispatch.** Non-`Triangles`
+  primitives are no longer dropped silently. Strips and fans
+  expand into triangle lists in-place (winding-correct per the
+  GL convention) and emit as `def Mesh`; the source topology
+  token is preserved on `Primitive::extras["usd:original_topology"]`
+  for hint round-trip. Lines / LineStrip / LineLoop emit as
+  `def BasisCurves` (`type = "linear"`, `wrap` selecting
+  periodic / non-periodic, `curveVertexCounts` matching the
+  topology shape). Points emit as `def Points`. Decoder
+  symmetric: parses BasisCurves and Points prims back into the
+  matching `Topology::Lines / LineStrip / LineLoop / Points`.
+- **`usd:no_fold` extras flag.** Authoring tools sometimes ship
+  intentional sibling-name collisions (`Foo` + `Foo_1` as
+  separate Meshes, not folded into one multi-primitive Mesh).
+  The decoder honours `(usd:no_fold = 1)` prim metadata as the
+  opt-out: marked siblings become independent Scene3D Meshes.
+  Encoder symmetric: re-emits the metadata flag whenever a
+  `Primitive::extras["usd:no_fold"] = true` indicates the source
+  scene wants the opt-out preserved.
+- **Per-Mesh transform on the inner `def Mesh`.** UsdGeomMesh
+  inherits UsdGeomXformable, so a Mesh prim can carry its own
+  transform independent of its parent Xform. The mapping uses
+  `Primitive::extras["usd:mesh_transform"]` (a JSON-shaped
+  matrix or TRS object) to cross the typed model; the writer
+  emits matching `xformOp:*` opinions directly on the inner
+  `def Mesh`. Decoder symmetric: lifts an inner-Mesh
+  `xformOp:transform` (or TRS triple) back into the same
+  extras slot.
+
+## Deferred to round 6+
 
 - **Binary `.usdc` "Crate" parser.** Pixar publishes no prose
   spec for the wire format; loading a `.usdc` Default Layer
@@ -123,11 +154,9 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   re-package with `usdcat -o foo.usda`.
 - **`UsdSkelSkeleton` + `UsdSkelBindingAPI`** skeletal-animation
   skinning.
-- **Strips / fans / lines mesh tessellation** in the writer
-  (currently skips non-`Triangles` primitives silently).
 - **`UsdGeomSubset`** per-face material-binding subsets.
 - **Composition arcs** — sub-layers, references, payloads that
-  pull in external USD files. Round 1/2 read+write a single
+  pull in external USD files. Rounds 1–5 read+write a single
   self-contained USD layer per archive only.
 
 ## Standalone build

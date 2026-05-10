@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 5 (topology dispatch + no_fold + per-Mesh transform)
+
+- **Strips / fans / lines / points dispatch in the writer.** Non-
+  `Triangles` primitives are now serialised correctly instead of
+  silently dropped:
+  - `Topology::TriangleStrip` / `TriangleFan` → expanded in-place
+    into a triangle list (alternating winding for strips, shared-
+    anchor fan for fans) and emitted as a `def Mesh`. The source
+    topology token survives in
+    `Primitive::extras["usd:original_topology"]` so a downstream
+    consumer can recover the hint.
+  - `Topology::Lines` → `def BasisCurves` with `type = "linear"`,
+    `wrap = "nonperiodic"`, and one `2` per index pair in
+    `curveVertexCounts`.
+  - `Topology::LineStrip` → `def BasisCurves` with `wrap =
+    "nonperiodic"` and a single `curveVertexCounts` entry equal
+    to the index count.
+  - `Topology::LineLoop` → `def BasisCurves` with `wrap =
+    "periodic"` (the closing segment is implicit per the
+    UsdGeomBasisCurves periodic-wrap rule).
+  - `Topology::Points` → `def Points` carrying the position
+    array.
+  Decoder symmetric: parses `BasisCurves` back into
+  `Lines / LineStrip / LineLoop` topologies (driven by `wrap`
+  + `curveVertexCounts` shape) and `Points` back into
+  `Topology::Points`.
+- **`usd:no_fold` extras flag.** When a `Primitive` carries
+  `extras["usd:no_fold"] = true`, the writer marks the emitted
+  `def Mesh` prim with the `(usd:no_fold = 1)` metadata flag so a
+  subsequent decoder run skips the round-3 sibling-Mesh fold
+  heuristic for that prim group. Decoder symmetric: any
+  `def Mesh` prim with the metadata flag becomes its own
+  Scene3D Mesh + Node, even when sibling stems would otherwise
+  group it. Mirrors the authoring-tool convention for
+  intentional `Foo` / `Foo_1` sibling collisions.
+- **Per-Mesh transform on the inner `def Mesh`.** UsdGeomMesh
+  inherits UsdGeomXformable, so a Mesh prim can carry its own
+  `xformOp:*` opinions independent of the parent Xform. The
+  round-5 mapping uses
+  `Primitive::extras["usd:mesh_transform"]` to cross the typed
+  model (since `Mesh` doesn't have a Transform field of its
+  own); the encoder picks up the extras entry and emits the
+  matching `xformOp:transform` (or `translate / orient / scale`
+  triple) directly on the inner `def Mesh`. Decoder symmetric:
+  surfaces an inner-Mesh `xformOp:transform` (or TRS triple)
+  back into the same extras slot as a JSON-shaped value.
+
 ### Added — Round 4 (UsdMediaSpatialAudio reader + writer)
 
 - **`UsdMediaSpatialAudio` reader.** `def SpatialAudio "<name>" {

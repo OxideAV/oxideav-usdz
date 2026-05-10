@@ -60,13 +60,32 @@
 //!   back into a `def SpatialAudio` block, embedding the audio
 //!   asset bytes alongside textures into the output ZIP.
 //!
-//! Deferred to round 5+:
+//! Round 5 adds:
+//!
+//! * **Strips / fans / lines / points dispatch in the writer.**
+//!   Non-`Triangles` primitives are tessellated (strips / fans →
+//!   triangle list under `def Mesh`) or emitted as the matching
+//!   UsdGeom prim type (`Lines` / `LineStrip` / `LineLoop` →
+//!   `def BasisCurves`; `Points` → `def Points`). The original
+//!   topology token round-trips on
+//!   `Primitive::extras["usd:original_topology"]`.
+//! * **`usd:no_fold` extras flag.** When a primitive carries
+//!   `extras["usd:no_fold"] = true`, the writer marks the emitted
+//!   `def Mesh` prim with the metadata flag so the decoder skips
+//!   the round-3 sibling-fold heuristic for it. Mirrors the
+//!   authoring-tool convention for intentional `Foo` / `Foo_1`
+//!   sibling collisions.
+//! * **Per-Mesh transform on the inner `def Mesh`.** A primitive
+//!   carrying `extras["usd:mesh_transform"]` (JSON-shaped matrix
+//!   or TRS) gets its `xformOp:*` opinions on the inner def Mesh
+//!   instead of the parent Xform. Decoder symmetric.
+//!
+//! Deferred to round 6+:
 //!
 //! * Binary `.usdc` "Crate" parser — Pixar publishes no prose spec
 //!   for the wire format; loading a `.usdc` Default Layer in r1
 //!   surfaces as `Error::Unsupported`.
 //! * `UsdSkelSkeleton` + `UsdSkelBindingAPI` skinning.
-//! * Strips / fans / lines mesh tessellation in the writer.
 //! * `UsdGeomSubset` per-face material binding subsets.
 //! * Composition arcs (sub-layers, references, payloads) that pull
 //!   in external USD files; r1 handles a single self-contained USD
