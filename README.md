@@ -77,6 +77,14 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   (quatf, USD's wxyz layout) + `xformOp:scale`;
   `Transform::Matrix(m)` → `xformOp:transform` (matrix4d);
   identity emits no opinions.
+- **Multi-primitive Mesh emission + sibling-fold decode.** A
+  Scene3D `Mesh` with N `Primitive`s serialises as N sibling
+  `def Mesh` prims (`<MeshName>`, `<MeshName>_1`,
+  `<MeshName>_2`, ...) each with its own `material:binding`.
+  The decoder folds sibling Mesh prims sharing a name stem
+  back into a single Scene3D Mesh with N Primitives.
+  Hand-authored sibling Mesh prims whose names don't match
+  the stem convention stay unaffected.
 
 ## Deferred to round 4+
 

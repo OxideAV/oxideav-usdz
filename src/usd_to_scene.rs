@@ -146,6 +146,19 @@ fn index_materials(ctx: &mut Ctx, parent: &str, prims: &[Prim]) -> Result<()> {
 /// Returns `None` for prims that don't materialise into a
 /// scene-graph node (e.g. `Material` / `Shader` — already
 /// captured in the materials index).
+///
+/// Sibling-Mesh folding rule (added in r3): when an Xform/Scope
+/// parent contains multiple `Mesh` children whose names share a
+/// common stem (`Foo`, `Foo_1`, `Foo_2` — i.e. base name +
+/// optional `_<digits>` suffix), they fold into a SINGLE
+/// [`Mesh`](oxideav_mesh3d::Mesh) carrying N
+/// [`Primitive`](oxideav_mesh3d::Primitive)s. This is the inverse
+/// of the multi-primitive emission rule in `usda_writer`'s
+/// `write_mesh`: a Scene3D Mesh with N primitives serialises as
+/// N sibling Mesh prims and round-trips back into one Mesh on
+/// decode. Hand-authored USD with sibling Mesh prims that don't
+/// match the convention (`HeadGeo`, `BodyGeo`) is unaffected —
+/// each becomes its own Scene3D Mesh as before.
 fn build_node(ctx: &mut Ctx, parent: &str, prim: &Prim) -> Result<Option<oxideav_mesh3d::NodeId>> {
     if prim.spec != "def" {
         return Ok(None);
@@ -157,11 +170,36 @@ fn build_node(ctx: &mut Ctx, parent: &str, prim: &Prim) -> Result<Option<oxideav
             let mut node = Node::new().with_name(prim.name.clone());
             node.transform = read_node_transform(prim);
             // Recurse children — collect the scene-graph children
-            // first, push attribute extras after.
+            // first, push attribute extras after. Mesh children
+            // sharing a common stem fold into a single Mesh per
+            // the r3 multi-primitive convention; everything else
+            // recurses into `build_node` one-at-a-time.
             let mut child_ids = Vec::new();
-            for child in &prim.children {
-                if let Some(id) = build_node(ctx, &path, child)? {
+            let mut i = 0usize;
+            while i < prim.children.len() {
+                let child = &prim.children[i];
+                if child.spec == "def" && child.type_name == "Mesh" {
+                    // Look ahead for additional Mesh siblings
+                    // sharing the same stem so they fold into one
+                    // Scene3D Mesh.
+                    let stem = mesh_name_stem(&child.name);
+                    let mut group_end = i + 1;
+                    while group_end < prim.children.len()
+                        && prim.children[group_end].spec == "def"
+                        && prim.children[group_end].type_name == "Mesh"
+                        && mesh_name_stem(&prim.children[group_end].name) == stem
+                    {
+                        group_end += 1;
+                    }
+                    let group = &prim.children[i..group_end];
+                    let id = build_mesh_group(ctx, &path, group)?;
                     child_ids.push(id);
+                    i = group_end;
+                } else if let Some(id) = build_node(ctx, &path, child)? {
+                    child_ids.push(id);
+                    i += 1;
+                } else {
+                    i += 1;
                 }
             }
             node.children = child_ids;
@@ -170,6 +208,10 @@ fn build_node(ctx: &mut Ctx, parent: &str, prim: &Prim) -> Result<Option<oxideav
             Ok(Some(id))
         }
         "Mesh" => {
+            // Top-level Mesh prim with no enclosing Xform — the
+            // sibling-fold doesn't apply (we have no parent's
+            // child list to scan). Build it as a single-primitive
+            // Mesh + Node, matching r1/r2 behaviour.
             let mesh = build_mesh(ctx, &path, prim)?;
             let mesh_id = ctx.scene.add_mesh(mesh);
             let mut node = Node::new().with_name(prim.name.clone()).with_mesh(mesh_id);
@@ -190,6 +232,53 @@ fn build_node(ctx: &mut Ctx, parent: &str, prim: &Prim) -> Result<Option<oxideav
             Ok(Some(id))
         }
     }
+}
+
+/// Strip a trailing `_<digits>` suffix to recover the "stem" used
+/// by the multi-primitive emission rule. `Foo` → `Foo`,
+/// `Foo_1` → `Foo`, `Foo_12` → `Foo`, `Foo_bar` → `Foo_bar`,
+/// `Foo_` → `Foo_` (trailing underscore with no digits stays).
+fn mesh_name_stem(name: &str) -> &str {
+    let Some(idx) = name.rfind('_') else {
+        return name;
+    };
+    let suffix = &name[idx + 1..];
+    if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+        return name;
+    }
+    &name[..idx]
+}
+
+/// Build a single Scene3D Mesh + Node bundle by folding `group`
+/// (one or more sibling Mesh prims sharing a name stem) into one
+/// Mesh whose `primitives` vector has one entry per group member.
+fn build_mesh_group(
+    ctx: &mut Ctx,
+    parent_path: &str,
+    group: &[Prim],
+) -> Result<oxideav_mesh3d::NodeId> {
+    debug_assert!(!group.is_empty());
+    let head = &group[0];
+    let head_path = join_path(parent_path, &head.name);
+    // Build the first prim's mesh as the seed; this captures the
+    // mesh name (which we always strip back to the stem so the
+    // round-trip preserves the Scene3D mesh name exactly).
+    let mut seed_mesh = build_mesh(ctx, &head_path, head)?;
+    let stem = mesh_name_stem(&head.name).to_string();
+    seed_mesh.name = Some(stem);
+    // Append each subsequent sibling's primitive.
+    for sibling in &group[1..] {
+        let sibling_path = join_path(parent_path, &sibling.name);
+        let extra = build_mesh(ctx, &sibling_path, sibling)?;
+        for p in extra.primitives {
+            seed_mesh.primitives.push(p);
+        }
+    }
+    let mesh_id = ctx.scene.add_mesh(seed_mesh);
+    let mut node = Node::new().with_name(head.name.clone()).with_mesh(mesh_id);
+    node.transform = read_node_transform(head);
+    stash_extras(&mut node.extras, head);
+    Ok(ctx.scene.add_node(node))
 }
 
 /// Reconstruct a [`Transform`] from the UsdGeomXformable opinion
@@ -707,5 +796,22 @@ mod tests {
             Unit::Millimetres
         ));
         assert!(matches!(unit_from_meters_per_unit(0.0254), Unit::Inches));
+    }
+
+    #[test]
+    fn mesh_name_stem_strips_digit_suffix() {
+        assert_eq!(mesh_name_stem("Body"), "Body");
+        assert_eq!(mesh_name_stem("Body_1"), "Body");
+        assert_eq!(mesh_name_stem("Body_12"), "Body");
+        assert_eq!(mesh_name_stem("Body_123456"), "Body");
+    }
+
+    #[test]
+    fn mesh_name_stem_keeps_non_digit_suffix() {
+        // `Body_` (no digits) and `Body_bar` (alpha suffix) must
+        // NOT strip — the convention only fires for `_<digits>`.
+        assert_eq!(mesh_name_stem("Body_"), "Body_");
+        assert_eq!(mesh_name_stem("Body_bar"), "Body_bar");
+        assert_eq!(mesh_name_stem("Body_1a"), "Body_1a");
     }
 }

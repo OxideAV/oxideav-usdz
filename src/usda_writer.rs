@@ -392,19 +392,37 @@ fn write_mesh(w: &mut Out, scene: &Scene3D, mesh: &Mesh, _id: MeshId, parent_pat
     if mesh.primitives.is_empty() {
         return;
     }
-    // We only emit the first primitive — USDZ's UsdGeomMesh holds a
-    // single vertex buffer, so multi-primitive meshes (one per
-    // material) collapse onto the first. Round-3 work: emit each
-    // primitive as a sibling Mesh prim with its own
-    // `material:binding`.
-    let prim = &mesh.primitives[0];
-    if !matches!(prim.topology, Topology::Triangles) {
-        // Strips / fans / points / lines need conversion into
-        // triangles first; skip rather than emit a broken mesh.
-        return;
+    // Multi-primitive meshes (one Primitive per material in the
+    // typical authoring tool output) become N sibling Mesh prims
+    // under the parent Xform — UsdGeomMesh holds a single vertex
+    // buffer, so we cannot fold the primitives onto a single
+    // Mesh prim. The reader rule documented in `usd_to_scene.rs`
+    // folds these siblings back into a single Scene3D Mesh
+    // when the prim names match the `<stem>` / `<stem>_<N>`
+    // convention emitted here, preserving the typed model.
+    for (i, prim) in mesh.primitives.iter().enumerate() {
+        if !matches!(prim.topology, Topology::Triangles) {
+            // Strips / fans / points / lines need conversion into
+            // triangles first; skip rather than emit a broken
+            // mesh prim. Round-4 followup tracked in r3 handoff.
+            continue;
+        }
+        let prim_name = if i == 0 {
+            mesh_name.clone()
+        } else {
+            format!("{mesh_name}_{i}")
+        };
+        write_one_mesh_prim(w, scene, prim, &prim_name);
     }
+}
+
+/// Emit a single `def Mesh "<name>" { ... }` block carrying one
+/// USD `UsdGeomMesh`. Wraps [`write_triangle_mesh`] with the
+/// prim-frame braces + the optional `material:binding`
+/// relationship.
+fn write_one_mesh_prim(w: &mut Out, scene: &Scene3D, prim: &Primitive, prim_name: &str) {
     w.write_indent();
-    writeln!(w.s, "def Mesh \"{mesh_name}\" {{").unwrap();
+    writeln!(w.s, "def Mesh \"{prim_name}\" {{").unwrap();
     w.indent += 1;
     write_triangle_mesh(w, prim);
     if let Some(mat_id) = prim.material {

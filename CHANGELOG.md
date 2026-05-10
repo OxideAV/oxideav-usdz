@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added — Round 3 (per-mesh transforms + multi-primitive)
 
+- **Multi-primitive Mesh emission + sibling-fold decode.** A
+  Scene3D `Mesh` carrying N `Primitive`s now serialises as N
+  sibling `def Mesh` prims under the parent Xform, named
+  `<MeshName>` for the first and `<MeshName>_<i>` for
+  subsequent ones (i = 1..N). Each carries its own
+  `material:binding`. The decoder folds sibling Mesh prims
+  whose names share a `<stem>` / `<stem>_<digits>` pattern
+  back into a single Scene3D `Mesh` with N `Primitive`s,
+  preserving full round-trip fidelity. Hand-authored sibling
+  Mesh prims with unrelated names (`HeadGeo`, `BodyGeo`) stay
+  unaffected — each becomes its own Scene3D Mesh.
 - **Per-node transform serialisation.** Both encoder and decoder
   now round-trip `Node::transform` through the
   `UsdGeomXformable` opinion schema:
