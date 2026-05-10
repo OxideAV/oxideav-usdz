@@ -30,10 +30,22 @@
 //!   - `upAxis = "Y" | "Z"` and `metersPerUnit` map onto
 //!     [`Scene3D::up_axis`] + [`Scene3D::unit`].
 //!
-//! Deferred to round 2+:
+//! Round 2 adds the **USDZ encoder**:
 //!
-//! * USDZ encoder (writing back out, with raw_storage("zip-stored")
-//!   pass-through optimisation when the scene was loaded from USDZ).
+//! * [`UsdzEncoder`] / [`Mesh3DEncoder`](oxideav_mesh3d::Mesh3DEncoder)
+//!   serialises a `Scene3D` back into a USDZ archive. Output is
+//!   STORED-only with the spec-mandated 64-byte payload alignment,
+//!   and the Default Layer (USDA text) is always the first entry.
+//! * Texture pass-through: when a texture's
+//!   [`AssetSource::raw_storage`](oxideav_mesh3d::AssetSource::raw_storage)
+//!   returns `RawStorage { scheme: "zip-stored", ... }` (which is
+//!   exactly what a [`ZipStoredAsset`] from this crate's reader
+//!   exposes), the encoder copies the inner-file bytes verbatim
+//!   into the output archive. USDZ → USDZ pipelines never re-encode
+//!   textures.
+//!
+//! Deferred to round 3+:
+//!
 //! * Binary `.usdc` "Crate" parser — Pixar publishes no prose spec
 //!   for the wire format; loading a `.usdc` Default Layer in r1
 //!   surfaces as `Error::Unsupported`.
@@ -62,20 +74,25 @@
 
 pub mod asset_source;
 pub mod decoder;
+pub mod encoder;
 pub mod error;
 pub mod usd_to_scene;
 pub mod usda;
+pub mod usda_writer;
 pub mod zip;
+pub mod zip_writer;
 
 pub use asset_source::ZipStoredAsset;
 pub use decoder::UsdzDecoder;
+pub use encoder::{EncodeReport, UsdzEncoder};
 pub use error::{Error, Result};
 
-/// Register the USDZ decoder against `registry` so callers can
-/// dispatch by extension (`.usdz`).
+/// Register both the USDZ decoder and encoder against `registry` so
+/// callers can dispatch by extension (`.usdz`).
 ///
 /// Only available with the default-on `registry` cargo feature.
 #[cfg(feature = "registry")]
 pub fn register(registry: &mut oxideav_mesh3d::Mesh3DRegistry) {
     registry.register_decoder("usdz", &["usdz"], Box::new(|| Box::new(UsdzDecoder::new())));
+    registry.register_encoder("usdz", &["usdz"], Box::new(|| Box::new(UsdzEncoder::new())));
 }

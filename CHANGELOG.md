@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 2 (USDZ writer)
+
+- `UsdzEncoder` implementing
+  `oxideav_mesh3d::Mesh3DEncoder` for the `.usdz` container.
+  `register()` now wires both decoder + encoder against a
+  `Mesh3DRegistry`.
+- USDZ-conforming PKZIP writer (`zip_writer::Writer`): STORED
+  entries only, every payload offset padded to a multiple of 64
+  bytes via the LFH `extra` field per the USDZ spec, CRC32
+  computed per entry, central directory + EOCD assembled
+  correctly.
+- USDA tokenizer-inverse (`usda_writer::write_layer`): serialises
+  `Scene3D` → `#usda 1.0` text. Coverage mirrors r1's reader —
+  `Xform`/`Scope` nodes, `UsdGeomMesh` (Triangles, positions +
+  optional normals + first-UV-set + material binding),
+  `UsdPreviewSurface` materials with `UsdUVTexture` shader
+  children for diffuse / normal / emissive / occlusion maps,
+  `upAxis` + `metersPerUnit` layer metadata.
+- **USDZ → USDZ pass-through optimisation.** When a texture's
+  `AssetSource::raw_storage()` returns
+  `RawStorage { scheme: "zip-stored", ... }` (which is what
+  `ZipStoredAsset` from this crate's reader exposes), the encoder
+  copies the inner-file bytes verbatim into the output ZIP — no
+  inflate / decode / re-encode cycle. A USDZ → `Scene3D` → USDZ
+  pipeline now preserves texture bytes bit-identical from input
+  to output. Verified by a roundtrip integration test
+  (`tests/roundtrip_encoder.rs`) + the new
+  `EncodeReport { pass_through_textures, reencoded_textures, ... }`
+  return shape from `UsdzEncoder::encode_with_report()`.
+
 ### Added — Round 1 (USDZ reader scaffold)
 
 - `UsdzDecoder` implementing

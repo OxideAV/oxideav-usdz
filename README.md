@@ -1,6 +1,6 @@
 # oxideav-usdz
 
-Pure-Rust **USDZ** (Universal Scene Description, zipped) reader.
+Pure-Rust **USDZ** (Universal Scene Description, zipped) reader **and writer**.
 USDZ is Pixar's container for shipping ready-to-go USD assets — an
 uncompressed, 64-byte-aligned ZIP archive whose first entry is a
 `.usd` / `.usda` / `.usdc` "Default Layer" referenced by every
@@ -9,11 +9,11 @@ iOS / macOS uses USDZ as its native AR scene format.
 
 The crate plugs into the
 [`oxideav-mesh3d`](https://crates.io/crates/oxideav-mesh3d) typed
-model — call `oxideav_usdz::register(&mut Mesh3DRegistry)` and
-dispatch by file extension, or invoke `UsdzDecoder::new()` directly
-and feed it bytes for a `Scene3D`.
+model — call `oxideav_usdz::register(&mut Mesh3DRegistry)` to wire
+both decoder + encoder up for `.usdz` extension dispatch, or
+invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
 
-## Round 1 scope
+## Round 1 scope (reader)
 
 - **PKZIP central-directory walk** — STORED-only entries (USDZ
   spec rejects any compression method); every payload offset is
@@ -33,29 +33,60 @@ and feed it bytes for a `Scene3D`.
 - **`UsdUVTexture` → `Texture`** wrapping a `ZipStoredAsset`.
   `ZipStoredAsset::raw_storage()` returns
   `RawStorage { scheme: "zip-stored", bytes, uncompressed_size }`,
-  so a future round-2 USDZ writer can pass the inner-file bytes
-  through verbatim into the output ZIP without re-buffering.
+  so the round-2 USDZ writer passes inner-file bytes through
+  verbatim into the output ZIP without re-buffering.
 - **`upAxis` + `metersPerUnit`** map onto `Scene3D::up_axis` and
   `Scene3D::unit` (with the standard preset list — metres /
   centimetres / millimetres / inches / feet / yards).
 
-## Deferred to round 2+
+## Round 2 scope (writer)
 
-- **USDZ encoder.** Round 1 is read-only. The encoder will
-  recognise `AssetSource::raw_storage("zip-stored")` on input and
-  copy bytes verbatim into the output archive (no re-encode for
-  USDZ → USDZ pipelines).
+- **`UsdzEncoder` / `Mesh3DEncoder`** — writes a `Scene3D` back
+  out as a USDZ archive. Output is byte-faithful to the spec:
+  STORED entries only, every payload offset is a multiple of 64
+  bytes (LFH `extra` field padded with NULs to push the payload
+  onto the boundary), CRC32 computed per entry, central directory
+  + EOCD assembled correctly.
+- **USDZ → USDZ pass-through** — when a texture's
+  `AssetSource::raw_storage()` returns
+  `RawStorage { scheme: "zip-stored", ... }` (which is exactly
+  what `ZipStoredAsset` from this crate's reader exposes), the
+  encoder copies the bytes verbatim. A USDZ → `Scene3D` → USDZ
+  pipeline therefore never inflates / re-deflates / re-encodes
+  texture or audio assets — the inner-file bytes survive
+  bit-identical from input archive to output archive.
+  `UsdzEncoder::encode_with_report()` returns a per-call
+  `EncodeReport` whose `pass_through_textures` / `reencoded_textures`
+  counters let callers verify the optimisation actually fires for
+  USDZ-sourced scenes.
+- **USDA tokenizer-inverse** — `Scene3D` → USDA text, the inverse
+  of round 1's USDA reader: layer metadata (`upAxis`,
+  `metersPerUnit`), `Xform` nodes containing `def Mesh` children,
+  `UsdGeomMesh` with `faceVertexCounts` / `faceVertexIndices` /
+  `points` / optional `primvars:normals` / optional `primvars:st`,
+  `Material` prims under a synthetic `/Materials` Scope holding
+  `UsdPreviewSurface` shader children + `UsdUVTexture` shader
+  children for every bound texture map.
+
+## Deferred to round 3+
+
 - **Binary `.usdc` "Crate" parser.** Pixar publishes no prose
-  spec for the wire format; loading a `.usdc` Default Layer in r1
-  surfaces as `Error::Unsupported` with a hint to re-package with
-  `usdcat -o foo.usda`.
+  spec for the wire format; loading a `.usdc` Default Layer
+  still surfaces as `Error::Unsupported` with a hint to
+  re-package with `usdcat -o foo.usda`.
 - **`UsdSkelSkeleton` + `UsdSkelBindingAPI`** skeletal-animation
   skinning.
-- **`UsdMediaSpatialAudio`** → `AudioSource` + `AudioEmitter`.
+- **`UsdMediaSpatialAudio`** → `AudioSource` + `AudioEmitter`
+  (writer side too — same `raw_storage("zip-stored")`
+  pass-through optimisation will apply to audio assets once the
+  reader plumbs them in).
 - **`UsdGeomSubset`** per-face material-binding subsets.
 - **Composition arcs** — sub-layers, references, payloads that
-  pull in external USD files. Round 1 reads a single
+  pull in external USD files. Round 1/2 read+write a single
   self-contained USD layer per archive only.
+- **Per-mesh transforms.** The writer currently emits identity
+  transforms only; round 3 will serialise `Transform::Trs` and
+  `Transform::Matrix` as USD `xformOp:transform` opinions.
 
 ## Standalone build
 
@@ -66,5 +97,6 @@ feature. Drop the framework dependency tree entirely with:
 oxideav-usdz = { version = "0.0", default-features = false }
 ```
 
-The decoder still parses USDZ into the same `Scene3D` typed model
-— only the `register()` glue and the `Error` alias change.
+The reader still parses USDZ into the same `Scene3D` typed model
+and the writer still emits valid USDZ archives — only the
+`register()` glue and the `Error` alias change.
