@@ -60,6 +60,60 @@ pub struct Prim {
     pub attrs: BTreeMap<String, Attr>,
     /// Child prims, declaration-ordered.
     pub children: Vec<Prim>,
+    /// VariantSets declared inside the prim body. Outer key is the
+    /// variantSet name (`"shapeVariant"`); inner key is each variant
+    /// name (`"Capsule"`, `"Cone"`, ...). Each [`Variant`] carries
+    /// the inner prim-body block (metadata, attrs, child prims).
+    /// Empty when the prim defines no variantSet — the common case.
+    ///
+    /// USDA syntax (per the OpenUSD glossary `simpleVariantSet.usd`
+    /// example):
+    ///
+    /// ```text
+    /// def Xform "Implicits" (
+    ///     append variantSets = "shapeVariant"
+    /// ) {
+    ///     variantSet "shapeVariant" = {
+    ///         "Capsule" {
+    ///             def Capsule "Pill" { }
+    ///         }
+    ///         "Cone" (
+    ///             prepend references = @other.usd@
+    ///         ) {
+    ///             def Cone "PartyHat" { }
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// Round 6 captures the structured form so a future composition
+    /// engine can switch on `variants = { string foo = "bar" }`
+    /// metadata to bring the selected variant's contents up into the
+    /// prim's own `attrs` / `children`. The current Scene3D
+    /// translator ignores `variant_sets`; the round-trip writer
+    /// re-emits the block verbatim.
+    pub variant_sets: BTreeMap<String, BTreeMap<String, Variant>>,
+}
+
+/// One variant within a [`Prim`]'s `variant_sets`.
+///
+/// Carries the same shape as a [`Prim`] body: optional `( ... )`
+/// metadata, attribute statements, and nested prim children. The
+/// variant doesn't have its own `spec` / `type_name` / `name` —
+/// the variant name is the outer-map key on
+/// [`Prim::variant_sets`] and the type/spec are inherited from the
+/// enclosing prim when the variant is selected.
+#[derive(Clone, Debug, Default)]
+pub struct Variant {
+    /// Optional `( ... )` metadata block — `prepend references = ...`,
+    /// `kind = "..."`, etc. Same shape as [`Prim::metadata`].
+    pub metadata: BTreeMap<String, Value>,
+    /// Attribute and relationship statements inside the variant
+    /// body. Same shape as [`Prim::attrs`].
+    pub attrs: BTreeMap<String, Attr>,
+    /// Child prims declared inside the variant body, in declaration
+    /// order.
+    pub children: Vec<Prim>,
 }
 
 /// One attribute or relationship statement inside a prim body.
@@ -279,6 +333,35 @@ impl<'a> Tokenizer<'a> {
             }
         }
     }
+
+    /// Compute `(line, column)` (both 1-indexed) for the current
+    /// cursor position. Linear scan — only called on the error path
+    /// so the cost is irrelevant.
+    fn line_col(&self) -> (usize, usize) {
+        let mut line = 1usize;
+        let mut col = 1usize;
+        for (i, c) in self.src.char_indices() {
+            if i >= self.pos {
+                break;
+            }
+            if c == '\n' {
+                line += 1;
+                col = 1;
+            } else {
+                col += 1;
+            }
+        }
+        (line, col)
+    }
+
+    /// Render the current position as `line L:C (offset N)` for use
+    /// inside error messages — much more actionable than a raw byte
+    /// offset when the source is hand-authored USDA spanning dozens
+    /// of lines.
+    fn pos_display(&self) -> String {
+        let (l, c) = self.line_col();
+        format!("line {l}:{c} (offset {})", self.pos)
+    }
 }
 
 /// Parse a `( name = value\n name = value )` block (used for both
@@ -358,8 +441,8 @@ fn read_ident(t: &mut Tokenizer<'_>) -> Result<String> {
     };
     if !is_ident_start(first) {
         return Err(invalid(format!(
-            "expected identifier, found `{first}` at offset {}",
-            t.pos
+            "expected identifier, found `{first}` at {}",
+            t.pos_display()
         )));
     }
     let mut s = String::new();
@@ -390,8 +473,8 @@ fn read_attr_name(t: &mut Tokenizer<'_>) -> Result<String> {
     }
     if s.is_empty() {
         return Err(invalid(format!(
-            "expected attribute name at offset {}",
-            t.pos
+            "expected attribute name at {}",
+            t.pos_display()
         )));
     }
     Ok(s)
@@ -528,8 +611,8 @@ fn read_tuple(t: &mut Tokenizer<'_>) -> Result<Vec<Value>> {
             return Ok(out);
         }
         return Err(invalid(format!(
-            "expected `,` or `)` in tuple at offset {}",
-            t.pos
+            "expected `,` or `)` in tuple at {}",
+            t.pos_display()
         )));
     }
 }
@@ -554,8 +637,8 @@ fn read_array(t: &mut Tokenizer<'_>) -> Result<Vec<Value>> {
             return Ok(out);
         }
         return Err(invalid(format!(
-            "expected `,` or `]` in array at offset {}",
-            t.pos
+            "expected `,` or `]` in array at {}",
+            t.pos_display()
         )));
     }
 }
@@ -605,8 +688,8 @@ fn read_number(t: &mut Tokenizer<'_>) -> Result<Value> {
     }
     if !saw_digit {
         return Err(invalid(format!(
-            "expected numeric literal at offset {}",
-            t.pos
+            "expected numeric literal at {}",
+            t.pos_display()
         )));
     }
     let f: f64 = s
@@ -654,8 +737,8 @@ fn parse_value(t: &mut Tokenizer<'_>) -> Result<Value> {
             }
         }
         _ => Err(invalid(format!(
-            "unexpected character `{c}` at offset {} where value expected",
-            t.pos
+            "unexpected character `{c}` at {} where value expected",
+            t.pos_display()
         ))),
     }
 }
@@ -722,14 +805,73 @@ fn read_dict(t: &mut Tokenizer<'_>) -> Result<BTreeMap<String, Value>> {
     }
 }
 
+/// Parse the contents of a `variantSet "name" = { ... }` block —
+/// a sequence of `"variantName" ( optional metadata ) { body }`
+/// entries.
+///
+/// Each body has the same shape as a prim body (attrs + nested
+/// prims + nested variantSets), so we recurse into
+/// [`parse_prim_body`] for it.
+fn parse_variant_set_body(t: &mut Tokenizer<'_>) -> Result<BTreeMap<String, Variant>> {
+    let mut out: BTreeMap<String, Variant> = BTreeMap::new();
+    loop {
+        t.skip_trivia();
+        if t.eat('}') {
+            return Ok(out);
+        }
+        if t.eof() {
+            return Err(invalid("EOF inside variantSet body"));
+        }
+        let variant_name = if matches!(t.peek_char(), Some('"' | '\'')) {
+            read_quoted_string(t)?
+        } else {
+            return Err(invalid(format!(
+                "expected quoted variant name at {}",
+                t.pos_display()
+            )));
+        };
+        t.skip_trivia();
+        let metadata = if t.eat('(') {
+            parse_metadata_block(t)?
+        } else {
+            BTreeMap::new()
+        };
+        t.skip_trivia();
+        if !t.eat('{') {
+            return Err(invalid(format!(
+                "expected `{{` to start variant `{variant_name}` body at {}",
+                t.pos_display()
+            )));
+        }
+        // The inner block is structurally identical to a prim body
+        // (attrs + nested prims + nested variantSets allowed). The
+        // glossary's simpleVariantSet.usd shows the common case
+        // (one nested `def`); composition examples nest references
+        // in the variant metadata which is also handled.
+        let (attrs, children, _nested_vsets) = parse_prim_body(t)?;
+        // Per the USD spec a variant can itself declare nested
+        // variantSets. We don't surface them through `Variant`'s
+        // shape (avoids unbounded recursion in the public type) —
+        // documented limitation.
+        out.insert(
+            variant_name,
+            Variant {
+                metadata,
+                attrs,
+                children,
+            },
+        );
+    }
+}
+
 /// Parse a single `def Type "name" ( ... ) { ... }` prim block.
 fn parse_prim(t: &mut Tokenizer<'_>) -> Result<Prim> {
     t.skip_trivia();
     let spec = read_ident(t)?;
     if !matches!(spec.as_str(), "def" | "over" | "class") {
         return Err(invalid(format!(
-            "expected `def`, `over`, or `class` at offset {}, got `{spec}`",
-            t.pos
+            "expected `def`, `over`, or `class` at {}, got `{spec}`",
+            t.pos_display()
         )));
     }
     t.skip_trivia();
@@ -745,8 +887,8 @@ fn parse_prim(t: &mut Tokenizer<'_>) -> Result<Prim> {
         read_quoted_string(t)?
     } else {
         return Err(invalid(format!(
-            "expected quoted prim name at offset {}",
-            t.pos
+            "expected quoted prim name at {}",
+            t.pos_display()
         )));
     };
     t.skip_trivia();
@@ -758,11 +900,11 @@ fn parse_prim(t: &mut Tokenizer<'_>) -> Result<Prim> {
     t.skip_trivia();
     if !t.eat('{') {
         return Err(invalid(format!(
-            "expected `{{` to start prim body at offset {}",
-            t.pos
+            "expected `{{` to start prim body at {}",
+            t.pos_display()
         )));
     }
-    let (attrs, children) = parse_prim_body(t)?;
+    let (attrs, children, variant_sets) = parse_prim_body(t)?;
     Ok(Prim {
         spec,
         type_name,
@@ -770,18 +912,30 @@ fn parse_prim(t: &mut Tokenizer<'_>) -> Result<Prim> {
         metadata,
         attrs,
         children,
+        variant_sets,
     })
 }
 
+/// Return shape of [`parse_prim_body`] — `(attrs, children,
+/// variant_sets)`. Aliased to keep the function signature under
+/// clippy's `type_complexity` cap.
+type PrimBody = (
+    BTreeMap<String, Attr>,
+    Vec<Prim>,
+    BTreeMap<String, BTreeMap<String, Variant>>,
+);
+
 /// Parse the inside of a `{ ... }` prim body — a mix of attribute
-/// statements and nested prim definitions.
-fn parse_prim_body(t: &mut Tokenizer<'_>) -> Result<(BTreeMap<String, Attr>, Vec<Prim>)> {
+/// statements, nested prim definitions, and `variantSet "name" =
+/// { ... }` blocks.
+fn parse_prim_body(t: &mut Tokenizer<'_>) -> Result<PrimBody> {
     let mut attrs = BTreeMap::new();
     let mut children = Vec::new();
+    let mut variant_sets: BTreeMap<String, BTreeMap<String, Variant>> = BTreeMap::new();
     loop {
         t.skip_trivia();
         if t.eat('}') {
-            return Ok((attrs, children));
+            return Ok((attrs, children, variant_sets));
         }
         if t.eof() {
             return Err(invalid("EOF inside prim body"));
@@ -793,6 +947,43 @@ fn parse_prim_body(t: &mut Tokenizer<'_>) -> Result<(BTreeMap<String, Attr>, Vec
         if matches!(lead.as_str(), "def" | "over" | "class") {
             let prim = parse_prim(t)?;
             children.push(prim);
+            continue;
+        }
+        if lead == "variantSet" {
+            // `variantSet "name" = { "variantA" { ... } "variantB" { ... } }`.
+            // Per the OpenUSD glossary `simpleVariantSet.usd` example.
+            let _ = read_ident(t)?; // consume `variantSet`
+            t.skip_trivia();
+            let vset_name = if matches!(t.peek_char(), Some('"' | '\'')) {
+                read_quoted_string(t)?
+            } else {
+                return Err(invalid(format!(
+                    "expected quoted variantSet name at {}",
+                    t.pos_display()
+                )));
+            };
+            t.skip_trivia();
+            if !t.eat('=') {
+                return Err(invalid(format!(
+                    "expected `=` after variantSet name at {}",
+                    t.pos_display()
+                )));
+            }
+            t.skip_trivia();
+            if !t.eat('{') {
+                return Err(invalid(format!(
+                    "expected `{{` to start variantSet body at {}",
+                    t.pos_display()
+                )));
+            }
+            let variants = parse_variant_set_body(t)?;
+            // Merge into any pre-existing entry for the same vset
+            // name (USDA permits re-opening a variantSet — the
+            // sparse-edit model — though it's rare).
+            let entry = variant_sets.entry(vset_name).or_default();
+            for (k, v) in variants {
+                entry.insert(k, v);
+            }
             continue;
         }
         let _ = saved;
@@ -847,7 +1038,10 @@ fn read_type_then_name(t: &mut Tokenizer<'_>) -> Result<(String, String)> {
     loop {
         t.skip_trivia();
         let Some(word) = peek_ident(t) else {
-            return Err(invalid(format!("expected type token at offset {}", t.pos)));
+            return Err(invalid(format!(
+                "expected type token at {}",
+                t.pos_display()
+            )));
         };
         if matches!(
             word.as_str(),

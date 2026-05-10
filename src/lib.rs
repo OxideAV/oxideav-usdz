@@ -80,11 +80,21 @@
 //!   or TRS) gets its `xformOp:*` opinions on the inner def Mesh
 //!   instead of the parent Xform. Decoder symmetric.
 //!
-//! Deferred to round 6+:
+//! Round 6 adds:
+//!
+//! * **VariantSet structured parser.** `variantSet "name" = {
+//!   "variantA" { ... } }` blocks land on
+//!   `Prim::variant_sets: BTreeMap<String, BTreeMap<String, Variant>>`
+//!   (parse-only; the Scene3D translator continues to ignore them
+//!   pending a future composition engine).
+//! * **Line + column in parser error messages.** Every `at offset N`
+//!   diagnostic now reads `line L:C (offset N)`.
+//!
+//! Deferred to round 7+:
 //!
 //! * Binary `.usdc` "Crate" parser — Pixar publishes no prose spec
-//!   for the wire format; loading a `.usdc` Default Layer in r1
-//!   surfaces as `Error::Unsupported`.
+//!   for the wire format (documented gap in `docs/3d/usd/README.md`);
+//!   loading a `.usdc` Default Layer surfaces as `Error::Unsupported`.
 //! * `UsdSkelSkeleton` + `UsdSkelBindingAPI` skinning.
 //! * `UsdGeomSubset` per-face material binding subsets.
 //! * Composition arcs (sub-layers, references, payloads) that pull

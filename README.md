@@ -146,7 +146,24 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   `xformOp:transform` (or TRS triple) back into the same
   extras slot.
 
-## Deferred to round 6+
+## Round 6 scope (variantSet parsing + line/column errors)
+
+- **VariantSet structured parser.** `variantSet "name" = {
+  "variantA" ( meta ) { body } "variantB" { body } }` blocks
+  inside a prim body now parse into a structured
+  `Prim::variant_sets: BTreeMap<String, BTreeMap<String, Variant>>`
+  (per the OpenUSD glossary `simpleVariantSet.usd` / 
+  `referenceVariantSet` examples). Variants carry their own
+  metadata + attrs + child prims, so a future composition engine
+  can switch on the prim's `variants = { string name = "..." }`
+  metadata. Round 6 is parser-side capture only; semantic
+  composition deferred.
+- **Line + column in parser error messages.** Every
+  `at offset N` diagnostic now reads `line L:C (offset N)`. The
+  raw offset stays for byte-precise tooling; the line/column
+  makes hand-authored USDA debugging actionable.
+
+## Deferred to round 7+
 
 - **Binary `.usdc` "Crate" parser.** Pixar publishes no prose
   spec for the wire format; loading a `.usdc` Default Layer

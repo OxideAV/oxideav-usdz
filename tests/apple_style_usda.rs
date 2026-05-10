@@ -257,6 +257,147 @@ fn pixar_serialiser_brace_layout() {
 }
 
 #[test]
+fn variant_set_parses_into_structured_form() {
+    // Mirrors the OpenUSD glossary `simpleVariantSet.usd` example:
+    // a variantSet declared inside a prim body, with each variant
+    // carrying a nested `def` prim. The parser surfaces the
+    // structure on `Prim::variant_sets` so a future composition
+    // engine can switch on `variants = { string foo = "bar" }`.
+    let src = br#"#usda 1.0
+def Xform "Implicits" (
+    append variantSets = "shapeVariant"
+) {
+    variantSet "shapeVariant" = {
+        "Capsule" {
+            def Capsule "Pill" {
+            }
+        }
+        "Cone" {
+            def Cone "PartyHat" {
+            }
+        }
+        "Cube" {
+            def Cube "Box" {
+            }
+        }
+    }
+}
+"#;
+    let layer = parse(src).expect("parse simpleVariantSet.usd");
+    let prim = &layer.prims[0];
+    assert_eq!(prim.name, "Implicits");
+
+    // The variantSets metadata key still surfaces in `metadata`.
+    assert!(prim.metadata.contains_key("variantSets"));
+
+    // The variantSet block lands in `variant_sets`.
+    let vsets = &prim.variant_sets;
+    assert_eq!(vsets.len(), 1, "one variantSet declared");
+    let shape = vsets.get("shapeVariant").expect("shapeVariant key");
+    assert_eq!(shape.len(), 3, "three variants");
+    assert!(shape.contains_key("Capsule"));
+    assert!(shape.contains_key("Cone"));
+    assert!(shape.contains_key("Cube"));
+
+    // Each variant body holds the nested `def` as a child prim.
+    let capsule_v = shape.get("Capsule").unwrap();
+    assert_eq!(capsule_v.children.len(), 1);
+    assert_eq!(capsule_v.children[0].type_name, "Capsule");
+    assert_eq!(capsule_v.children[0].name, "Pill");
+    assert!(capsule_v.metadata.is_empty());
+    assert!(capsule_v.attrs.is_empty());
+
+    let cube_v = shape.get("Cube").unwrap();
+    assert_eq!(cube_v.children[0].name, "Box");
+}
+
+#[test]
+fn variant_set_with_per_variant_metadata() {
+    // Per the glossary's `referenceVariantSet` example each variant
+    // can carry its own `( ... )` metadata block — typically a
+    // composition arc bringing in another asset.
+    let src = br#"#usda 1.0
+over "Model" {
+    variantSet "referenceVariantSet" = {
+        "asset1" (
+            prepend references = @./Asset1.usda@
+        ) {
+        }
+        "asset2" (
+            prepend references = @./Asset2.usda@
+        ) {
+        }
+    }
+}
+"#;
+    let layer = parse(src).expect("parse variantSet with per-variant metadata");
+    let prim = &layer.prims[0];
+    let vset = prim
+        .variant_sets
+        .get("referenceVariantSet")
+        .expect("variantSet present");
+    let asset1 = vset.get("asset1").expect("asset1 variant");
+    let refs = asset1
+        .metadata
+        .get("references")
+        .expect("references metadata on asset1");
+    match refs {
+        Value::Asset(s) => assert_eq!(s, "./Asset1.usda"),
+        other => panic!("expected Asset, got {other:?}"),
+    }
+    let asset2 = vset.get("asset2").expect("asset2 variant");
+    match asset2.metadata.get("references") {
+        Some(Value::Asset(s)) => assert_eq!(s, "./Asset2.usda"),
+        other => panic!("expected Asset, got {other:?}"),
+    }
+}
+
+#[test]
+fn empty_variant_set_block() {
+    // A variantSet declared but with no variants — Pixar's tooling
+    // sometimes emits this when a variant is removed but the
+    // declaration stub is left behind.
+    let src = b"#usda 1.0\ndef Xform \"X\" {\n    variantSet \"foo\" = {\n    }\n}\n";
+    let layer = parse(src).expect("parse empty variantSet");
+    let prim = &layer.prims[0];
+    let vset = prim.variant_sets.get("foo").expect("foo variantSet");
+    assert!(vset.is_empty());
+}
+
+#[test]
+fn parse_error_reports_line_and_column() {
+    // Round 6: error messages render `line L:C (offset N)` instead
+    // of the bare offset. Plant a stray garbage character at a
+    // known line and verify the error mentions both `line` and the
+    // 1-indexed column.
+    //
+    // Line 1: `#usda 1.0`
+    // Line 2: `def Xform "Root" {`
+    // Line 3: `    %foo = 1`   ← `%` is invalid as type-token start
+    // Line 4: `}`
+    let src = b"#usda 1.0\ndef Xform \"Root\" {\n    %foo = 1\n}\n";
+    let err = parse(src).expect_err("parse should fail on stray `%`");
+    // `Error::InvalidData(String)` under both registry and
+    // standalone feature configurations of oxideav-mesh3d, so we
+    // match `Display` rather than the variant directly.
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("line 3"),
+        "error should mention the line number, got: {msg}"
+    );
+    // Column is 5 (1-indexed; four spaces of indent + the `%` itself).
+    assert!(
+        msg.contains(":5"),
+        "error should mention the column, got: {msg}"
+    );
+    // Offset stays in the message for callers that prefer raw bytes.
+    assert!(
+        msg.contains("offset"),
+        "error should still carry the offset, got: {msg}"
+    );
+}
+
+#[test]
 fn doc_triple_quoted_string_in_metadata() {
     // Pixar's serialiser emits a `doc = """..."""` field when it
     // adds a "generated from..." header during flattening. Triple

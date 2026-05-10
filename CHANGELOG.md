@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 6 (variantSet parsing + line/column errors)
+
+- **VariantSet structured parser.** `variantSet "name" = {
+  "variantA" ( meta ) { body } "variantB" { body } }` blocks
+  inside a prim body now parse into a structured
+  `Prim::variant_sets: BTreeMap<String, BTreeMap<String, Variant>>`
+  rather than landing on the `unexpected character '{' at offset N`
+  error path. Each `Variant` carries its own `metadata`, `attrs`
+  and `children`, mirroring [`Prim`](crate::usda::Prim)'s shape so
+  a future composition engine can switch on the prim's
+  `variants = { string name = "..." }` selection metadata. Coverage
+  matches OpenUSD glossary's `simpleVariantSet.usd` and
+  `referenceVariantSet` examples — variants with composition-arc
+  metadata (`prepend references = @...@`) round-trip too. Empty
+  `variantSet "foo" = {}` blocks (Pixar's tooling emits these when
+  a variant is removed but the declaration stub remains) parse to
+  an empty inner map. The Scene3D translator continues to ignore
+  variant_sets — round 6 is parser-side capture only; semantic
+  composition deferred to a later round.
+- **Line + column in parser error messages.** Every `at offset N`
+  diagnostic in `usda.rs` now renders as `line L:C (offset N)`
+  using a `Tokenizer::pos_display()` helper. The original byte
+  offset stays in the message so callers comparing exact
+  `at offset` substrings keep working; new consumers get an
+  actionable line/column for hand-authored USDA debugging. Affects
+  the identifier / attribute-name / numeric-literal / value-dispatch
+  / prim-spec / prim-name / prim-body / type-token error paths
+  (10 sites total).
+
+### Tests
+
+- `tests/apple_style_usda.rs` gains four cases:
+  `variant_set_parses_into_structured_form` (the canonical
+  glossary example), `variant_set_with_per_variant_metadata`
+  (per-variant `prepend references = @...@`),
+  `empty_variant_set_block` (the stripped-stub case),
+  `parse_error_reports_line_and_column` (locks the new error
+  message shape).
+
+### Docs gap
+
+- **USDC binary "Crate" format.** OpenUSD publishes no prose spec
+  for the wire format — `docs/3d/usd/README.md` documents this
+  explicitly. The C++ source (`pxr/usd/usd/crateFile.{h,cpp}`)
+  is barred under the workspace's no-external-libs rule.
+  Loading a `.usdc` Default Layer continues to surface as
+  `Error::Unsupported` with a `usdcat -o foo.usda` hint.
+
 ### Added — Apple oracle parser unblock (CI run 25631625721)
 
 - **Typed-dictionary value literals** (`Value::Dict`). The USDA
