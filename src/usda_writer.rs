@@ -14,12 +14,58 @@
 //! for any bound texture maps. Audio / skinning / animation are
 //! still reader-side TODOs and are skipped on the encoder side too.
 
+use std::collections::BTreeMap;
 use std::fmt::Write;
 
 use oxideav_mesh3d::{
     AudioData, AudioEmitter, AudioSource, AuralMode, Axis, ImageData, Indices, Material, Mesh,
     MeshId, NodeId, Primitive, Scene3D, Texture, TextureRef, Topology, Transform, Unit,
 };
+
+use crate::usda::Value;
+
+/// `Scene3D::extras` key holding the lossless layer-metadata blob
+/// produced by [`crate::usd_to_scene::translate`].  The blob is a
+/// JSON object whose values use the tagged shape from
+/// [`crate::variant_codec`]; on the writer side we decode it back into
+/// a [`BTreeMap<String, Value>`](Value) and emit each entry inside the
+/// USDA `( ... )` layer-metadata block alongside `upAxis` /
+/// `metersPerUnit`.
+///
+/// Added round 9 — round 1..8 wrote a per-key untagged entry
+/// (`usd:<key>` → string-shaped JSON) which loses the
+/// `Token` / `Asset` / `Path` distinction. The untagged entries stay
+/// for direct-JSON consumers; this blob is the round-trip channel.
+pub const LAYER_METADATA_EXTRAS_KEY: &str = "usd:layerMetadata";
+
+/// `Node::extras` key holding the lossless prim-metadata blob
+/// (counterpart to [`LAYER_METADATA_EXTRAS_KEY`] for per-prim
+/// `( ... )` metadata).  Same tagged shape from
+/// [`crate::variant_codec`].
+///
+/// Added round 9 — round 1..8 stashed the prim metadata under
+/// `usd:metadata` as an untagged JSON object.  That entry stays for
+/// callers reading it directly; this one is what the writer round-
+/// trips through so composition-arc opinions (`references`,
+/// `payload`, `inherits`, `specializes`, `kind`, `apiSchemas`, ...)
+/// survive USDZ → `Scene3D` → USDZ.
+pub const PRIM_METADATA_EXTRAS_KEY: &str = "usd:primMetadata";
+
+/// Metadata keys we always emit with the `prepend` list-edit
+/// operator.  These are USD composition arcs — every authoring tool
+/// (Pixar's `usdedit`, Apple's `usdzconvert`, Houdini, Maya) writes
+/// them with `prepend` because that's the standard LIVRPS-strength
+/// authoring intent: the new opinion sits at the front of the list,
+/// strongest. We follow the same convention so a USDZ round-trip
+/// produces the same shape one would author by hand.
+const PREPEND_LIST_EDIT_KEYS: &[&str] = &[
+    "references",
+    "payload",
+    "inherits",
+    "specializes",
+    "apiSchemas",
+    "variantSets",
+];
 
 /// Serialise `scene` to a UTF-8 USDA text layer.
 ///
@@ -290,6 +336,26 @@ fn write_layer_metadata(w: &mut Out, scene: &Scene3D) {
     writeln!(w.s, "(").unwrap();
     writeln!(w.s, "    upAxis = \"{up_axis}\"").unwrap();
     writeln!(w.s, "    metersPerUnit = {}", format_float(mpu as f64)).unwrap();
+    // Round 9: re-emit `defaultPrim`, `subLayers`, `customLayerData`,
+    // and any other layer-metadata key picked up by the decoder.  The
+    // canonical [`USD glossary`][1] LIVRPS section + the `subLayers` /
+    // `references` examples mandate these keys survive a round-trip
+    // for cross-layer composition to work; r1..r8 dropped them.
+    //
+    // [1]: docs/3d/usd/glossary.html § Composition Arcs / Sub-layers
+    let layer_meta = scene
+        .extras
+        .get(LAYER_METADATA_EXTRAS_KEY)
+        .map(crate::variant_codec::decode_btree_value)
+        .unwrap_or_default();
+    for (k, v) in &layer_meta {
+        // Don't double-emit the canonical keys we already wrote.
+        if matches!(k.as_str(), "upAxis" | "metersPerUnit") {
+            continue;
+        }
+        let formatted = format_metadata_assignment(k, v);
+        writeln!(w.s, "    {formatted}").unwrap();
+    }
     writeln!(w.s, ")").unwrap();
 }
 
@@ -316,7 +382,9 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
         .map(crate::variant_codec::decode_variant_sets)
         .unwrap_or_default();
     let selection = extract_variant_selection(&node.extras);
-    let prim_metadata_lines = build_prim_metadata_lines(&variant_sets, &selection);
+    let composition_lines = extract_composition_arc_lines(&node.extras);
+    let prim_metadata_lines =
+        build_prim_metadata_lines(&variant_sets, &selection, &composition_lines);
 
     // We always emit `Xform` for now — meshes hang off as inner
     // `def Mesh` children rather than collapsing into the node's
@@ -394,8 +462,14 @@ fn build_prim_metadata_lines(
         std::collections::BTreeMap<String, crate::usda::Variant>,
     >,
     selection: &std::collections::BTreeMap<String, String>,
+    composition_lines: &[String],
 ) -> Vec<String> {
     let mut out = Vec::new();
+    // Round 9: composition-arc opinions go first so the LIVRPS
+    // ordering visible in the source file's metadata block is
+    // preserved.  Selection `variants = {...}` follows because it's
+    // strength-ordered below References in the LIVRPS recipe.
+    out.extend_from_slice(composition_lines);
     if !selection.is_empty() {
         // `variants = { string SET = "VAR" ... }` — sorted on SET
         // so output is deterministic regardless of source ordering.
@@ -417,6 +491,35 @@ fn build_prim_metadata_lines(
         // contributing variantSet declarations from a layer.
         let names: Vec<String> = variant_sets.keys().map(|k| format!("\"{k}\"")).collect();
         out.push(format!("prepend variantSets = [{}]", names.join(", ")));
+    }
+    out
+}
+
+/// Pull every non-variant prim-metadata entry back out of the node's
+/// extras and re-emit each as a USDA assignment line for the prim's
+/// `( ... )` metadata block.
+///
+/// The composition-arc keys (`references`, `payload`, `inherits`,
+/// `specializes`, `apiSchemas`) are auto-prefixed with the `prepend`
+/// list-edit operator per [`PREPEND_LIST_EDIT_KEYS`].
+///
+/// `variants` + `variantSets` are intentionally skipped here — the
+/// round-8 variant writer paths handle those.
+fn extract_composition_arc_lines(
+    extras: &std::collections::HashMap<String, serde_json::Value>,
+) -> Vec<String> {
+    let Some(blob) = extras.get(PRIM_METADATA_EXTRAS_KEY) else {
+        return Vec::new();
+    };
+    let meta = crate::variant_codec::decode_btree_value(blob);
+    let mut out = Vec::new();
+    for (k, v) in &meta {
+        // `variants` selection + `variantSets` declaration are emitted
+        // by the variant-aware paths; don't double-emit them here.
+        if matches!(k.as_str(), "variants" | "variantSets") {
+            continue;
+        }
+        out.push(format_metadata_assignment(k, v));
     }
     out
 }
@@ -1610,6 +1713,133 @@ fn sanitize_prim_name(s: &str) -> String {
         out.insert(0, '_');
     }
     out
+}
+
+/// Serialise `value` as a USDA right-hand-side literal.  Inverse of
+/// [`crate::usda::parse_value`].
+///
+/// Covers the [`Value`] variants the decoder can produce from layer
+/// metadata + prim metadata.  Used by the round-9 layer-metadata /
+/// prim-metadata round-trip paths.
+///
+/// Float arrays inside [`Value::Array`] / [`Value::Tuple`] use the
+/// same compact `format_float` rules as the rest of the writer for
+/// determinism.
+fn format_metadata_value(value: &Value) -> String {
+    match value {
+        Value::Token(s) => format!("\"{s}\""),
+        Value::String(s) => format!("\"{}\"", escape_usda_string(s)),
+        Value::Asset(s) => format!("@{s}@"),
+        Value::Path(s) => format!("<{s}>"),
+        Value::Float(f) => format_float(*f),
+        Value::Bool(b) => {
+            if *b {
+                "true".into()
+            } else {
+                "false".into()
+            }
+        }
+        Value::Tuple(seq) => {
+            let mut s = String::from("(");
+            for (i, v) in seq.iter().enumerate() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                s.push_str(&format_metadata_value(v));
+            }
+            s.push(')');
+            s
+        }
+        Value::Array(seq) => {
+            let mut s = String::from("[");
+            for (i, v) in seq.iter().enumerate() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                s.push_str(&format_metadata_value(v));
+            }
+            s.push(']');
+            s
+        }
+        Value::AssetWithPath { asset, prim_path } => format!("@{asset}@<{prim_path}>"),
+        Value::Dict(map) => format_metadata_dict(map),
+        Value::Raw(s) => s.clone(),
+        Value::None => String::new(),
+    }
+}
+
+/// Serialise a typed-dictionary value (`Value::Dict`) as a USDA
+/// `{ TYPE NAME = VALUE; ... }` block.  Round 1 dropped the type
+/// token during parsing, so round-trip output uses a heuristic to
+/// pick a plausible USDA type per value variant — `string` for
+/// quoted strings, `token` for tokens, `dictionary` for nested dicts,
+/// `bool` for bools, `double` for floats.  This is good enough for
+/// the customLayerData blob that Apple's `usdzconvert` emits;
+/// reconstructing the exact original type tokens would require
+/// preserving them in the parser, which round 1 declined to do.
+fn format_metadata_dict(map: &BTreeMap<String, Value>) -> String {
+    if map.is_empty() {
+        return "{ }".into();
+    }
+    let mut s = String::from("{ ");
+    for (i, (k, v)) in map.iter().enumerate() {
+        if i > 0 {
+            s.push_str("; ");
+        }
+        let ty = guess_usda_type(v);
+        let body = format_metadata_value(v);
+        if matches!(v, Value::None) {
+            s.push_str(&format!("{ty} {k}"));
+        } else {
+            s.push_str(&format!("{ty} {k} = {body}"));
+        }
+    }
+    s.push_str(" }");
+    s
+}
+
+fn guess_usda_type(v: &Value) -> &'static str {
+    match v {
+        Value::Token(_) => "token",
+        Value::String(_) => "string",
+        Value::Asset(_) | Value::AssetWithPath { .. } => "asset",
+        Value::Path(_) => "rel",
+        Value::Float(_) => "double",
+        Value::Bool(_) => "bool",
+        Value::Tuple(_) => "double3",
+        Value::Array(_) => "string[]",
+        Value::Dict(_) => "dictionary",
+        Value::Raw(_) | Value::None => "token",
+    }
+}
+
+/// Escape a quoted string for emission inside `"..."` USDA syntax.
+/// Backslash + double-quote are the only mandatory escapes; we keep
+/// the rest of the bytes verbatim so non-ASCII names round-trip.
+fn escape_usda_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Build a `KEY = VALUE` assignment line for emission inside a
+/// USDA `( ... )` metadata block.  Honours the round-9
+/// [`PREPEND_LIST_EDIT_KEYS`] convention for composition arcs.
+fn format_metadata_assignment(key: &str, value: &Value) -> String {
+    let body = format_metadata_value(value);
+    let prepend = PREPEND_LIST_EDIT_KEYS.contains(&key);
+    if prepend {
+        format!("prepend {key} = {body}")
+    } else {
+        format!("{key} = {body}")
+    }
 }
 
 fn format_float(f: f64) -> String {

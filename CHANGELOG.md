@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 9 (composition-arc + layer-metadata round-trip)
+
+- **Layer-metadata round-trip.** The writer now re-emits every
+  layer-level `( ... )` metadata key — `defaultPrim`, `subLayers`,
+  `customLayerData`, and any unknown / Apple-vendor key — in
+  addition to the round-1 `upAxis` + `metersPerUnit` pair. The
+  decoder stashes the source layer's full metadata block on
+  `Scene3D::extras["usd:layerMetadata"]` using the lossless tagged
+  shape from `crate::variant_codec`, so a USDZ → `Scene3D` → USDZ
+  round trip preserves each value's USDA type-token discriminant
+  (`Token` vs `String` vs `Asset` vs `AssetWithPath` vs `Path`).
+  Round 1..8 dropped them silently — every authored `defaultPrim =
+  "Root"` re-emitted with only `upAxis` + `metersPerUnit` left.
+- **Prim composition-arc metadata round-trip.** Mirror of the
+  layer-metadata path on `Node::extras["usd:primMetadata"]`. The
+  writer now re-emits every prim-level `( ... )` metadata key —
+  `kind`, `active`, `apiSchemas`, `references`, `payload`,
+  `inherits`, `specializes`, custom keys — using the LIVRPS
+  `prepend` list-edit prefix for the composition-arc keys
+  (`references` / `payload` / `inherits` / `specializes` /
+  `apiSchemas` / `variantSets`) per OpenUSD authoring convention.
+  `references = @file.usd@</Prim>` round-trips with both the asset
+  path and the `</Prim>` selector intact via `Value::AssetWithPath`.
+- **`format_metadata_value` writer helper.** Inverse of
+  `crate::usda::parse_value` — covers every `Value` variant the
+  decoder produces from a layer- or prim-metadata block. Used by
+  both round-9 round-trip paths plus open to future encoder needs
+  for inline value serialisation.
+
+### Tests
+
+- `tests/composition_roundtrip.rs` — 8-case suite covering each
+  composition-arc / layer-metadata shape end-to-end (build USDZ
+  → decode → write → re-parse → assert): `defaultPrim`,
+  `subLayers = [@a@, @b@]`, `prepend references = @./asset@</P>`
+  (AssetWithPath form), `prepend payload = @./payload@`, prim
+  `kind = "component"`, `customLayerData = { string version =
+  "1.0" }`, `prepend apiSchemas = [...]` list-edit form, and an
+  unknown vendor-custom layer-metadata key (`customField`).
+- Existing 100+ tests across 20 integration files still green;
+  the new tagged extras blob is additive (every prior round's
+  untagged `usd:metadata` / per-key `usd:<key>` entries remain).
+
+### Docs gap (carried forward from round 8)
+
+- **UsdSkel + UsdGeomSubset still blocked.** `docs/3d/usd/README.md`
+  documents that the per-schema HTML for `UsdGeom` / `UsdSkel` /
+  `UsdShade` / `UsdPhysics` schema families lives behind a different
+  URL pattern (`api_*.html`) on openusd.org and isn't staged in the
+  workspace yet. The round-9 brief asked for `UsdGeomSubset` first;
+  glossary.html doesn't define it (only TOC links into the
+  unfetched `api_usd_geom_subset.html`), so the work fell back to
+  the composition-arc push instead.
+- **Cross-file composition arcs still single-layer.** Round 9
+  surfaces references / payloads / sublayers as round-trip metadata,
+  but the Scene3D translator still doesn't open the targeted
+  `@file.usd@` and merge its contents — every cross-file arc stays
+  as a side-channel opinion on `extras`. Cross-file resolution
+  requires per-archive asset traversal that round 9 intentionally
+  defers.
+- **`NodeGraphNodeAPI` / `UsdShadeNodeGraph` composition** — the
+  staged glossary only mentions it in TOC links to the unfetched
+  per-schema HTML. Same staging gap as UsdGeomSubset.
+
 ### Added — Round 8 (variant writer round-trip)
 
 - **VariantSet writer.** The encoder now re-emits `variantSet "name"

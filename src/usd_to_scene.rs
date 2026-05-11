@@ -130,7 +130,19 @@ fn apply_layer_metadata(scene: &mut Scene3D, meta: &BTreeMap<String, Value>) {
     if let Some(f) = meta.get("metersPerUnit").and_then(|v| v.as_f32()) {
         scene.unit = unit_from_meters_per_unit(f);
     }
-    // Stash everything else verbatim for round-trip preservation.
+    // Stash everything else verbatim for round-trip preservation.  Two
+    // shapes ride here:
+    //
+    //   * The lossy, per-key untagged form (`usd:<key>` → JSON value)
+    //     kept from r1 for back-compat with tools that read the keys
+    //     directly without round-tripping the layer.
+    //   * The lossless tagged blob (`usd:layerMetadata` → JSON object
+    //     of every non-canonical key, preserving the [`Value`]
+    //     discriminant via [`crate::variant_codec`]) added in r9 so
+    //     [`crate::usda_writer::write_layer_metadata`] can re-emit the
+    //     original `defaultPrim` / `subLayers` / `customLayerData` etc.
+    //     declarations with their correct USDA type-token shape.
+    let mut tagged = BTreeMap::new();
     for (k, v) in meta {
         if matches!(k.as_str(), "upAxis" | "metersPerUnit") {
             continue;
@@ -138,6 +150,13 @@ fn apply_layer_metadata(scene: &mut Scene3D, meta: &BTreeMap<String, Value>) {
         if let Some(json) = value_to_json(v) {
             scene.extras.insert(format!("usd:{k}"), json);
         }
+        tagged.insert(k.clone(), v.clone());
+    }
+    if !tagged.is_empty() {
+        let blob = crate::variant_codec::encode_btree_value(&tagged);
+        scene
+            .extras
+            .insert(crate::usda_writer::LAYER_METADATA_EXTRAS_KEY.into(), blob);
     }
 }
 
@@ -644,6 +663,14 @@ fn stash_extras(extras: &mut HashMap<String, serde_json::Value>, prim: &Prim) {
             }
         }
         extras.insert("usd:metadata".into(), serde_json::Value::Object(obj));
+        // Round 9: also stash the metadata block in the lossless
+        // tagged shape from [`crate::variant_codec`] so the writer can
+        // reconstruct each value's USDA type-token (Token vs String vs
+        // Asset vs AssetWithPath vs Path).  The untagged `usd:metadata`
+        // entry above stays for callers that consume the JSON
+        // directly without going back through the writer.
+        let tagged = crate::variant_codec::encode_btree_value(&prim.metadata);
+        extras.insert(crate::usda_writer::PRIM_METADATA_EXTRAS_KEY.into(), tagged);
     }
     // Round 8: stash the prim's structured `variant_sets` block on
     // `usd:variantSets` so the writer can re-emit every unselected

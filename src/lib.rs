@@ -120,7 +120,25 @@
 //!   [`crate::variant_codec`] JSON encoding; the writer reads it
 //!   back when synthesising the prim's metadata + body.
 //!
-//! Deferred to round 9+:
+//! Round 9 adds:
+//!
+//! * **Composition-arc + layer-metadata round-trip on the writer.**
+//!   `defaultPrim`, `subLayers`, `customLayerData`, prim `kind`,
+//!   `prepend references = @file@</P>` (AssetWithPath form),
+//!   `prepend payload = @file@`, `prepend apiSchemas = [...]`, and
+//!   every other layer- or prim-level `( ... )` metadata key now
+//!   re-emit from the writer. The decoder stashes the source's
+//!   metadata using the lossless tagged shape from
+//!   [`crate::variant_codec`] under
+//!   [`crate::usda_writer::LAYER_METADATA_EXTRAS_KEY`] /
+//!   [`crate::usda_writer::PRIM_METADATA_EXTRAS_KEY`], so a
+//!   USDZ → `Scene3D` → USDZ pipeline preserves each value's
+//!   USDA type-token discriminant
+//!   (`Token` vs `String` vs `Asset` vs `AssetWithPath` vs `Path`).
+//!   The list-edit operator (`prepend`) is auto-prefixed on
+//!   composition-arc keys per OpenUSD authoring convention.
+//!
+//! Deferred to round 10+:
 //!
 //! * Binary `.usdc` "Crate" parser — Pixar publishes no prose spec
 //!   for the wire format (documented gap in `docs/3d/usd/README.md`);

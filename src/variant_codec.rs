@@ -197,7 +197,12 @@ fn decode_prim(value: &JValue) -> Prim {
     }
 }
 
-fn encode_btree_value(map: &BTreeMap<String, Value>) -> JValue {
+/// Encode a [`BTreeMap<String, Value>`] into a JSON object preserving
+/// every value's [`Value`] discriminant via the tagged-encoding shape
+/// produced by [`encode_value`]. Exposed `pub(crate)` so the layer-
+/// metadata + prim-metadata round-trip paths added in round 9 can
+/// reuse the same lossless shape that round 8 used for variant bodies.
+pub(crate) fn encode_btree_value(map: &BTreeMap<String, Value>) -> JValue {
     let mut o = JMap::new();
     for (k, v) in map {
         o.insert(k.clone(), encode_value(v));
@@ -205,7 +210,9 @@ fn encode_btree_value(map: &BTreeMap<String, Value>) -> JValue {
     JValue::Object(o)
 }
 
-fn decode_btree_value(value: &JValue) -> BTreeMap<String, Value> {
+/// Inverse of [`encode_btree_value`]. Malformed entries decode as
+/// [`Value::None`] (silently skipped by the writer).
+pub(crate) fn decode_btree_value(value: &JValue) -> BTreeMap<String, Value> {
     let mut out = BTreeMap::new();
     let JValue::Object(obj) = value else {
         return out;
