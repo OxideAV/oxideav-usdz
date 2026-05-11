@@ -645,6 +645,14 @@ fn stash_extras(extras: &mut HashMap<String, serde_json::Value>, prim: &Prim) {
         }
         extras.insert("usd:metadata".into(), serde_json::Value::Object(obj));
     }
+    // Round 8: stash the prim's structured `variant_sets` block on
+    // `usd:variantSets` so the writer can re-emit every unselected
+    // variant (round 7 only evaluated the *selected* one, leaving the
+    // others invisible to a USDZ → USDZ round trip).  See
+    // [`crate::variant_codec`] for the JSON shape.
+    if let Some(json) = crate::variant_codec::encode_variant_sets(&prim.variant_sets) {
+        extras.insert(crate::variant_codec::EXTRAS_KEY.into(), json);
+    }
 }
 
 /// Build a `Mesh + Primitive` from a USD `Mesh` / `BasisCurves` /

@@ -305,13 +305,45 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
     } else {
         format!("{parent_path}/{safe_name}")
     };
+    // Round 8: surface the prim's variant declarations on the prim
+    // metadata block — `prepend variantSets = [...]` lists the set
+    // names we'll emit inside the body, and `variants = {...}` carries
+    // the selection that resolved a variant during decode (so re-decoding
+    // the round-tripped USDA reproduces the same Scene3D).
+    let variant_sets = node
+        .extras
+        .get(crate::variant_codec::EXTRAS_KEY)
+        .map(crate::variant_codec::decode_variant_sets)
+        .unwrap_or_default();
+    let selection = extract_variant_selection(&node.extras);
+    let prim_metadata_lines = build_prim_metadata_lines(&variant_sets, &selection);
+
     // We always emit `Xform` for now — meshes hang off as inner
     // `def Mesh` children rather than collapsing into the node's
     // own prim type. Round-3 work: also synthesise `Camera` /
     // `Light` prim types when the node carries those references.
     w.write_indent();
-    writeln!(w.s, "def Xform \"{safe_name}\" {{").unwrap();
+    if prim_metadata_lines.is_empty() {
+        writeln!(w.s, "def Xform \"{safe_name}\" {{").unwrap();
+    } else {
+        writeln!(w.s, "def Xform \"{safe_name}\" (").unwrap();
+        w.indent += 1;
+        for line in &prim_metadata_lines {
+            w.write_indent();
+            writeln!(w.s, "{line}").unwrap();
+        }
+        w.indent -= 1;
+        w.write_indent();
+        writeln!(w.s, ") {{").unwrap();
+    }
     w.indent += 1;
+
+    // Emit each declared `variantSet "name" = { "variant" { ... } }`
+    // block.  Keys are walked in BTreeMap order so output is
+    // deterministic regardless of input ordering.
+    if !variant_sets.is_empty() {
+        write_variant_sets(w, &variant_sets);
+    }
 
     // Per-node transform → `xformOp:*` opinions. Identity TRS
     // collapses to nothing (cleaner output + matches what the r1/r2
@@ -349,6 +381,269 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
     w.indent -= 1;
     w.write_indent();
     writeln!(w.s, "}}").unwrap();
+}
+
+/// Produce the `( ... )` metadata-block lines for a node prim — one
+/// per declared variantSet plus the optional `variants = {...}`
+/// selection.  Returns an empty vec when the node carries no variant
+/// information, which lets the caller skip the metadata block entirely
+/// for the common case (preserving the round-1 / r2 output shape).
+fn build_prim_metadata_lines(
+    variant_sets: &std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, crate::usda::Variant>,
+    >,
+    selection: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if !selection.is_empty() {
+        // `variants = { string SET = "VAR" ... }` — sorted on SET
+        // so output is deterministic regardless of source ordering.
+        let mut buf = String::from("variants = {");
+        let mut first = true;
+        for (set, var) in selection {
+            if !first {
+                buf.push(';');
+            }
+            buf.push_str(&format!(" string {set} = \"{var}\""));
+            first = false;
+        }
+        buf.push_str(" }");
+        out.push(buf);
+    }
+    if !variant_sets.is_empty() {
+        // `prepend variantSets = ["a", "b", ...]` — the list-edit
+        // operator follows the OpenUSD glossary's convention for
+        // contributing variantSet declarations from a layer.
+        let names: Vec<String> = variant_sets.keys().map(|k| format!("\"{k}\"")).collect();
+        out.push(format!("prepend variantSets = [{}]", names.join(", ")));
+    }
+    out
+}
+
+/// Pull the `variants = { string SET = "VAR" }` selection back out of
+/// the node's `usd:metadata` extras stash.  The decoder mirrors the
+/// prim's metadata into `extras["usd:metadata"]` as a JSON object
+/// where each value is a JSON-shaped [`Value`](crate::usda::Value);
+/// the `variants` entry surfaces as a JSON object whose values are
+/// the variant names (since the parser drops the `string` type token
+/// during the `Value::Dict` flattening).
+fn extract_variant_selection(
+    extras: &std::collections::HashMap<String, serde_json::Value>,
+) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let Some(meta) = extras.get("usd:metadata").and_then(|v| v.as_object()) else {
+        return out;
+    };
+    let Some(variants) = meta.get("variants").and_then(|v| v.as_object()) else {
+        return out;
+    };
+    for (set, val) in variants {
+        if let Some(s) = val.as_str() {
+            out.insert(set.clone(), s.to_string());
+        }
+    }
+    out
+}
+
+/// Emit each `variantSet "name" = { "variant" ( meta ) { body } }`
+/// block on the prim body.  Walks BTreeMap key-sorted order so the
+/// output matches the structural form decode_variant_sets returns.
+fn write_variant_sets(
+    w: &mut Out,
+    sets: &std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, crate::usda::Variant>,
+    >,
+) {
+    for (set_name, variants) in sets {
+        w.write_indent();
+        writeln!(w.s, "variantSet \"{set_name}\" = {{").unwrap();
+        w.indent += 1;
+        for (variant_name, variant) in variants {
+            write_one_variant(w, variant_name, variant);
+        }
+        w.indent -= 1;
+        w.write_indent();
+        writeln!(w.s, "}}").unwrap();
+    }
+}
+
+/// Emit one `"variantName" ( meta ) { ... }` entry inside a
+/// variantSet body.  The body is a synthetic prim-body — we walk the
+/// variant's `metadata` (the optional `( ... )` block), `attrs`, and
+/// recursive `children` with the same rules used to round-trip prim
+/// bodies elsewhere.
+fn write_one_variant(w: &mut Out, name: &str, variant: &crate::usda::Variant) {
+    w.write_indent();
+    if variant.metadata.is_empty() {
+        writeln!(w.s, "\"{name}\" {{").unwrap();
+    } else {
+        writeln!(w.s, "\"{name}\" (").unwrap();
+        w.indent += 1;
+        for line in metadata_lines_from_value_map(&variant.metadata) {
+            w.write_indent();
+            writeln!(w.s, "{line}").unwrap();
+        }
+        w.indent -= 1;
+        w.write_indent();
+        writeln!(w.s, ") {{").unwrap();
+    }
+    w.indent += 1;
+    write_attr_map(w, &variant.attrs);
+    for child in &variant.children {
+        write_prim(w, child);
+    }
+    w.indent -= 1;
+    w.write_indent();
+    writeln!(w.s, "}}").unwrap();
+}
+
+/// Render a `BTreeMap<String, Value>` (a parsed `(...)` metadata
+/// block) back into one `name = value` line per entry.  Used inside
+/// per-variant `(...)` blocks; mirrors the input shape of
+/// [`crate::usda::parse_metadata_block`].
+fn metadata_lines_from_value_map(
+    map: &std::collections::BTreeMap<String, crate::usda::Value>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for (k, v) in map {
+        match render_value(v) {
+            Some(rendered) => out.push(format!("{k} = {rendered}")),
+            None => out.push(k.clone()),
+        }
+    }
+    out
+}
+
+/// Emit `BTreeMap<String, Attr>` as `<type> <name> = <value>` lines.
+fn write_attr_map(w: &mut Out, attrs: &std::collections::BTreeMap<String, crate::usda::Attr>) {
+    for (name, attr) in attrs {
+        w.write_indent();
+        let type_token = if attr.type_token.is_empty() {
+            String::new()
+        } else {
+            format!("{} ", attr.type_token)
+        };
+        match render_value(&attr.value) {
+            Some(rendered) => writeln!(w.s, "{type_token}{name} = {rendered}").unwrap(),
+            None => writeln!(w.s, "{type_token}{name}").unwrap(),
+        }
+    }
+}
+
+/// Recursively serialise a [`crate::usda::Prim`] back into USDA text.
+/// Used to re-emit a variant's child prim trees so a round-trip
+/// preserves nested geometry / shaders authored inside variants.
+fn write_prim(w: &mut Out, prim: &crate::usda::Prim) {
+    w.write_indent();
+    let type_token = if prim.type_name.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", prim.type_name)
+    };
+    let metadata_lines = if prim.metadata.is_empty() {
+        Vec::new()
+    } else {
+        metadata_lines_from_value_map(&prim.metadata)
+    };
+    if metadata_lines.is_empty() {
+        writeln!(w.s, "{}{} \"{}\" {{", prim.spec, type_token, prim.name).unwrap();
+    } else {
+        writeln!(w.s, "{}{} \"{}\" (", prim.spec, type_token, prim.name).unwrap();
+        w.indent += 1;
+        for line in metadata_lines {
+            w.write_indent();
+            writeln!(w.s, "{line}").unwrap();
+        }
+        w.indent -= 1;
+        w.write_indent();
+        writeln!(w.s, ") {{").unwrap();
+    }
+    w.indent += 1;
+    write_attr_map(w, &prim.attrs);
+    if !prim.variant_sets.is_empty() {
+        write_variant_sets(w, &prim.variant_sets);
+    }
+    for child in &prim.children {
+        write_prim(w, child);
+    }
+    w.indent -= 1;
+    w.write_indent();
+    writeln!(w.s, "}}").unwrap();
+}
+
+/// Render a [`crate::usda::Value`] back into the USDA literal form
+/// the parser would accept.  Returns `None` for [`Value::None`] (the
+/// caller emits the bare attribute name without a `=`).
+fn render_value(v: &crate::usda::Value) -> Option<String> {
+    use crate::usda::Value as V;
+    Some(match v {
+        V::Token(s) => s.clone(),
+        V::String(s) => format!("\"{}\"", escape_quoted(s)),
+        V::Float(f) => format_float(*f),
+        V::Bool(b) => if *b { "true" } else { "false" }.into(),
+        V::Tuple(seq) => format!(
+            "({})",
+            seq.iter()
+                .map(|x| render_value(x).unwrap_or_else(|| "none".into()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        V::Array(seq) => format!(
+            "[{}]",
+            seq.iter()
+                .map(|x| render_value(x).unwrap_or_else(|| "none".into()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        V::Asset(s) => format!("@{s}@"),
+        V::Path(s) => format!("<{s}>"),
+        V::Dict(map) => {
+            // Synthesise a `string foo = "bar"` entry per key — Apple's
+            // round-trippable spelling for unknown-typed dicts.  This
+            // is good enough for the `variants = {...}` selection (the
+            // only Dict shape we actively reconstruct on the writer
+            // path); other Dict round-trips fall back to the same
+            // shape, which the parser is happy to re-ingest.
+            let mut buf = String::from("{");
+            let mut first = true;
+            for (k, val) in map {
+                if !first {
+                    buf.push(';');
+                }
+                let rendered = render_value(val).unwrap_or_else(|| "none".into());
+                let type_hint = match val {
+                    V::String(_) | V::Token(_) => "string",
+                    V::Float(_) => "double",
+                    V::Bool(_) => "bool",
+                    _ => "string",
+                };
+                buf.push_str(&format!(" {type_hint} {k} = {rendered}"));
+                first = false;
+            }
+            buf.push_str(" }");
+            buf
+        }
+        V::AssetWithPath { asset, prim_path } => format!("@{asset}@<{prim_path}>"),
+        V::Raw(s) => s.clone(),
+        V::None => return None,
+    })
+}
+
+fn escape_quoted(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Serialise the per-node transform as a list of `xformOp:*`

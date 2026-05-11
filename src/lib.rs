@@ -106,7 +106,21 @@
 //!   `usd:variantReferences:<set>:<var>:references` so the extras
 //!   layer surfaces the unresolved arc to the caller.
 //!
-//! Deferred to round 8+:
+//! Round 8 adds:
+//!
+//! * **VariantSet writer round-trip.** The encoder now re-emits
+//!   `variantSet "name" = { "variant" ( meta ) { body } }` blocks
+//!   from the source layer (including unselected branches), the
+//!   `prepend variantSets = [...]` declaration, and the
+//!   `variants = { string SET = "VAR" }` selection metadata, so a
+//!   USDZ → `Scene3D` → USDZ pipeline preserves every variant body
+//!   regardless of which one was selected. The decoder stashes the
+//!   structured form under
+//!   `Node::extras["usd:variantSets"]` via the
+//!   [`crate::variant_codec`] JSON encoding; the writer reads it
+//!   back when synthesising the prim's metadata + body.
+//!
+//! Deferred to round 9+:
 //!
 //! * Binary `.usdc` "Crate" parser — Pixar publishes no prose spec
 //!   for the wire format (documented gap in `docs/3d/usd/README.md`);
@@ -117,13 +131,8 @@
 //!   staged).
 //! * `UsdGeomSubset` per-face material binding subsets — same
 //!   schema-doc gap as UsdSkel.
-//! * **Variant writer support.** Round 7 evaluates variants on the
-//!   read path; the writer doesn't yet re-emit `variantSet` blocks
-//!   from the source layer's structured form, nor the
-//!   `variants = { ... }` selection metadata. A round-trip through
-//!   `Scene3D` flattens the variant content into the resolved tree.
 //! * Composition arcs (sub-layers, references, payloads) that pull
-//!   in **external** USD files; r1-r7 handle a single self-contained
+//!   in **external** USD files; r1-r8 handle a single self-contained
 //!   USD layer per archive only.
 //!
 //! ## Standalone build
@@ -149,6 +158,7 @@ pub mod error;
 pub mod usd_to_scene;
 pub mod usda;
 pub mod usda_writer;
+pub mod variant_codec;
 pub mod zip;
 pub mod zip_writer;
 

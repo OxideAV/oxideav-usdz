@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 8 (variant writer round-trip)
+
+- **VariantSet writer.** The encoder now re-emits `variantSet "name"
+  = { "variant" ( meta ) { body } ... }` blocks captured from the
+  source layer, plus the `variants = { string SET = "VAR" ... }`
+  selection metadata and the `prepend variantSets = [...]` list, so
+  a USDZ → USDZ round trip preserves every variant body, including
+  the *unselected* branches that round 7 left invisible to the
+  writer (round 7 evaluated the selected variant and flattened it
+  into the resolved tree, dropping the others).
+- **`crate::variant_codec` module.** Defines the JSON shape used
+  for the `Node::extras["usd:variantSets"]` round-trip stash —
+  every `Variant`'s `metadata` / `attrs` / recursive prim
+  `children` are encoded with full type discriminants so the
+  writer can reconstruct the original USDA spelling (`Token` vs
+  `String` vs `Asset` etc. all round-trip distinctly). `Prim`
+  trees inside a variant body are encoded recursively, including
+  nested `variant_sets` declarations.
+- **Decoder side: stash on Node extras.** `usd_to_scene::stash_extras`
+  now also encodes the prim's `variant_sets` block via
+  `variant_codec::encode_variant_sets()` and writes it under the
+  `usd:variantSets` extras key on the synthesised `Node`.
+
+### Tests
+
+- `tests/variant_writer.rs` — 4-case suite: the full
+  decode→encode→re-decode→re-parse loop on the glossary's classic
+  three-variant `simpleVariantSet.usd` shape (asserts every variant
+  body survives + selection metadata picks the same Capsule on
+  re-decode); per-variant attribute round-trip; bare `def Xform`
+  without variants emits no `(...)` metadata block (preserves r1/r2
+  output shape); two distinct variantSets on the same prim survive
+  + their selections still resolve on re-decode.
+
+### Docs gap
+
+- **UsdSkel + UsdGeomSubset still blocked.** `docs/3d/usd/README.md`
+  documents that the per-schema HTML for the `UsdGeom` / `UsdSkel`
+  / `UsdShade` schema families lives behind a different URL pattern
+  (`api_*.html`) on openusd.org and isn't staged in the workspace
+  yet. Both candidate features (skeletal animation, per-face
+  material subsets) wait on that staging round.
+- **Composition arcs (sublayers / references / payloads pulling in
+  *external* USD files) still single-layer only.** Round 8 closes
+  the variant-selection round-trip gap; cross-file composition
+  remains a future round.
+
 ### Added — Round 7 (variant selection composition)
 
 - **Variant selection composition.** The Scene3D translator now
