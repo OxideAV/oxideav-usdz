@@ -163,18 +163,41 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   raw offset stays for byte-precise tooling; the line/column
   makes hand-authored USDA debugging actionable.
 
-## Deferred to round 7+
+## Round 7 scope (variant selection composition)
+
+- **Variant selection composition.** The Scene3D translator now
+  evaluates `metadata["variants"] = { string SET = "VAR" }`
+  selections against `Prim::variant_sets` before walking the prim
+  tree. The matching variant's `attrs` and `children` are merged
+  in under **LIVRPS** strength order — Local opinions beat
+  Variant opinions. A `def Mesh` declared inside a selected
+  variant therefore materialises as a Scene3D Mesh + Node just
+  like a directly-authored child would. Round 7 is read-only; the
+  writer doesn't yet round-trip `variantSet` blocks (a `Scene3D`
+  round-trip flattens the variant content into the resolved
+  tree). Public API: `Prim::resolved_variants()` returns the
+  composed view of a single prim. External `references = @...@`
+  opinions inside a selected variant are NOT followed — they're
+  stashed under `usd:variantReferences:<set>:<var>:references` so
+  the extras layer surfaces the unresolved arc to the caller.
+
+## Deferred to round 8+
 
 - **Binary `.usdc` "Crate" parser.** Pixar publishes no prose
   spec for the wire format; loading a `.usdc` Default Layer
   still surfaces as `Error::Unsupported` with a hint to
   re-package with `usdcat -o foo.usda`.
 - **`UsdSkelSkeleton` + `UsdSkelBindingAPI`** skeletal-animation
-  skinning.
-- **`UsdGeomSubset`** per-face material-binding subsets.
-- **Composition arcs** — sub-layers, references, payloads that
-  pull in external USD files. Rounds 1–5 read+write a single
-  self-contained USD layer per archive only.
+  skinning — blocked on `UsdSkel` schema docs not yet staged in
+  `docs/3d/usd/`.
+- **`UsdGeomSubset`** per-face material-binding subsets — same
+  schema-doc gap as `UsdSkel`.
+- **Variant writer.** Round 7 evaluates variants on the read
+  path; the encoder doesn't yet re-emit `variantSet` blocks back
+  from a `Scene3D`.
+- **External composition arcs** — sub-layers, references, payloads
+  that pull in **other** USD files. Rounds 1–7 read+write a
+  single self-contained USD layer per archive only.
 
 ## Standalone build
 

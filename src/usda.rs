@@ -116,6 +116,137 @@ pub struct Variant {
     pub children: Vec<Prim>,
 }
 
+impl Prim {
+    /// Return a [`Prim`] with every selected variant composed into
+    /// the prim body — the variant's `attrs` and `children` are
+    /// merged in **under** the prim's own opinions (Local Wins per
+    /// the OpenUSD glossary's LIVRPS strength order: Local,
+    /// Inherits, VariantSets, References, Payloads, Specializes).
+    ///
+    /// The selection is read from the prim's own `metadata` under
+    /// the `variants` key — the standard USDA shape:
+    ///
+    /// ```text
+    /// def Xform "Implicits" (
+    ///     variants = { string shapeVariant = "Capsule" }
+    /// ) {
+    ///     variantSet "shapeVariant" = {
+    ///         "Capsule" { def Capsule "Pill" {} }
+    ///         "Cone"    { def Cone "PartyHat" {} }
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// With `shapeVariant = "Capsule"`, the resolved prim picks up
+    /// `def Capsule "Pill"` as a child (in addition to any children
+    /// authored directly on the prim).
+    ///
+    /// **What's resolved:**
+    ///
+    /// * `metadata["variants"] = { string SET = "VARIANT", ... }`
+    ///   names which variant to pull in for each declared variantSet.
+    /// * For each `(SET, VARIANT)` pair, the matching
+    ///   `variant_sets[SET][VARIANT]` is composed in:
+    ///   - `Variant::children` are appended to the prim's own
+    ///     `children` (variant-authored children are weaker than
+    ///     local children sharing the same name; we de-dup by prim
+    ///     name + spec, keeping the local one).
+    ///   - `Variant::attrs` are merged into the prim's `attrs` only
+    ///     for keys not already present locally.
+    ///   - `Variant::metadata` is merged into the prim's `metadata`
+    ///     for keys not already present locally — *except* the
+    ///     `references` / `payload` keys, which round 7 records on
+    ///     the resolved prim's metadata as
+    ///     `usd:variantReferences` so the Scene3D extras layer
+    ///     surfaces the unresolved arc to the caller (we don't
+    ///     follow external references in round 7).
+    /// * Nested children are *not* recursed into — call
+    ///   [`Prim::resolved_variants`] again on each child to
+    ///   compose its variants in turn. The top-level translator in
+    ///   [`crate::usd_to_scene::translate`] handles that walk.
+    ///
+    /// **What's preserved:**
+    ///
+    /// * `variant_sets` stays on the resolved prim verbatim so a
+    ///   writer round-trip can re-emit the block.
+    /// * `metadata["variants"]` stays so the selection itself
+    ///   round-trips.
+    ///
+    /// **Edge cases:**
+    ///
+    /// * No `variants` metadata key → prim returned unchanged
+    ///   (variant_sets are present but no selection authored).
+    /// * Selection naming a variant that doesn't exist → that
+    ///   `(SET, VARIANT)` pair is silently skipped (per USD's
+    ///   "variant selections are not required" tolerance rule).
+    /// * Selection naming a variantSet that doesn't exist → also
+    ///   silently skipped.
+    pub fn resolved_variants(&self) -> Prim {
+        let Some(Value::Dict(selections)) = self.metadata.get("variants") else {
+            return self.clone();
+        };
+        if self.variant_sets.is_empty() {
+            return self.clone();
+        }
+
+        let mut out_attrs = self.attrs.clone();
+        let mut out_children = self.children.clone();
+        let mut out_metadata = self.metadata.clone();
+
+        for (set_name, sel_value) in selections {
+            let variant_name = match sel_value {
+                Value::String(s) | Value::Token(s) => s.as_str(),
+                _ => continue,
+            };
+            let Some(set) = self.variant_sets.get(set_name) else {
+                continue;
+            };
+            let Some(variant) = set.get(variant_name) else {
+                continue;
+            };
+
+            // Variant attrs lose to local opinions.
+            for (k, v) in &variant.attrs {
+                out_attrs.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+
+            // Variant metadata loses to local; composition arcs are
+            // mirrored into a side-channel so the Scene3D extras
+            // layer surfaces them.
+            for (k, v) in &variant.metadata {
+                if matches!(k.as_str(), "references" | "payload") {
+                    let bucket_key = format!("usd:variantReferences:{set_name}:{variant_name}:{k}");
+                    out_metadata.insert(bucket_key, v.clone());
+                    continue;
+                }
+                out_metadata.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+
+            // Variant children are appended; collisions on
+            // (spec, name) lose to local children.
+            for child in &variant.children {
+                let key = (child.spec.as_str(), child.name.as_str());
+                let collision = out_children
+                    .iter()
+                    .any(|c| (c.spec.as_str(), c.name.as_str()) == key);
+                if !collision {
+                    out_children.push(child.clone());
+                }
+            }
+        }
+
+        Prim {
+            spec: self.spec.clone(),
+            type_name: self.type_name.clone(),
+            name: self.name.clone(),
+            metadata: out_metadata,
+            attrs: out_attrs,
+            children: out_children,
+            variant_sets: self.variant_sets.clone(),
+        }
+    }
+}
+
 /// One attribute or relationship statement inside a prim body.
 #[derive(Clone, Debug)]
 pub struct Attr {

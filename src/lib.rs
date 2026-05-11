@@ -90,16 +90,41 @@
 //! * **Line + column in parser error messages.** Every `at offset N`
 //!   diagnostic now reads `line L:C (offset N)`.
 //!
-//! Deferred to round 7+:
+//! Round 7 adds:
+//!
+//! * **Variant selection composition.** The Scene3D translator now
+//!   evaluates `metadata["variants"] = { string SET = "VAR" }`
+//!   selections against `Prim::variant_sets` before walking the
+//!   prim tree. The matching variant's `attrs` and `children` are
+//!   merged into the prim under LIVRPS strength order — Local
+//!   opinions beat the variant's. So a `def Mesh` declared inside
+//!   a selected variant materialises as a Scene3D Mesh + Node just
+//!   like a directly-authored child would. See
+//!   [`crate::usda::Prim::resolved_variants`] for the composition
+//!   algorithm. Variant `references = @other.usd@` opinions are
+//!   not followed (round 7 is single-layer); they're stashed under
+//!   `usd:variantReferences:<set>:<var>:references` so the extras
+//!   layer surfaces the unresolved arc to the caller.
+//!
+//! Deferred to round 8+:
 //!
 //! * Binary `.usdc` "Crate" parser — Pixar publishes no prose spec
 //!   for the wire format (documented gap in `docs/3d/usd/README.md`);
 //!   loading a `.usdc` Default Layer surfaces as `Error::Unsupported`.
-//! * `UsdSkelSkeleton` + `UsdSkelBindingAPI` skinning.
-//! * `UsdGeomSubset` per-face material binding subsets.
+//! * `UsdSkelSkeleton` + `UsdSkelBindingAPI` skinning — UsdSkel
+//!   schema docs are not in our `docs/3d/usd/` (the spec README
+//!   notes UsdSkel sits behind a per-schema URL pattern not yet
+//!   staged).
+//! * `UsdGeomSubset` per-face material binding subsets — same
+//!   schema-doc gap as UsdSkel.
+//! * **Variant writer support.** Round 7 evaluates variants on the
+//!   read path; the writer doesn't yet re-emit `variantSet` blocks
+//!   from the source layer's structured form, nor the
+//!   `variants = { ... }` selection metadata. A round-trip through
+//!   `Scene3D` flattens the variant content into the resolved tree.
 //! * Composition arcs (sub-layers, references, payloads) that pull
-//!   in external USD files; r1 handles a single self-contained USD
-//!   layer per archive only.
+//!   in **external** USD files; r1-r7 handle a single self-contained
+//!   USD layer per archive only.
 //!
 //! ## Standalone build
 //!

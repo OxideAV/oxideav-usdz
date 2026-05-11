@@ -43,6 +43,25 @@ use crate::Result;
 
 /// Convert a parsed USDA layer + the surrounding ZIP archive into
 /// a [`Scene3D`].
+///
+/// **Variant composition (round 7).** Before the material index +
+/// node-build passes run, the prim tree is transformed by
+/// recursively applying [`Prim::resolved_variants`](crate::usda::Prim::resolved_variants):
+/// every prim with `metadata["variants"] = { string SET = "VAR" }`
+/// has the corresponding `variant_sets[SET][VAR]`'s attrs +
+/// children composed in (under local opinions per LIVRPS strength
+/// order). The downstream `index_materials` + `build_node` passes
+/// then see the composed view, so a `def Material` declared inside
+/// a selected variant participates in `material:binding`
+/// resolution and a `def Mesh` declared inside a selected variant
+/// becomes a Scene3D Mesh + Node just like a directly-declared
+/// child would.
+///
+/// Variant `references = @...@` and `payload = @...@` opinions
+/// are NOT followed (round 7 is single-layer evaluation only) —
+/// they're stashed on the resolved prim's metadata under
+/// `usd:variantReferences:<set>:<var>:references` so the extras
+/// stash surfaces the unresolved arc to the caller.
 pub fn translate(layer: &Layer, archive: Arc<Vec<u8>>, entries: &[ZipEntry]) -> Result<Scene3D> {
     let mut ctx = Ctx {
         scene: Scene3D::new(),
@@ -57,19 +76,36 @@ pub fn translate(layer: &Layer, archive: Arc<Vec<u8>>, entries: &[ZipEntry]) -> 
 
     apply_layer_metadata(&mut ctx.scene, &layer.metadata);
 
+    // Recursively compose variant selections so the rest of the
+    // translator never has to think about variant_sets again.
+    let resolved: Vec<Prim> = layer.prims.iter().map(resolve_variants_recursive).collect();
+
     // Walk the prim tree once, indexing every Material + Shader by
     // its absolute prim path. We resolve material bindings on a
     // second pass once every material is registered.
-    index_materials(&mut ctx, "", &layer.prims)?;
+    index_materials(&mut ctx, "", &resolved)?;
 
     // Now build the node tree.
-    for prim in &layer.prims {
+    for prim in &resolved {
         let node = build_node(&mut ctx, "", prim)?;
         if let Some(id) = node {
             ctx.scene.add_root(id);
         }
     }
     Ok(ctx.scene)
+}
+
+/// Apply [`Prim::resolved_variants`](crate::usda::Prim::resolved_variants)
+/// at every depth of the prim tree, returning a new tree where
+/// every prim's variant selection (if any) has been composed in.
+fn resolve_variants_recursive(prim: &Prim) -> Prim {
+    let mut composed = prim.resolved_variants();
+    composed.children = composed
+        .children
+        .iter()
+        .map(resolve_variants_recursive)
+        .collect();
+    composed
 }
 
 struct Ctx {

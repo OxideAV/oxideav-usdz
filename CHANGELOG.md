@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 7 (variant selection composition)
+
+- **Variant selection composition.** The Scene3D translator now
+  evaluates `metadata["variants"] = { string SET = "VAR" }`
+  against `Prim::variant_sets` before walking the prim tree. The
+  matching variant's `attrs` and `children` are merged into the
+  prim per LIVRPS strength order — Local opinions beat the
+  variant's. The headline behaviour: a `def Mesh` declared inside
+  a selected variant materialises as a Scene3D `Mesh` + `Node`
+  just like a directly-authored child would. The composition is
+  recursive — variant selections deep in the prim tree are
+  resolved on the same pass.
+- **`Prim::resolved_variants()` helper.** Public API on
+  [`crate::usda::Prim`] that returns the composed view of a single
+  prim. Tests + Scene3D translator both use it. Variant
+  `references = @other.usd@` opinions inside a selected variant
+  are NOT followed (round 7 is single-layer evaluation only) —
+  they're recorded on the resolved prim's metadata under
+  `usd:variantReferences:<set>:<var>:references` so the extras
+  layer surfaces the unresolved arc to the caller. Variant
+  `metadata` keys other than `references` / `payload` lose to
+  local opinions per LIVRPS.
+
+### Tests
+
+- `tests/variant_evaluation.rs` — 11-case suite covering: the
+  glossary `simpleVariantSet.usd` shape (single variantSet, one
+  variant selected, child `def Xform` materialises); changing the
+  selection picks a different child; no-selection metadata leaves
+  the variant invisible; selecting a non-existent variant name is
+  silently tolerated (per "selections are not required"); local
+  child wins over variant child sharing the same name; multiple
+  variantSets compose independently; variant-authored `def Mesh`
+  pulls through into a Scene3D mesh with positions; deeply-nested
+  variantSet (on a non-root prim) is composed; variant
+  `references = @...@` opinions land in the
+  `usd:variantReferences:<set>:<var>:references` side channel;
+  variant attribute opinion loses to local; `variant_sets` are
+  preserved on the resolved prim for future writer round-trip.
+
+### Docs gap
+
+- **UsdSkel + UsdGeomSubset blocked.** `docs/3d/usd/README.md`
+  documents that the per-schema HTML for the `UsdGeom` /
+  `UsdSkel` / `UsdShade` schema families lives behind a different
+  URL pattern (`api_*.html`) on openusd.org and isn't staged in
+  the workspace yet. Both candidate features (skeletal animation,
+  per-face material subsets) wait on that staging round.
+- **Round 7 is read-only on the writer.** Composition fires on
+  the decode path; the encoder doesn't yet round-trip
+  `variantSet` blocks from the source layer's structured form
+  (the round 6 changelog entry's "round-trip writer re-emits the
+  block verbatim" claim was aspirational and remains a gap).
+  After a `Scene3D` round-trip the variant content is flattened
+  into the resolved tree — selection metadata is lost, the
+  `variantSet` block isn't re-emitted.
+
 ## [0.0.1](https://github.com/OxideAV/oxideav-usdz/compare/v0.0.0...v0.0.1) - 2026-05-10
 
 ### Other
