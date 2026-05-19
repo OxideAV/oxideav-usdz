@@ -138,7 +138,24 @@
 //!   The list-edit operator (`prepend`) is auto-prefixed on
 //!   composition-arc keys per OpenUSD authoring convention.
 //!
-//! Deferred to round 10+:
+//! Round 10 adds:
+//!
+//! * **Anchored in-archive sublayer composition.** When the Default
+//!   Layer declares `subLayers = [@./geom.usda@, ...]` and those
+//!   entries exist in the surrounding USDZ archive, the decoder now
+//!   composes each sublayer's prim tree underneath the local
+//!   layer's per the OpenUSD glossary's LayerStack definition: "the
+//!   recursive gathering of all SubLayers of a Layer, plus the
+//!   layer itself as first and strongest". Local opinions beat
+//!   sublayer opinions; `over` + `def` of the same prim name fuse
+//!   into a single `def`. `.usdc` sublayer entries surface as
+//!   [`Error::Unsupported`](crate::Error) consistent with the
+//!   round-1 Default-Layer policy; external / cross-package
+//!   sublayer paths are silently skipped from composition. The
+//!   audit trail rides on
+//!   `Scene3D::extras["usd:composedSubLayers"]`.
+//!
+//! Deferred to round 11+:
 //!
 //! * Binary `.usdc` "Crate" parser — Pixar publishes no prose spec
 //!   for the wire format (documented gap in `docs/3d/usd/README.md`);
@@ -149,9 +166,16 @@
 //!   staged).
 //! * `UsdGeomSubset` per-face material binding subsets — same
 //!   schema-doc gap as UsdSkel.
-//! * Composition arcs (sub-layers, references, payloads) that pull
-//!   in **external** USD files; r1-r8 handle a single self-contained
-//!   USD layer per archive only.
+//! * Cross-package composition arcs and `references` / `payloads`
+//!   arc resolution — round 10 handles intra-archive `subLayers`
+//!   only; `@foo.usdz[path/within.usd]@` references and
+//!   `references` / `payloads` that target a single prim inside
+//!   another file stay as side-channel opinions on
+//!   `scene.extras["usd:layerMetadata"]`.
+//! * Sublayer round-trip on the writer — round 10 evaluates
+//!   sublayers on the read path; the encoder flattens the composed
+//!   tree back into a single layer rather than preserving the
+//!   multi-file LayerStack structure on output.
 //!
 //! ## Standalone build
 //!

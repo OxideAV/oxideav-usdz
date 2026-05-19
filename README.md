@@ -181,7 +181,32 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   stashed under `usd:variantReferences:<set>:<var>:references` so
   the extras layer surfaces the unresolved arc to the caller.
 
-## Deferred to round 8+
+## Round 10 scope (anchored sublayer composition)
+
+- **In-archive sublayer composition.** When the Default Layer
+  declares `subLayers = [@./geom.usda@, @./materials.usda@, ...]`
+  and those entries exist in the surrounding USDZ archive, the
+  decoder now composes each sublayer's prim tree underneath the
+  local layer's, per the OpenUSD glossary's LayerStack definition:
+  "the recursive gathering of all SubLayers of a Layer, plus the
+  layer itself as first and strongest". Sublayers are walked
+  depth-first, strength-ordered (first entry strongest), with a
+  cycle-break on self-reference; the audit trail rides on
+  `Scene3D::extras["usd:composedSubLayers"]`. Local prim opinions
+  beat sublayer opinions on every metadata / attr / child key;
+  `over` + `def` of the same prim name fuse into a single `def`
+  (the prim IS defined — by the sublayer — and the local layer is
+  only overriding opinions).
+- **`.usdc` sublayer surfaces as `Error::Unsupported`.** The
+  binary Crate parser is still gated on a docs-collaborator trace
+  doc, so a sublayer with the `.usdc` extension errors out
+  consistently with the round-1 Default-Layer policy. External /
+  cross-package sublayer paths (anything not in the archive's
+  entries) are silently skipped during composition — they stay on
+  `scene.extras["usd:layerMetadata"]` for writer round-trip so a
+  higher-level pipeline can still resolve them.
+
+## Deferred to round 11+
 
 - **Binary `.usdc` "Crate" parser.** Pixar publishes no prose
   spec for the wire format; loading a `.usdc` Default Layer
@@ -192,12 +217,21 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   `docs/3d/usd/`.
 - **`UsdGeomSubset`** per-face material-binding subsets — same
   schema-doc gap as `UsdSkel`.
-- **Variant writer.** Round 7 evaluates variants on the read
-  path; the encoder doesn't yet re-emit `variantSet` blocks back
-  from a `Scene3D`.
-- **External composition arcs** — sub-layers, references, payloads
-  that pull in **other** USD files. Rounds 1–7 read+write a
-  single self-contained USD layer per archive only.
+- **Cross-package composition arcs** — references / payloads /
+  sublayers that pull in **other** USD files outside the
+  surrounding archive. Round 10 handles intra-archive sublayer
+  composition only; external paths stay as side-channel opinions
+  on `scene.extras["usd:layerMetadata"]`.
+- **Sublayer round-trip on the writer.** Round 10 evaluates
+  sublayers on the read path; the encoder still flattens the
+  composed tree back into a single layer rather than preserving
+  the multi-file LayerStack structure on output.
+- **References / payloads composition.** `prepend references =
+  @./asset.usd@</Prim>` and `prepend payload = @./asset.usd@` are
+  still parser-only — their target file is not opened during
+  composition (round 9 surfaced the opinion on extras; round 10
+  added LayerStack composition but kept references/payloads as a
+  parser-only opinion).
 
 ## Standalone build
 

@@ -7,6 +7,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 10 (anchored sublayer composition)
+
+- **In-archive sublayer composition.** When the Default Layer
+  declares `subLayers = [@./geom.usda@, ...]` and the named
+  entries exist in the surrounding USDZ archive, the decoder
+  composes their prim trees underneath the local layer's per the
+  OpenUSD glossary's LayerStack definition: "the recursive
+  gathering of all SubLayers of a Layer, plus the layer itself as
+  first and strongest". Sublayers are walked depth-first,
+  strength-ordered (first entry strongest), with a cycle-break on
+  self-reference. The audit trail of which sublayers were
+  composed in lands on
+  `Scene3D::extras["usd:composedSubLayers"]` (declaration order,
+  depth-first innermost first). Rounds 1..9 ignored the
+  `subLayers` opinion entirely on the read path — every prim
+  authored in a sublayer was invisible to the `Scene3D`
+  translation.
+- **Anchored asset-path resolution.** Sublayer entries are
+  resolved against the authoring layer's archive directory per
+  `spec_usdz.html` §USD Constraints — `./foo.usda` and `foo.usda`
+  both anchor to the parent layer's folder; absolute archive
+  paths fall back to the archive root if anchored resolution
+  misses. Paths containing `://`, `[` (cross-package), or
+  starting with `/` are treated as external and silently skipped
+  from composition (kept on `scene.extras` for writer
+  round-trip).
+- **LIVRPS-aligned prim merge.** When local + sublayer both
+  declare a prim by the same name, the local opinion wins for
+  every metadata key, attr key, variantSet, and same-named child.
+  Children present only in the sublayer are appended after local
+  children. Empty `type_name` on the local prim inherits from the
+  sublayer. The specifier upgrades from `over` / `class` to `def`
+  when the sublayer is the defining layer — the prim IS defined
+  (by the sublayer); the local layer is overriding opinions.
+- **`.usdc` sublayer surfaces as `Error::Unsupported`.** The
+  binary Crate parser is still gated on a docs-collaborator trace
+  doc; a sublayer with the `.usdc` extension errors out
+  consistently with the round-1 Default-Layer policy rather than
+  silently dropping the layer.
+
+### Tests
+
+- `tests/sublayer_composition.rs` — 9-case integration suite:
+  * `sublayer_def_mesh_lands_in_scene` — basic
+    `@./geom.usda@` composition of a `def Mesh`.
+  * `local_layer_opinion_wins_over_sublayer` — local 3-vertex Mesh
+    beats sublayer 4-vertex Mesh on same prim name.
+  * `sublayer_fills_in_missing_def_prims` — local declares empty
+    Xform, sublayer contributes two Meshes that surface.
+  * `earlier_sublayer_beats_later` — `subLayers = [@a@, @b@]`,
+    `a`'s opinions win.
+  * `nested_sublayers_compose_recursively` — `a → b → c` chain
+    composes the leaf-layer Mesh up to the root.
+  * `cyclic_sublayer_does_not_loop` — `a` sublayers itself; we
+    don't recurse forever.
+  * `external_sublayer_path_is_silently_skipped` — unresolvable
+    path keeps the opinion on extras, doesn't error.
+  * `usdc_sublayer_surfaces_as_unsupported` — `.usdc` entry
+    errors per the docs-gap policy.
+  * `over_in_local_upgrades_to_def_from_sublayer` — `over` +
+    `def` merge to `def`; the Mesh surfaces.
+- Existing 121 tests across 21 integration files still green.
+
+### Docs gap (carried forward from round 9)
+
+- **UsdSkel + UsdGeomSubset still blocked.** Per-schema HTML for
+  the `UsdGeom` / `UsdSkel` / `UsdShade` / `UsdPhysics` schema
+  families lives behind a different URL pattern (`api_*.html`) on
+  openusd.org and isn't staged in the workspace yet.
+- **Cross-package composition arcs still single-archive.** Round
+  10 composes intra-archive sublayers but does not open
+  cross-package `@foo.usdz[path/within.usd]@` references; the
+  `ArResolver` syntax mentioned in `spec_usdz.html` §USD
+  Constraints stays as a side-channel opinion on
+  `scene.extras["usd:layerMetadata"]`.
+- **References / payloads composition not yet wired.** Round 10
+  walks the `subLayers` arc; the matching engine for
+  `references` / `payload` arcs (which target a *single* prim
+  inside the named asset rather than the whole layer) is deferred
+  pending its own round.
+- **Sublayer writer round-trip.** Round 10 evaluates sublayers on
+  the read path; the encoder flattens the composed tree back into
+  a single layer rather than preserving the multi-file
+  LayerStack structure on output.
+
 ### Added — Round 9 (composition-arc + layer-metadata round-trip)
 
 - **Layer-metadata round-trip.** The writer now re-emits every

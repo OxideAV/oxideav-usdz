@@ -63,22 +63,67 @@ use crate::Result;
 /// `usd:variantReferences:<set>:<var>:references` so the extras
 /// stash surfaces the unresolved arc to the caller.
 pub fn translate(layer: &Layer, archive: Arc<Vec<u8>>, entries: &[ZipEntry]) -> Result<Scene3D> {
+    let entry_map: HashMap<String, ZipEntry> = entries
+        .iter()
+        .map(|e| (e.name.clone(), e.clone()))
+        .collect();
+
     let mut ctx = Ctx {
         scene: Scene3D::new(),
-        archive,
-        entries: entries
-            .iter()
-            .map(|e| (e.name.clone(), e.clone()))
-            .collect(),
+        archive: archive.clone(),
+        entries: entry_map.clone(),
         materials_by_path: HashMap::new(),
         textures_by_path: HashMap::new(),
     };
 
     apply_layer_metadata(&mut ctx.scene, &layer.metadata);
 
+    // LayerStack composition (round 10): gather every in-archive
+    // sublayer recursively, then merge their prim trees underneath
+    // the local layer's prims per the OpenUSD glossary's LayerStack
+    // semantics:
+    //
+    //   "LayerStack: The ordered set of layers resulting from the
+    //    recursive gathering of all SubLayers of a Layer, plus the
+    //    layer itself as first and strongest."
+    //
+    // Local opinions beat sublayer opinions; each subLayers entry is
+    // weaker than the one before it (USD-doc order = strength order).
+    // Cross-package + external sublayers (anything we can't find in
+    // the surrounding ZIP entries) are skipped silently — they stay
+    // as opinions on `scene.extras["usd:layerMetadata"]` so a writer
+    // round-trip keeps them, and the caller can resolve them through
+    // a higher-level pipeline (mirroring the ArResolver pre-resolve
+    // step described in `spec_usdz.html` §USD Constraints).
+    let mut composed_paths: Vec<String> = Vec::new();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut merged_layer = layer.clone();
+    compose_sublayers(
+        &mut merged_layer,
+        &archive,
+        &entry_map,
+        /* anchor_layer */ None,
+        &mut visited,
+        &mut composed_paths,
+    )?;
+    if !composed_paths.is_empty() {
+        let names: Vec<serde_json::Value> = composed_paths
+            .iter()
+            .map(|s| serde_json::Value::String(s.clone()))
+            .collect();
+        ctx.scene.extras.insert(
+            "usd:composedSubLayers".into(),
+            serde_json::Value::Array(names),
+        );
+    }
+
     // Recursively compose variant selections so the rest of the
     // translator never has to think about variant_sets again.
-    let resolved: Vec<Prim> = layer.prims.iter().map(resolve_variants_recursive).collect();
+    let resolved: Vec<Prim> = merged_layer
+        .prims
+        .iter()
+        .map(resolve_variants_recursive)
+        .collect();
 
     // Walk the prim tree once, indexing every Material + Shader by
     // its absolute prim path. We resolve material bindings on a
@@ -93,6 +138,211 @@ pub fn translate(layer: &Layer, archive: Arc<Vec<u8>>, entries: &[ZipEntry]) -> 
         }
     }
     Ok(ctx.scene)
+}
+
+/// LayerStack composition (round 10).
+///
+/// Walks the local layer's `subLayers` metadata list — each entry is
+/// a `Value::Asset` path — and for every path that resolves to an
+/// in-archive `.usd` / `.usda` entry parses the sublayer, recurses
+/// into its own sublayers (depth-first, strength-ordered), and
+/// merges the result *underneath* the local layer's prims.
+///
+/// Sublayer paths are resolved against `anchor_layer`, the path of
+/// the parent layer that contains the `subLayers` opinion — per the
+/// USDZ spec §USD Constraints, anchored paths (`./foo.usd`) resolve
+/// "to the layer-within-the-package in which the path is authored".
+/// At the root call `anchor_layer = None` and we fall back to
+/// resolving against the archive root.
+///
+/// Per the glossary LayerStack definition the local layer is "first
+/// and strongest", so we keep local prims verbatim and merge each
+/// sublayer's prims as `over`-style opinions: a same-named prim from
+/// the sublayer contributes any attrs / metadata / children that the
+/// local layer didn't author.
+///
+/// `visited` tracks layer paths already composed in the current
+/// recursion to break sublayer cycles (`a.usd` sublayers `b.usd`
+/// which sublayers `a.usd` again — invalid per USD but we should
+/// not loop on it).
+///
+/// `.usdc` sublayer entries surface as `Error::Unsupported` because
+/// the binary Crate parser is still deferred (docs gap — see
+/// `docs/3d/usd/README.md`). External sublayers (anything not in
+/// `entries`) are silently dropped from composition; the original
+/// path stays on `scene.extras["usd:layerMetadata"]` so a writer
+/// round-trip preserves the unresolved opinion.
+fn compose_sublayers(
+    target: &mut Layer,
+    archive: &Arc<Vec<u8>>,
+    entries: &HashMap<String, ZipEntry>,
+    anchor_layer: Option<&str>,
+    visited: &mut std::collections::HashSet<String>,
+    composed_out: &mut Vec<String>,
+) -> Result<()> {
+    let raw = match target.metadata.get("subLayers") {
+        Some(Value::Array(items)) => items.clone(),
+        _ => return Ok(()),
+    };
+    for item in &raw {
+        let path = match item {
+            Value::Asset(s) => s.clone(),
+            Value::String(s) | Value::Token(s) => s.clone(),
+            _ => continue,
+        };
+        let resolved = match resolve_archive_path(&path, anchor_layer, entries) {
+            Some(p) => p,
+            None => continue, // External / cross-package — silently skip.
+        };
+        if !visited.insert(resolved.clone()) {
+            continue; // Cycle break.
+        }
+        let entry = match entries.get(&resolved) {
+            Some(e) => e,
+            None => continue,
+        };
+        let lower = resolved.to_ascii_lowercase();
+        let ext = lower.rsplit('.').next().unwrap_or("");
+        if ext == "usdc" {
+            return Err(unsupported(format!(
+                "USDZ subLayer `{resolved}` is in `.usdc` (binary crate) format; \
+                 binary USDC parsing is still gated on a docs-collaborator trace \
+                 doc. Re-package the sublayer with `usdcat -o foo.usda`."
+            )));
+        }
+        if ext != "usd" && ext != "usda" {
+            continue;
+        }
+        let start = entry.payload_offset as usize;
+        let end = start + entry.payload_len as usize;
+        let bytes = &archive[start..end];
+        let mut sub = crate::usda::parse(bytes)?;
+        // Depth-first: a sublayer's own sublayers compose first, so
+        // by the time we merge `sub` it is itself the LayerStack
+        // rooted at that sublayer.
+        compose_sublayers(
+            &mut sub,
+            archive,
+            entries,
+            Some(&resolved),
+            visited,
+            composed_out,
+        )?;
+        composed_out.push(resolved.clone());
+        merge_layer_under(target, &sub);
+    }
+    Ok(())
+}
+
+/// Normalise a `subLayers` / `references` entry path against the
+/// authoring layer's location inside the package.
+///
+/// Rules (per `spec_usdz.html` §USD Constraints):
+///
+/// * `./foo.usd` — anchored to the authoring layer's directory.
+/// * `foo.usd` (no leading `./` or `/`) — also anchored to the
+///   authoring layer's directory; treated identically.
+/// * Absolute archive path (`textures/diffuse.png`, no leading `/`)
+///   — falls back to a lookup against the archive root if anchored
+///   resolution misses.
+/// * Anything containing `://`, `[`, or starting with `/` is
+///   considered external / cross-package and returns `None`.
+fn resolve_archive_path(
+    path: &str,
+    anchor_layer: Option<&str>,
+    entries: &HashMap<String, ZipEntry>,
+) -> Option<String> {
+    if path.is_empty() || path.contains("://") || path.starts_with('/') || path.contains('[') {
+        return None;
+    }
+    let stripped = path.strip_prefix("./").unwrap_or(path);
+    if let Some(anchor) = anchor_layer {
+        if let Some(slash) = anchor.rfind('/') {
+            let dir = &anchor[..slash + 1];
+            let candidate = format!("{dir}{stripped}");
+            if entries.contains_key(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    if entries.contains_key(stripped) {
+        return Some(stripped.to_string());
+    }
+    None
+}
+
+/// Merge `weak` underneath `strong` per LayerStack strength order:
+/// every key in `weak.metadata` that `strong` doesn't already author
+/// rides up to `strong`; every root prim in `weak` either merges
+/// into a same-named local prim (recursively) or is appended as a
+/// new prim if no local prim shares the name.
+fn merge_layer_under(strong: &mut Layer, weak: &Layer) {
+    for (k, v) in &weak.metadata {
+        // Skip `subLayers` — the sublayer's own subLayers have
+        // already been folded in during the depth-first recursion;
+        // re-inheriting them would loop.
+        if k == "subLayers" {
+            continue;
+        }
+        strong
+            .metadata
+            .entry(k.clone())
+            .or_insert_with(|| v.clone());
+    }
+    for sub_prim in &weak.prims {
+        if let Some(local) = strong.prims.iter_mut().find(|p| p.name == sub_prim.name) {
+            merge_prim_under(local, sub_prim);
+        } else {
+            strong.prims.push(sub_prim.clone());
+        }
+    }
+}
+
+/// Merge `weak` prim into `strong` prim. Local opinions win for
+/// every metadata key, every attr key, and every same-named child.
+/// Children present only in the weak prim are appended after the
+/// local children (preserving local declaration order).
+///
+/// **Specifier upgrade.** `over` is a non-defining specifier; `def`
+/// is the defining one. If the local layer authored an `over` opinion
+/// on a prim that the sublayer defines via `def`, the merged prim
+/// inherits the `def` specifier — the prim IS defined (by the
+/// sublayer) and the local layer is merely overriding opinions. The
+/// same upgrade applies to `class` only when the strong side was
+/// empty; otherwise we keep the strong specifier (since `class`
+/// declares a class hierarchy that `def` shouldn't silently shadow).
+fn merge_prim_under(strong: &mut Prim, weak: &Prim) {
+    if weak.spec == "def" && strong.spec != "def" {
+        strong.spec = "def".to_string();
+    }
+    // `type_name` from weak fills in only when strong's is empty (a
+    // bare `over "Foo" {}` with no type spec inherits the sublayer's
+    // typed declaration).
+    if strong.type_name.is_empty() && !weak.type_name.is_empty() {
+        strong.type_name = weak.type_name.clone();
+    }
+    for (k, v) in &weak.metadata {
+        strong
+            .metadata
+            .entry(k.clone())
+            .or_insert_with(|| v.clone());
+    }
+    for (k, v) in &weak.attrs {
+        strong.attrs.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    for (k, v) in &weak.variant_sets {
+        strong
+            .variant_sets
+            .entry(k.clone())
+            .or_insert_with(|| v.clone());
+    }
+    for child in &weak.children {
+        if let Some(local_child) = strong.children.iter_mut().find(|c| c.name == child.name) {
+            merge_prim_under(local_child, child);
+        } else {
+            strong.children.push(child.clone());
+        }
+    }
 }
 
 /// Apply [`Prim::resolved_variants`](crate::usda::Prim::resolved_variants)
