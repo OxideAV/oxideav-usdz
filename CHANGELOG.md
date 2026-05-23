@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 11 (references / payload arc composition)
+
+- **In-archive `references` / `payload` arc composition.** A prim
+  carrying `references = @asset.usd@` / `payload = @asset.usd@`
+  (optionally with a `</Prim>` selector) that targets an in-archive
+  `.usd` / `.usda` layer now has the targeted prim composed
+  underneath it per the OpenUSD glossary's References definition.
+  The referencing prim keeps its own name — the "prim name-change"
+  the glossary's `MarbleCollection` example describes — while the
+  target's `type_name`, `kind`, children, and attrs ride up. A bare
+  `references = @file@` targets the referenced layer's `defaultPrim`;
+  `@file@</Prim>` targets the named prim (descending nested paths).
+  Rounds 1..10 ignored both arcs on the read path: a prim authored
+  purely as `def "Inst" ( references = @Marble.usd@ )` produced an
+  empty node.
+- **LIVRPS-aligned strength order.** Local opinions beat referenced
+  opinions (`merge_prim_under`'s local-wins merge); `references`
+  beats `payload` ("Payloads are weaker than references"); within a
+  `[@a@, @b@]` list the earlier entry is stronger (USD list order =
+  strength order). Composed strongest-first into the local prim so
+  every weaker arc only fills gaps.
+- **Transitive + cyclic composition.** A referenced layer that
+  itself references composes transitively (its sub-references resolve
+  against *its own* archive location). A `(layer-path, in-asset
+  prim-path)` visited set breaks reference cycles so decode always
+  terminates.
+- **Flatten-on-write + round-trip preservation.** Consumed
+  in-archive arcs are stripped from prim metadata so the writer
+  flattens the composed tree into a single layer (matching round
+  10's sublayer flatten-on-write policy). External / cross-package
+  (`/abs`, `://`, `[...]`) and non-`.usd[a]` targets stay authored so
+  the writer round-trips the unresolved opinion verbatim; a partly
+  external list keeps the whole opinion. `.usdc` targets raise
+  `Error::Unsupported` (binary-Crate docs gap). The audit trail of
+  composed arcs lands on
+  `Scene3D::extras["usd:composedReferences"]` as
+  `"<layer>|references"` / `"<layer>|payload"` entries.
+- **`tests/reference_composition.rs`** — 10 tests modelled on the
+  glossary's `MarbleCollection` worked example plus boundary cases
+  (defaultPrim targeting, `</Prim>` selector, references-beat-payload,
+  list strength order, transitive nesting, external round-trip,
+  `.usdc` rejection, cycle termination, USDZ→Scene3D→USDZ flatten).
+
 ### Added — Round 10 (anchored sublayer composition)
 
 - **In-archive sublayer composition.** When the Default Layer

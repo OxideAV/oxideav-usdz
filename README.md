@@ -206,7 +206,31 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   `scene.extras["usd:layerMetadata"]` for writer round-trip so a
   higher-level pipeline can still resolve them.
 
-## Deferred to round 11+
+## Round 11 scope (references / payload arc composition)
+
+- **In-archive `references` / `payload` arc composition.** A prim
+  carrying `references = @asset.usd@` / `payload = @asset.usd@`
+  (optionally with a `</Prim>` selector) that targets an in-archive
+  `.usd` / `.usda` layer now has the targeted prim composed
+  underneath it, per the OpenUSD glossary's References definition —
+  modelled on the glossary's `MarbleCollection` worked example. The
+  referencing prim keeps its own name (the glossary's "prim
+  name-change"); the target's `type_name`, `kind`, children, and
+  attrs ride up. A bare `references = @file@` targets the referenced
+  layer's `defaultPrim`; `@file@</Prim>` targets the named prim.
+  Local opinions beat referenced opinions; `references` beats
+  `payload`; within a `[@a@, @b@]` list the earlier entry is
+  stronger. Nested references compose transitively; a
+  `(layer, prim-path)` visited set breaks cycles. The audit trail of
+  composed arcs lands on `Scene3D::extras["usd:composedReferences"]`.
+- **Flatten-on-write + round-trip preservation.** Consumed
+  in-archive arcs are stripped so the writer flattens the composed
+  tree into a single layer (matching round 10's sublayer policy).
+  External / cross-package (`/abs`, `://`, `[...]`) and
+  non-`.usd[a]` targets stay authored so the writer round-trips them;
+  `.usdc` targets raise `Error::Unsupported` (binary-Crate gap).
+
+## Deferred to round 12+
 
 - **Binary `.usdc` "Crate" parser.** Pixar publishes no prose
   spec for the wire format; loading a `.usdc` Default Layer
@@ -217,21 +241,18 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   `docs/3d/usd/`.
 - **`UsdGeomSubset`** per-face material-binding subsets — same
   schema-doc gap as `UsdSkel`.
-- **Cross-package composition arcs** — references / payloads /
-  sublayers that pull in **other** USD files outside the
-  surrounding archive. Round 10 handles intra-archive sublayer
-  composition only; external paths stay as side-channel opinions
-  on `scene.extras["usd:layerMetadata"]`.
-- **Sublayer round-trip on the writer.** Round 10 evaluates
-  sublayers on the read path; the encoder still flattens the
-  composed tree back into a single layer rather than preserving
-  the multi-file LayerStack structure on output.
-- **References / payloads composition.** `prepend references =
-  @./asset.usd@</Prim>` and `prepend payload = @./asset.usd@` are
-  still parser-only — their target file is not opened during
-  composition (round 9 surfaced the opinion on extras; round 10
-  added LayerStack composition but kept references/payloads as a
-  parser-only opinion).
+- **Cross-package `@foo.usdz[path/within.usd]@` references** —
+  round 11 resolves `references` / `payload` targets that live as
+  their own entries in the *same* archive; package-relative `[...]`
+  selectors into a sibling `.usdz` stay as side-channel opinions on
+  `scene.extras["usd:layerMetadata"]`.
+- **`inherits` / `specializes` composition arcs** — round 11
+  follows `references` / `payload` only; class-hierarchy arcs
+  round-trip as authored opinions but are not yet evaluated.
+- **SubLayer / reference round-trip on the writer.** Rounds 10–11
+  evaluate sublayers + references on the read path; the encoder
+  flattens the composed tree into a single layer rather than
+  preserving the multi-file structure on output.
 
 ## Standalone build
 

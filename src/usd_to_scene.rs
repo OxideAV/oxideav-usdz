@@ -117,6 +117,41 @@ pub fn translate(layer: &Layer, archive: Arc<Vec<u8>>, entries: &[ZipEntry]) -> 
         );
     }
 
+    // Reference / payload composition (round 11): walk every prim in
+    // the composed LayerStack and, for any prim carrying a
+    // `references` / `payload` opinion that targets an in-archive
+    // `.usd` / `.usda` layer, compose the targeted prim underneath
+    // the referencing prim per the OpenUSD glossary's References
+    // semantics (the referencing prim keeps its name; the target's
+    // type / kind / children / attrs ride up; local opinions win).
+    // The consumed arc keys are stripped so the writer flattens the
+    // composed tree into a single layer (mirroring the round-10
+    // sublayer-flatten-on-write policy). Unresolved / external arcs
+    // are left in place so the writer round-trips them verbatim.
+    let mut composed_refs: Vec<String> = Vec::new();
+    let mut ref_layer_cache: HashMap<String, Layer> = HashMap::new();
+    for prim in &mut merged_layer.prims {
+        compose_references(
+            prim,
+            &archive,
+            &entry_map,
+            /* anchor_layer */ None,
+            &mut ref_layer_cache,
+            &mut composed_refs,
+            &mut std::collections::HashSet::new(),
+        )?;
+    }
+    if !composed_refs.is_empty() {
+        let names: Vec<serde_json::Value> = composed_refs
+            .iter()
+            .map(|s| serde_json::Value::String(s.clone()))
+            .collect();
+        ctx.scene.extras.insert(
+            "usd:composedReferences".into(),
+            serde_json::Value::Array(names),
+        );
+    }
+
     // Recursively compose variant selections so the rest of the
     // translator never has to think about variant_sets again.
     let resolved: Vec<Prim> = merged_layer
@@ -343,6 +378,278 @@ fn merge_prim_under(strong: &mut Prim, weak: &Prim) {
             strong.children.push(child.clone());
         }
     }
+}
+
+/// Reference / payload composition (round 11).
+///
+/// Walks a single prim (recursing into its children first, so a
+/// referenced layer that itself references is fully composed before
+/// it merges upward), and for every `references` / `payload` opinion
+/// the prim carries that targets an **in-archive** `.usd` / `.usda`
+/// layer, composes the targeted prim underneath `prim` per the
+/// OpenUSD glossary's References definition:
+///
+///   "the primary use for References is to compose smaller units of
+///    scene description into larger aggregates … the prim name
+///    [of the target] is gone, since the references allowed us to
+///    perform a prim name-change on the prim targeted by the
+///    reference."
+///
+/// So the referencing prim KEEPS its own name; the target prim's
+/// `type_name`, metadata (`kind`, …), attrs, and children all ride
+/// up under it via [`merge_prim_under`] (local opinions win, exactly
+/// as the glossary's flattened `MarbleCollection` example shows the
+/// local `xformOp:translate` and the `over "marble_geom"`
+/// `displayColor` override beating the referenced asset's opinions).
+///
+/// **Target selection.** A `references = @file@</Prim>` /
+/// `payload = @file@</Prim>` ([`Value::AssetWithPath`]) targets the
+/// named prim inside the referenced layer. A bare `references =
+/// @file@` ([`Value::Asset`]) targets the referenced layer's
+/// `defaultPrim` (per the glossary `defaultPrim` definition: an
+/// aggregating file `references = @asset.usd@` resolves against the
+/// asset's `defaultPrim`). A layer with neither an explicit selector
+/// nor a `defaultPrim` is skipped (nothing to compose).
+///
+/// **Strength.** References are stronger than payloads ("Payloads
+/// are weaker than references"), so when a prim carries both we
+/// compose `references` first; an earlier list entry is stronger
+/// than a later one (USD list order = strength order), so we compose
+/// them weakest-last using [`merge_prim_under`]'s local-wins merge.
+///
+/// **Flatten-on-write.** Consumed in-archive arcs are stripped from
+/// `prim.metadata` so the writer emits the flattened result rather
+/// than re-authoring a now-already-composed `references` opinion
+/// (mirrors the round-10 sublayer flatten-on-write policy). External
+/// / cross-package / `.usdc` targets stay in `metadata` untouched so
+/// the writer round-trips them verbatim, and the unresolved arc
+/// surfaces to the caller through the layer-metadata stash.
+///
+/// `.usd` / `.usda` targets compose; a `.usdc` target raises
+/// [`Error::Unsupported`](crate::Error) consistent with the
+/// round-1 Default-Layer + round-10 sublayer policy (the binary
+/// Crate parser is still a documented docs gap).
+///
+/// `visited` breaks reference cycles (`a.usd</A>` references
+/// `b.usd</B>` which references `a.usd</A>` again).
+fn compose_references(
+    prim: &mut Prim,
+    archive: &Arc<Vec<u8>>,
+    entries: &HashMap<String, ZipEntry>,
+    anchor_layer: Option<&str>,
+    cache: &mut HashMap<String, Layer>,
+    composed_out: &mut Vec<String>,
+    visited: &mut std::collections::HashSet<String>,
+) -> Result<()> {
+    // Compose children's own arcs first (depth-first).
+    for child in &mut prim.children {
+        compose_references(
+            child,
+            archive,
+            entries,
+            anchor_layer,
+            cache,
+            composed_out,
+            visited,
+        )?;
+    }
+
+    // Gather the prim's arcs in strength order: every `references`
+    // entry (strongest-first) followed by every `payload` entry.
+    // We collect the resolved targets first, then merge them
+    // weakest-last so the local prim's own opinions stay strongest.
+    let ref_arcs = collect_arc_targets(prim.metadata.get("references"));
+    let payload_arcs = collect_arc_targets(prim.metadata.get("payload"));
+    let had_ref_arcs = !ref_arcs.is_empty();
+    let had_payload_arcs = !payload_arcs.is_empty();
+
+    // Track which keys we actually consumed so unresolved/external
+    // arcs stay authored for the writer. A key is only stripped when
+    // it had composable arcs AND *every* one of them composed (a
+    // partly-external list keeps the whole opinion so the writer
+    // round-trips the unresolved members).
+    let mut any_consumed = false;
+    let mut consumed_all_references = true;
+    let mut consumed_all_payload = true;
+
+    // Strength order: references[0] strongest … references[n] …
+    // payload[0] … payload[m] weakest. We merge strongest-first into
+    // `prim`: `prim` already holds the LOCAL opinions (strongest of
+    // all), and [`merge_prim_under`] only fills in keys / children the
+    // accumulator lacks, so each arc loses to the local prim and to
+    // every stronger arc composed before it.
+    let strength_ordered: Vec<(&str, ArcTarget)> = ref_arcs
+        .into_iter()
+        .map(|t| ("references", t))
+        .chain(payload_arcs.into_iter().map(|t| ("payload", t)))
+        .collect();
+
+    for (kind, target) in strength_ordered {
+        let resolved_layer_path = match resolve_archive_path(&target.asset, anchor_layer, entries) {
+            Some(p) => p,
+            None => {
+                // External / cross-package — leave the arc
+                // authored so the writer round-trips it.
+                if kind == "references" {
+                    consumed_all_references = false;
+                } else {
+                    consumed_all_payload = false;
+                }
+                continue;
+            }
+        };
+        let lower = resolved_layer_path.to_ascii_lowercase();
+        let ext = lower.rsplit('.').next().unwrap_or("");
+        if ext == "usdc" {
+            return Err(unsupported(format!(
+                "USDZ {kind} `{resolved_layer_path}` is in `.usdc` (binary crate) \
+                 format; binary USDC parsing is still gated on a docs-collaborator \
+                 trace doc. Re-package the referenced layer with `usdcat -o foo.usda`."
+            )));
+        }
+        if ext != "usd" && ext != "usda" {
+            if kind == "references" {
+                consumed_all_references = false;
+            } else {
+                consumed_all_payload = false;
+            }
+            continue;
+        }
+
+        // Cycle guard keyed on (layer-path, in-asset prim path).
+        let cycle_key = format!("{resolved_layer_path}|{}", target.prim_path);
+        if !visited.insert(cycle_key.clone()) {
+            // Already composing this exact target up the stack — drop
+            // it to avoid infinite recursion. Mark consumed so the
+            // writer doesn't re-author a cycle.
+            any_consumed = true;
+            continue;
+        }
+
+        let ref_layer = load_layer_cached(&resolved_layer_path, archive, entries, cache)?;
+        // Pick the target prim: explicit `</Prim>` selector, else
+        // the layer's `defaultPrim`.
+        let Some(mut target_prim) = select_target_prim(&ref_layer, &target.prim_path).cloned()
+        else {
+            // Nothing to compose (no selector + no defaultPrim, or the
+            // named prim is absent). Leave the arc authored; surface
+            // nothing.
+            visited.remove(&cycle_key);
+            if kind == "references" {
+                consumed_all_references = false;
+            } else {
+                consumed_all_payload = false;
+            }
+            continue;
+        };
+
+        // The target may itself carry references/payloads — compose
+        // them against the referenced layer's own location (so its
+        // anchored sub-references resolve correctly).
+        compose_references(
+            &mut target_prim,
+            archive,
+            entries,
+            Some(&resolved_layer_path),
+            cache,
+            composed_out,
+            visited,
+        )?;
+
+        merge_prim_under(prim, &target_prim);
+        composed_out.push(format!("{resolved_layer_path}|{kind}"));
+        any_consumed = true;
+        visited.remove(&cycle_key);
+    }
+
+    if any_consumed {
+        if had_ref_arcs && consumed_all_references {
+            prim.metadata.remove("references");
+        }
+        if had_payload_arcs && consumed_all_payload {
+            prim.metadata.remove("payload");
+        }
+    }
+    Ok(())
+}
+
+/// A single resolved composition-arc target.
+struct ArcTarget {
+    /// `@...@` asset path portion.
+    asset: String,
+    /// `</...>` in-asset prim selector (empty when the arc targets
+    /// the referenced layer's `defaultPrim`).
+    prim_path: String,
+}
+
+/// Flatten a `references` / `payload` metadata value into an ordered
+/// list of [`ArcTarget`]s. A scalar `Asset` / `AssetWithPath` yields
+/// one target; an `Array` of them yields one per element (USD list
+/// order = strength order). Any other shape (or a bare path-only
+/// arc) yields nothing.
+fn collect_arc_targets(v: Option<&Value>) -> Vec<ArcTarget> {
+    fn one(v: &Value) -> Option<ArcTarget> {
+        match v {
+            Value::Asset(a) => Some(ArcTarget {
+                asset: a.clone(),
+                prim_path: String::new(),
+            }),
+            Value::AssetWithPath { asset, prim_path } if !asset.is_empty() => Some(ArcTarget {
+                asset: asset.clone(),
+                prim_path: prim_path.clone(),
+            }),
+            _ => None,
+        }
+    }
+    match v {
+        Some(Value::Array(items)) => items.iter().filter_map(one).collect(),
+        Some(other) => one(other).into_iter().collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Resolve `</A/B/C>` (or a bare `defaultPrim` lookup) to the target
+/// prim inside a referenced layer.
+///
+/// * Non-empty `prim_path` — split on `/`, descend the prim tree
+///   from the layer roots. Returns `None` if any segment is missing.
+/// * Empty `prim_path` — look up the layer's `defaultPrim` token and
+///   return the matching root prim. Returns `None` if the layer has
+///   no `defaultPrim` or it names no root prim.
+fn select_target_prim<'a>(layer: &'a Layer, prim_path: &str) -> Option<&'a Prim> {
+    let trimmed = prim_path.trim_start_matches('/');
+    if trimmed.is_empty() {
+        let name = layer.metadata.get("defaultPrim")?.as_text()?;
+        return layer.prims.iter().find(|p| p.name == name);
+    }
+    let mut segments = trimmed.split('/');
+    let first = segments.next()?;
+    let mut cur = layer.prims.iter().find(|p| p.name == first)?;
+    for seg in segments {
+        cur = cur.children.iter().find(|c| c.name == seg)?;
+    }
+    Some(cur)
+}
+
+/// Parse + cache an in-archive USDA layer by its archive entry name.
+fn load_layer_cached(
+    path: &str,
+    archive: &Arc<Vec<u8>>,
+    entries: &HashMap<String, ZipEntry>,
+    cache: &mut HashMap<String, Layer>,
+) -> Result<Layer> {
+    if let Some(layer) = cache.get(path) {
+        return Ok(layer.clone());
+    }
+    let entry = entries
+        .get(path)
+        .ok_or_else(|| invalid(format!("referenced layer `{path}` vanished from archive")))?;
+    let start = entry.payload_offset as usize;
+    let end = start + entry.payload_len as usize;
+    let bytes = &archive[start..end];
+    let layer = crate::usda::parse(bytes)?;
+    cache.insert(path.to_string(), layer.clone());
+    Ok(layer)
 }
 
 /// Apply [`Prim::resolved_variants`](crate::usda::Prim::resolved_variants)
