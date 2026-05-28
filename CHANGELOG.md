@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Round 12 (`defaultPrim` consistency on the writer)
+
+- **`defaultPrim` token tracks prim-name sanitisation.** The USDA
+  writer sanitises prim names to the `[A-Za-z_][A-Za-z0-9_]*` USD
+  grammar (e.g. `"My Cube"` → `def Xform "My_Cube"`), but the
+  `defaultPrim` opinion preserved through `usd:layerMetadata` was
+  emitted verbatim. A downstream resolver looking up the
+  `defaultPrim` token then missed the only prim in the layer,
+  silently breaking `references = @./scene.usda@` (selector-less)
+  composition against our output. The writer now rewrites the token
+  to the sanitised spelling when the raw form names a real root.
+- **Dangling `defaultPrim` opinions are dropped.** When the
+  preserved `defaultPrim` names a prim that no longer exists in the
+  scene (downstream pipeline pruned it), the writer used to re-emit
+  the dangling token. Strict USD validators reject layers whose
+  `defaultPrim` resolves to nothing — we now drop the opinion (and
+  fall back to synthesising one from the first surviving root, if
+  any).
+- **Missing `defaultPrim` is synthesised from the first root.** A
+  freshly-constructed `Scene3D` (no `usd:layerMetadata`) emitted no
+  `defaultPrim` at all, so cross-archive `references = @./scene.usda@`
+  resolution against our output produced nothing. The writer now
+  synthesises a `defaultPrim` opinion naming the first root's
+  sanitised prim name whenever no preserved one survives. A
+  genuinely rootless scene still emits no opinion (USD's `defaultPrim`
+  is optional, and we don't invent a target out of thin air).
+
 ### Added — Round 11 (references / payload arc composition)
 
 - **In-archive `references` / `payload` arc composition.** A prim

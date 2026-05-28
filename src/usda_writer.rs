@@ -348,15 +348,86 @@ fn write_layer_metadata(w: &mut Out, scene: &Scene3D) {
         .get(LAYER_METADATA_EXTRAS_KEY)
         .map(crate::variant_codec::decode_btree_value)
         .unwrap_or_default();
+    // Round 12: keep the emitted `defaultPrim` token consistent with
+    // the actual prim names we write. Three situations to handle:
+    //
+    //   * The preserved token names a root that exists verbatim under
+    //     its sanitised name — emit unchanged.
+    //   * The preserved token names a root whose name was sanitised
+    //     (`"My Cube"` → `def Xform "My_Cube"`) — rewrite to the
+    //     sanitised spelling so cross-archive `references = @./scene.usda@`
+    //     (selector-less, i.e. resolve-to-defaultPrim) still finds the
+    //     target.
+    //   * The preserved token names nothing in the scene (e.g. the
+    //     `defaultPrim` root was removed downstream) — drop the
+    //     opinion entirely. Emitting a dangling `defaultPrim` makes
+    //     a strict USD validator reject the layer.
+    //
+    // When no `defaultPrim` is authored at all but the scene has at
+    // least one root, synthesise one from the first root's sanitised
+    // name. Without this, every selector-less `@./scene.usda@`
+    // reference downstream of us is silently dropped.
+    let root_names = root_prim_names(scene);
+    let resolved_default_prim = layer_meta
+        .get("defaultPrim")
+        .and_then(|v| v.as_text())
+        .and_then(|token| resolve_default_prim_token(token, &root_names));
     for (k, v) in &layer_meta {
         // Don't double-emit the canonical keys we already wrote.
         if matches!(k.as_str(), "upAxis" | "metersPerUnit") {
             continue;
         }
+        if k == "defaultPrim" {
+            // Either rewrite the token to track sanitisation or skip
+            // the dangling opinion outright; we'll re-emit a fresh
+            // line below when a resolution survived.
+            continue;
+        }
         let formatted = format_metadata_assignment(k, v);
         writeln!(w.s, "    {formatted}").unwrap();
     }
+    let default_prim = resolved_default_prim.or_else(|| root_names.first().cloned());
+    if let Some(name) = default_prim {
+        writeln!(w.s, "    defaultPrim = \"{name}\"").unwrap();
+    }
     writeln!(w.s, ")").unwrap();
+}
+
+/// Collect the sanitised prim names the writer will emit for every
+/// root in `scene`. Mirrors the naming choices [`write_node`] makes
+/// (anonymous nodes fall back to `node_<id>`) so the result is
+/// authoritative for `defaultPrim` resolution.
+fn root_prim_names(scene: &Scene3D) -> Vec<String> {
+    scene
+        .roots
+        .iter()
+        .filter_map(|id| {
+            let node = scene.node(*id)?;
+            let raw = node
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("node_{}", id.0));
+            Some(sanitize_prim_name(&raw))
+        })
+        .collect()
+}
+
+/// Match a preserved `defaultPrim` token against the writer's actual
+/// emitted root names. Returns the spelling we should write, or
+/// `None` if the token refers to nothing in the scene.
+///
+/// Tries the raw token first (covers tokens that were already
+/// sanitisation-safe), then the sanitised spelling of the token
+/// (covers tokens that named the pre-sanitisation form).
+fn resolve_default_prim_token(token: &str, root_names: &[String]) -> Option<String> {
+    if root_names.iter().any(|n| n == token) {
+        return Some(token.to_string());
+    }
+    let sanitised = sanitize_prim_name(token);
+    if root_names.iter().any(|n| n == &sanitised) {
+        return Some(sanitised);
+    }
+    None
 }
 
 fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {

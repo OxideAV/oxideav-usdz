@@ -303,3 +303,107 @@ def Xform "Root" {
         other => panic!("expected customField to be a String, got {other:?}"),
     }
 }
+
+// Round 12: `defaultPrim` token consistency with the actual prim
+// names the writer emits.
+
+#[test]
+fn default_prim_tracks_prim_name_sanitisation() {
+    // The reader accepts `"My Cube"` as a prim-name token but the
+    // writer sanitises spaces to underscores, producing
+    // `def Xform "My_Cube"`. If we re-emitted the unmodified
+    // `defaultPrim = "My Cube"`, a downstream resolver looking up
+    // the `defaultPrim` token would miss the only prim in the layer.
+    //
+    // The fix rewrites the token to the sanitised spelling.
+    //
+    // (The reader actually rejects spaces in prim names — see the
+    // [`usda::tests`] grammar — so we route this through a
+    // constructed `Scene3D` instead of round-tripping a USDA string.)
+    use oxideav_mesh3d::{Node, Scene3D};
+    let mut scene = Scene3D::new();
+    let root = scene.add_node(Node::new().with_name("My Cube"));
+    scene.roots.push(root);
+    // Authored layer metadata names the raw (pre-sanitisation) prim.
+    let layer_meta = serde_json::json!({
+        "defaultPrim": { "Token": "My Cube" }
+    });
+    scene.extras.insert("usd:layerMetadata".into(), layer_meta);
+    let text = oxideav_usdz::usda_writer::write_layer(&scene);
+    assert!(
+        text.contains("def Xform \"My_Cube\""),
+        "expected sanitised prim name in body, got:\n{text}"
+    );
+    assert!(
+        text.contains("defaultPrim = \"My_Cube\""),
+        "defaultPrim opinion should track the sanitised prim name; got:\n{text}"
+    );
+    // And the round-tripped layer parses cleanly without a dangling
+    // `defaultPrim`.
+    let re = parse(text.as_bytes()).expect("re-parse round-tripped USDA");
+    assert!(re.prims.iter().any(|p| p.name == "My_Cube"));
+}
+
+#[test]
+fn default_prim_naming_nothing_in_scene_is_dropped() {
+    // If `usd:layerMetadata["defaultPrim"]` names a prim that the
+    // scene no longer contains (e.g. a downstream pipeline pruned
+    // the `defaultPrim` root), the writer must not emit a dangling
+    // opinion. Strict USD validators reject layers whose
+    // `defaultPrim` points at no real root.
+    use oxideav_mesh3d::{Node, Scene3D};
+    let mut scene = Scene3D::new();
+    let kept = scene.add_node(Node::new().with_name("Kept"));
+    scene.roots.push(kept);
+    let layer_meta = serde_json::json!({
+        "defaultPrim": { "Token": "Vanished" }
+    });
+    scene.extras.insert("usd:layerMetadata".into(), layer_meta);
+    let text = oxideav_usdz::usda_writer::write_layer(&scene);
+    // The dangling token must not appear.
+    assert!(
+        !text.contains("defaultPrim = \"Vanished\""),
+        "dangling defaultPrim should be dropped; got:\n{text}"
+    );
+    // The first surviving root becomes the synthesised default.
+    assert!(
+        text.contains("defaultPrim = \"Kept\""),
+        "expected synthesised defaultPrim from surviving root; got:\n{text}"
+    );
+}
+
+#[test]
+fn default_prim_synthesised_when_absent_but_roots_present() {
+    // A freshly-constructed `Scene3D` carries no `usd:layerMetadata`.
+    // The writer used to emit no `defaultPrim` at all, which broke
+    // selector-less `references = @./scene.usda@` resolution
+    // against the emitted layer (the referencing prim composes
+    // nothing because there's no `defaultPrim` to resolve to).
+    use oxideav_mesh3d::{Node, Scene3D};
+    let mut scene = Scene3D::new();
+    let root = scene.add_node(Node::new().with_name("Root"));
+    scene.roots.push(root);
+    let text = oxideav_usdz::usda_writer::write_layer(&scene);
+    assert!(
+        text.contains("defaultPrim = \"Root\""),
+        "expected synthesised defaultPrim opinion; got:\n{text}"
+    );
+    let re = parse(text.as_bytes()).expect("re-parse round-tripped USDA");
+    match re.metadata.get("defaultPrim") {
+        Some(Value::Token(s)) | Some(Value::String(s)) => assert_eq!(s, "Root"),
+        other => panic!("expected token/string defaultPrim, got {other:?}"),
+    }
+}
+
+#[test]
+fn default_prim_not_synthesised_for_rootless_scene() {
+    // An empty scene has nothing to nominate as `defaultPrim`.
+    // The writer must NOT invent one out of thin air.
+    use oxideav_mesh3d::Scene3D;
+    let scene = Scene3D::new();
+    let text = oxideav_usdz::usda_writer::write_layer(&scene);
+    assert!(
+        !text.contains("defaultPrim"),
+        "rootless scene must not synthesise a defaultPrim; got:\n{text}"
+    );
+}

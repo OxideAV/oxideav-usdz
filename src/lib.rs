@@ -180,7 +180,23 @@
 //!   rides on `Scene3D::extras["usd:composedReferences"]`. See
 //!   [`crate::usd_to_scene`]'s `compose_references`.
 //!
-//! Deferred to round 12+:
+//! Round 12 — `defaultPrim` writer consistency:
+//!
+//! * **Token tracks prim-name sanitisation.** The writer rewrites a
+//!   preserved `defaultPrim = "My Cube"` to `"My_Cube"` so it still
+//!   names the actual emitted prim (`def Xform "My_Cube"`). Without
+//!   the rewrite a selector-less `references = @./scene.usda@`
+//!   resolving to `defaultPrim` would silently miss its target.
+//! * **Dangling opinions are dropped.** A preserved `defaultPrim`
+//!   that names no surviving root is omitted rather than re-emitted
+//!   verbatim (strict USD validators reject dangling defaults).
+//! * **Synthesised when absent.** A `Scene3D` carrying no
+//!   `usd:layerMetadata` now emits a `defaultPrim` opinion naming
+//!   the first root's sanitised prim name; without it, downstream
+//!   selector-less references against our output produce nothing.
+//!   Rootless scenes still emit no opinion.
+//!
+//! Deferred to round 13+:
 //!
 //! * Binary `.usdc` "Crate" parser — Pixar publishes no prose spec
 //!   for the wire format (documented gap in `docs/3d/usd/README.md`);

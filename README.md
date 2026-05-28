@@ -230,7 +230,26 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   non-`.usd[a]` targets stay authored so the writer round-trips them;
   `.usdc` targets raise `Error::Unsupported` (binary-Crate gap).
 
-## Deferred to round 12+
+## Round 12 scope (`defaultPrim` consistency on the writer)
+
+- **`defaultPrim` token tracks sanitisation.** The writer sanitises
+  prim names to USD's `[A-Za-z_][A-Za-z0-9_]*` grammar (`"My Cube"` →
+  `def Xform "My_Cube"`). A preserved `defaultPrim` opinion named
+  with the pre-sanitisation spelling is now rewritten to match the
+  emitted prim so selector-less `references = @./scene.usda@`
+  resolution against our output still finds the target.
+- **Dangling `defaultPrim` is dropped.** When the preserved opinion
+  names a prim that no longer exists in the scene (downstream
+  pipeline pruned the root), the writer drops the dangling opinion
+  rather than re-emitting it — strict USD validators reject layers
+  whose `defaultPrim` resolves to nothing.
+- **Missing `defaultPrim` is synthesised from the first root.** A
+  freshly-constructed `Scene3D` (no `usd:layerMetadata`) now emits a
+  `defaultPrim` opinion naming the first root's sanitised name so
+  cross-archive selector-less references downstream of us actually
+  resolve. Rootless scenes still emit no opinion.
+
+## Deferred to round 13+
 
 - **Binary `.usdc` "Crate" parser.** Pixar publishes no prose
   spec for the wire format; loading a `.usdc` Default Layer
