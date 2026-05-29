@@ -117,6 +117,33 @@ pub fn translate(layer: &Layer, archive: Arc<Vec<u8>>, entries: &[ZipEntry]) -> 
         );
     }
 
+    // Inherits composition (round 13, LIVRPS "I" — stronger than
+    // references / payload). `inherits` targets an in-layer prim path
+    // (`</Class/Foo>`) and contributes its opinions to the inheriting
+    // prim. Composed BEFORE references so a referenced opinion can't
+    // overwrite an inherited one (LIVRPS: L > I > V > R > P > S).
+    let inherits_snapshot = merged_layer.prims.clone();
+    let mut composed_inherits: Vec<String> = Vec::new();
+    for prim in &mut merged_layer.prims {
+        compose_class_arcs(
+            prim,
+            "inherits",
+            &inherits_snapshot,
+            &mut composed_inherits,
+            &mut std::collections::HashSet::new(),
+        );
+    }
+    if !composed_inherits.is_empty() {
+        let names: Vec<serde_json::Value> = composed_inherits
+            .iter()
+            .map(|s| serde_json::Value::String(s.clone()))
+            .collect();
+        ctx.scene.extras.insert(
+            "usd:composedInherits".into(),
+            serde_json::Value::Array(names),
+        );
+    }
+
     // Reference / payload composition (round 11): walk every prim in
     // the composed LayerStack and, for any prim carrying a
     // `references` / `payload` opinion that targets an in-archive
@@ -148,6 +175,34 @@ pub fn translate(layer: &Layer, archive: Arc<Vec<u8>>, entries: &[ZipEntry]) -> 
             .collect();
         ctx.scene.extras.insert(
             "usd:composedReferences".into(),
+            serde_json::Value::Array(names),
+        );
+    }
+
+    // Specializes composition (round 13, LIVRPS "S" — weakest arc).
+    // `specializes` targets an in-layer prim path (`</Class/Foo>`)
+    // and contributes its opinions to the specialising prim as
+    // refinable defaults. Composed AFTER references / payload so an
+    // earlier-strength arc has already filled in opinions; only what
+    // remains missing gets filled from the specialised target.
+    let specializes_snapshot = merged_layer.prims.clone();
+    let mut composed_specializes: Vec<String> = Vec::new();
+    for prim in &mut merged_layer.prims {
+        compose_class_arcs(
+            prim,
+            "specializes",
+            &specializes_snapshot,
+            &mut composed_specializes,
+            &mut std::collections::HashSet::new(),
+        );
+    }
+    if !composed_specializes.is_empty() {
+        let names: Vec<serde_json::Value> = composed_specializes
+            .iter()
+            .map(|s| serde_json::Value::String(s.clone()))
+            .collect();
+        ctx.scene.extras.insert(
+            "usd:composedSpecializes".into(),
             serde_json::Value::Array(names),
         );
     }
@@ -571,6 +626,159 @@ fn compose_references(
         }
     }
     Ok(())
+}
+
+/// Class-hierarchy composition (round 13).
+///
+/// Resolves `inherits = </Class/Foo>` / `specializes = </Class/Foo>`
+/// arcs in a single in-layer pass. Both arcs target a prim path
+/// within the *same* layer (per the OpenUSD glossary's Inherits /
+/// Specializes definitions — they're "internal" composition arcs,
+/// distinct from `references` / `payload` which target external
+/// asset paths).
+///
+/// **Strength.** Per LIVRPS strength order — L > I > V > R > P > S
+/// — `inherits` is stronger than every external-asset arc; only the
+/// local prim's own opinions and a stronger variant selection beat
+/// inherited opinions. `specializes` is the weakest arc; every
+/// stronger opinion (Local, Inherits, Variants, References,
+/// Payload) has already had its chance to fill in the prim by the
+/// time specializes composes. The caller arranges this by invoking
+/// `compose_class_arcs(prim, "inherits", ...)` BEFORE
+/// [`compose_references`] and `compose_class_arcs(prim,
+/// "specializes", ...)` AFTER it.
+///
+/// **List ordering.** Within a multi-target `inherits = [</A>, </B>]`
+/// list, the earlier entry is stronger (USD list order = strength
+/// order). We compose them strongest-first into `prim`, so each
+/// later target fills only what's still missing.
+///
+/// **Targeting.** A `Value::Path` (`</A/B>`) or a `Value::Array` of
+/// paths is followed; any other shape (asset paths, raw strings)
+/// is left in place — that's not a valid class-arc value and the
+/// writer should keep authoring whatever was originally there.
+///
+/// **Cycle break.** `visited` carries the prim paths already being
+/// composed up the recursion stack so a class-arc cycle (`/A`
+/// inherits `</B>` which inherits `</A>`) terminates instead of
+/// looping. The visited path uses the root prim's name as the
+/// anchor; recursive descent into children appends `/child`.
+///
+/// **Flatten-on-write.** A consumed in-layer arc is stripped from
+/// `prim.metadata` so the writer flattens the composed tree
+/// matching the round-10 sublayer / round-11 reference policy.
+/// External arcs (paths that don't resolve to any prim in the
+/// local layer's snapshot) stay authored so the writer round-trips
+/// them verbatim.
+///
+/// **Audit trail.** Each composed `(target-prim-path, kind)` lands
+/// in `composed_out` formatted as `"<prim-path>|<kind>"` so the
+/// caller can stash it on `Scene3D::extras["usd:composedInherits"]`
+/// / `"usd:composedSpecializes"` mirroring the references audit
+/// shape.
+fn compose_class_arcs(
+    prim: &mut Prim,
+    kind: &str,
+    layer_snapshot: &[Prim],
+    composed_out: &mut Vec<String>,
+    visited: &mut std::collections::HashSet<String>,
+) {
+    // Compose this prim's class arcs before descending into children
+    // for `inherits` (stronger fills the prim before child-level
+    // weaker arcs get a chance to look at the inherited shape) and
+    // after children for `specializes` semantics doesn't actually
+    // change observable behaviour at this layer because each prim's
+    // own arcs are independent — but matching `compose_references`
+    // shape keeps the call sites symmetric.
+    let targets = collect_class_arc_targets(prim.metadata.get(kind));
+    let had_targets = !targets.is_empty();
+    let mut any_consumed = false;
+    let mut consumed_all = true;
+
+    for target_path in &targets {
+        // Cycle guard keyed on the target prim path. An arc that
+        // names a prim we're already in the middle of composing is
+        // skipped to terminate; the consumed flag still flips so the
+        // writer doesn't re-author the cycle.
+        let normalised = target_path.trim_start_matches('/').to_string();
+        if !visited.insert(normalised.clone()) {
+            any_consumed = true;
+            continue;
+        }
+        match resolve_in_layer_path(layer_snapshot, target_path) {
+            Some(target) => {
+                // The target may itself carry class arcs that resolve
+                // against the same layer; compose them so the merged
+                // shape under `prim` is already the fully-composed
+                // target tree.
+                let mut composed_target = target.clone();
+                compose_class_arcs(
+                    &mut composed_target,
+                    kind,
+                    layer_snapshot,
+                    composed_out,
+                    visited,
+                );
+                merge_prim_under(prim, &composed_target);
+                composed_out.push(format!("{target_path}|{kind}"));
+                any_consumed = true;
+            }
+            None => {
+                // External / cross-layer class-arc target — leave
+                // the opinion authored so the writer round-trips it.
+                consumed_all = false;
+            }
+        }
+        visited.remove(&normalised);
+    }
+
+    if any_consumed && had_targets && consumed_all {
+        prim.metadata.remove(kind);
+    }
+
+    // Recurse into children so a nested prim's own class arcs also
+    // compose. The children walk happens after the prim's own arcs
+    // are merged in so a freshly-composed child (one that rode up
+    // from the inherited target) can be reached.
+    for child in &mut prim.children {
+        compose_class_arcs(child, kind, layer_snapshot, composed_out, visited);
+    }
+}
+
+/// Flatten an `inherits` / `specializes` metadata value into an
+/// ordered list of in-layer prim paths. A scalar [`Value::Path`]
+/// yields one entry; an [`Value::Array`] of `Path`s yields one per
+/// element (USD list order = strength order). Any other variant
+/// (asset paths, raw strings, empty) yields nothing.
+fn collect_class_arc_targets(v: Option<&Value>) -> Vec<String> {
+    fn one(v: &Value) -> Option<String> {
+        match v {
+            Value::Path(p) if !p.is_empty() => Some(p.clone()),
+            _ => None,
+        }
+    }
+    match v {
+        Some(Value::Array(items)) => items.iter().filter_map(one).collect(),
+        Some(other) => one(other).into_iter().collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Walk a prim path (`</A/B/C>`) against a flat list of root prims
+/// (the layer snapshot) and return the matching prim. Returns
+/// `None` when any path segment is absent or the path is empty.
+fn resolve_in_layer_path<'a>(roots: &'a [Prim], path: &str) -> Option<&'a Prim> {
+    let trimmed = path.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut segments = trimmed.split('/');
+    let first = segments.next()?;
+    let mut cur = roots.iter().find(|p| p.name == first)?;
+    for seg in segments {
+        cur = cur.children.iter().find(|c| c.name == seg)?;
+    }
+    Some(cur)
 }
 
 /// A single resolved composition-arc target.

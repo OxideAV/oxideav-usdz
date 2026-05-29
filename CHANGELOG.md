@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 13 (in-layer `inherits` / `specializes` composition)
+
+- **In-layer class-hierarchy arc composition.** A prim carrying
+  `inherits = </Class/Foo>` / `specializes = </Class/Foo>` (or a
+  list of such paths) now has the targeted in-layer prim composed
+  underneath it per the OpenUSD glossary's Inherits / Specializes
+  definitions. The class-arc target is a prim path WITHIN the same
+  layer (as distinct from `references` / `payload` which target
+  external assets), so the composer walks the local layer's prim
+  tree rather than opening another archive entry. The targeted
+  prim's `type_name`, `kind`, children, and attrs ride up under the
+  inheriting / specialising prim via the same `merge_prim_under`
+  primitive that powers rounds 10 / 11 — local opinions win, then
+  earlier list entries win over later ones (USD list order =
+  strength order).
+- **LIVRPS-aligned strength order.** Per the OpenUSD glossary
+  LIVRPS ordering — L > I > V > R > P > S — `inherits` is composed
+  BEFORE `references` / `payload` so a referenced opinion can never
+  overwrite an inherited one; `specializes` is composed AFTER all
+  other arcs so it can only fill in opinions that every stronger
+  arc has left unsourced. Confirmed by paired test fixtures: a prim
+  with `inherits` + `references` resolves to the inherited child;
+  the same shape with `specializes` + `references` resolves to the
+  referenced child.
+- **Transitive composition.** A class prim that itself carries
+  `inherits` / `specializes` opinions has its own arc composed
+  before merging upward. So `</A> inherits </B>; Prop inherits </A>`
+  results in Prop carrying every child contributed by `</B>` (per
+  the glossary's "implied" inherited opinion chain).
+- **Cycle break.** A `(prim-path)` visited set keyed on the
+  normalised path scopes per-recursion so a class-arc cycle (`</A>`
+  inherits `</B>` which inherits `</A>` again) terminates without
+  looping. The cycle break still flips the consumed flag so the
+  writer doesn't re-author an arc that resolves into a cycle.
+- **Flatten-on-write + round-trip preservation.** A successfully-
+  composed in-layer arc is stripped from the prim's metadata so the
+  writer flattens the composed tree into a single layer, matching
+  the round 10 / 11 sublayer + reference flatten-on-write policy.
+  An arc whose target prim path doesn't resolve in the local layer
+  stays authored so the writer round-trips the unresolved opinion
+  verbatim (matching the external-/cross-package round-trip path
+  for `references`). The audit trail of composed arcs lands on
+  `Scene3D::extras["usd:composedInherits"]` and
+  `Scene3D::extras["usd:composedSpecializes"]` as
+  `"<prim-path>|inherits"` / `"<prim-path>|specializes"` entries.
+- **`tests/class_hierarchy_composition.rs`** — 10-case suite:
+  basic class inheritance pulls children up + audit stamp;
+  local-child-wins-over-inherited; multi-target `inherits = [</A>,
+  </B>]` strength order; inherits-beats-references; specializes-
+  loses-to-references; transitive `</A>` → `</B>` chain; cycle
+  termination; external (unresolvable) target round-trips; consumed
+  arc flattens away on the writer; non-`Path` opinion value (a raw
+  string for `inherits`) doesn't crash the composer.
+
 ### Fixed — Round 12 (`defaultPrim` consistency on the writer)
 
 - **`defaultPrim` token tracks prim-name sanitisation.** The USDA

@@ -196,7 +196,38 @@
 //!   selector-less references against our output produce nothing.
 //!   Rootless scenes still emit no opinion.
 //!
-//! Deferred to round 13+:
+//! Round 13 — in-layer `inherits` / `specializes` class-hierarchy
+//! arc composition:
+//!
+//! * **In-layer class-arc composition.** A prim carrying `inherits
+//!   = </Class/Foo>` or `specializes = </Class/Foo>` (or a list of
+//!   such paths) now has the targeted in-layer prim composed
+//!   underneath it per the OpenUSD glossary's Inherits / Specializes
+//!   definitions. Class arcs target a prim path *within the same
+//!   layer* (distinct from `references` / `payload` which target
+//!   external asset paths), so the composer walks the local layer's
+//!   prim tree rather than another archive entry. The target's
+//!   `type_name`, `kind`, children, and attrs ride up via the same
+//!   `merge_prim_under` primitive that powers rounds 10 / 11 —
+//!   local opinions win; earlier list entries beat later ones.
+//! * **LIVRPS-aligned strength order.** L > I > V > R > P > S, so
+//!   `inherits` composes BEFORE `references` / `payload` and
+//!   `specializes` composes AFTER them; the read-pass call order in
+//!   [`crate::usd_to_scene::translate`] reflects this directly.
+//! * **Transitive composition + cycle break.** A class prim that
+//!   itself carries class arcs has its own arc composed before
+//!   merging upward; a `(prim-path)` visited set scoped per-recursion
+//!   breaks reference cycles.
+//! * **Flatten-on-write.** Consumed in-layer arcs are stripped so
+//!   the writer flattens the composed tree into a single layer,
+//!   matching the rounds 10 / 11 sublayer + reference policy.
+//!   Unresolved arcs (paths that don't name any local prim) stay
+//!   authored so the writer round-trips them verbatim. The audit
+//!   trail lands on `Scene3D::extras["usd:composedInherits"]` and
+//!   `["usd:composedSpecializes"]`. See
+//!   [`crate::usd_to_scene`]'s `compose_class_arcs`.
+//!
+//! Deferred to round 14+:
 //!
 //! * Binary `.usdc` "Crate" parser — Pixar publishes no prose spec
 //!   for the wire format (documented gap in `docs/3d/usd/README.md`);
@@ -212,13 +243,11 @@
 //!   that live as their own entries in the *same* archive; nested
 //!   `[...]` package selectors into a sibling `.usdz` stay as
 //!   side-channel opinions on `scene.extras["usd:layerMetadata"]`.
-//! * `inherits` / `specializes` composition arcs — round 11 follows
-//!   `references` / `payload` only; class-hierarchy arcs round-trip
-//!   as authored opinions but are not yet evaluated.
-//! * Reference round-trip on the writer — like round 10's sublayers,
-//!   round 11 evaluates references on the read path and the encoder
-//!   flattens the composed tree into a single layer rather than
-//!   re-authoring the multi-file `references` structure on output.
+//! * SubLayer / reference / class-arc round-trip on the writer —
+//!   rounds 10 / 11 / 13 evaluate sublayers + references + class
+//!   arcs on the read path; the encoder flattens the composed tree
+//!   into a single layer rather than preserving the multi-file or
+//!   class-hierarchy authoring on output.
 //!
 //! ## Standalone build
 //!

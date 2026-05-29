@@ -249,7 +249,44 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   cross-archive selector-less references downstream of us actually
   resolve. Rootless scenes still emit no opinion.
 
-## Deferred to round 13+
+## Round 13 scope (in-layer `inherits` / `specializes` composition)
+
+- **In-layer class-hierarchy arc composition.** A prim carrying
+  `inherits = </Class/Foo>` / `specializes = </Class/Foo>` (or a
+  list of such paths) now has the targeted in-layer prim composed
+  underneath it per the OpenUSD glossary's Inherits / Specializes
+  definitions. Class arcs target a prim path WITHIN the same layer
+  (distinct from `references` / `payload` which target external
+  asset paths), so the composer walks the local layer's prim tree
+  rather than another archive entry. The target's `type_name`,
+  `kind`, children, and attrs ride up under the inheriting /
+  specialising prim through the same `merge_prim_under` primitive
+  that powers the round 10 / 11 sublayer + reference composers —
+  local opinions win, earlier list entries beat later ones.
+- **LIVRPS-aligned strength order.** Per the OpenUSD glossary —
+  L > I > V > R > P > S — `inherits` composes BEFORE
+  `references` / `payload` so a referenced opinion can never
+  overwrite an inherited one; `specializes` composes AFTER all
+  other arcs so it can only fill opinions that every stronger arc
+  has left unsourced.
+- **Transitive composition + cycle break.** A class prim that
+  itself carries class-arc opinions has its own arc composed before
+  merging upward (`</A>` inherits `</B>`; `Prop` inherits `</A>`
+  pulls every child contributed by `</B>` up through `</A>`). A
+  visited-set keyed on the normalised prim path scoped per-recursion
+  breaks reference cycles so a self-referential class hierarchy
+  doesn't hang.
+- **Flatten-on-write.** Successfully-composed in-layer arcs are
+  stripped so the writer flattens the composed tree into a single
+  layer, matching the round 10 / 11 sublayer + reference
+  flatten-on-write policy. An arc whose target prim path doesn't
+  resolve in the local layer stays authored so the writer
+  round-trips the unresolved opinion verbatim. The audit trail
+  rides on `Scene3D::extras["usd:composedInherits"]` and
+  `["usd:composedSpecializes"]` as `"<prim-path>|inherits"` /
+  `"<prim-path>|specializes"` entries.
+
+## Deferred to round 14+
 
 - **Binary `.usdc` "Crate" parser.** Pixar publishes no prose
   spec for the wire format; loading a `.usdc` Default Layer
@@ -265,13 +302,11 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   their own entries in the *same* archive; package-relative `[...]`
   selectors into a sibling `.usdz` stay as side-channel opinions on
   `scene.extras["usd:layerMetadata"]`.
-- **`inherits` / `specializes` composition arcs** — round 11
-  follows `references` / `payload` only; class-hierarchy arcs
-  round-trip as authored opinions but are not yet evaluated.
-- **SubLayer / reference round-trip on the writer.** Rounds 10–11
-  evaluate sublayers + references on the read path; the encoder
-  flattens the composed tree into a single layer rather than
-  preserving the multi-file structure on output.
+- **SubLayer / reference / class-arc round-trip on the writer.**
+  Rounds 10 / 11 / 13 evaluate sublayers + references + class arcs
+  on the read path; the encoder flattens the composed tree into a
+  single layer rather than preserving the multi-file structure or
+  the original class-hierarchy authoring on output.
 
 ## Standalone build
 
