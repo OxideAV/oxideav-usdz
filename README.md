@@ -286,7 +286,25 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   `["usd:composedSpecializes"]` as `"<prim-path>|inherits"` /
   `"<prim-path>|specializes"` entries.
 
-## Deferred to round 14+
+## Round 14 scope (CRC-32 integrity verification)
+
+- **STORED payloads are verified against the central-directory
+  CRC-32.** USDZ is a PKZIP archive (PKWARE APPNOTE.TXT container)
+  with two extra constraints; every entry carries a CRC-32 in the
+  same field a compressed entry would. The writer always emitted a
+  correct CRC, but the reader never checked it. The ZIP walker now
+  reads the CRC-32 each central-directory header records and
+  recomputes the CRC-32/ISO-HDLC of the stored payload, rejecting any
+  mismatch with `Error::InvalidData`. A corrupted byte (bit-rot, a
+  truncated copy, a mismatched STORED pass-through) is caught at the
+  container boundary as a clear integrity error instead of surfacing
+  downstream as a baffling USDA parse failure or a garbled texture.
+  The check reuses the crate's own CRC-32 routine so reader and
+  writer can never drift; the zero-length empty-file case verifies
+  naturally. The CRC field is plain PKWARE structure — not
+  USD-specific.
+
+## Deferred to round 15+
 
 - **Binary `.usdc` "Crate" parser.** Pixar publishes no prose
   spec for the wire format; loading a `.usdc` Default Layer

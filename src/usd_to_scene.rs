@@ -93,8 +93,8 @@ pub fn translate(layer: &Layer, archive: Arc<Vec<u8>>, entries: &[ZipEntry]) -> 
     // the surrounding ZIP entries) are skipped silently — they stay
     // as opinions on `scene.extras["usd:layerMetadata"]` so a writer
     // round-trip keeps them, and the caller can resolve them through
-    // a higher-level pipeline (mirroring the ArResolver pre-resolve
-    // step described in `spec_usdz.html` §USD Constraints).
+    // a higher-level pipeline (the asset-resolver pre-resolve step a
+    // full USD runtime would perform before composition).
     let mut composed_paths: Vec<String> = Vec::new();
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut merged_layer = layer.clone();
@@ -327,7 +327,7 @@ fn compose_sublayers(
 /// Normalise a `subLayers` / `references` entry path against the
 /// authoring layer's location inside the package.
 ///
-/// Rules (per `spec_usdz.html` §USD Constraints):
+/// Path-anchoring rules (USD relative-asset-path convention):
 ///
 /// * `./foo.usd` — anchored to the authoring layer's directory.
 /// * `foo.usd` (no leading `./` or `/`) — also anchored to the

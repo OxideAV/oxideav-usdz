@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 14 (CRC-32 integrity verification on the reader)
+
+- **STORED payloads are verified against the central-directory
+  CRC-32.** The ZIP walker now reads the CRC-32 field each
+  central-directory file header records (offset +16) and recomputes
+  the CRC-32/ISO-HDLC of the stored payload, rejecting any mismatch
+  with `Error::InvalidData` (`"USDZ entry '<name>' failed CRC-32
+  check (stored 0x…, computed 0x…)"`). Until now the writer computed
+  and emitted a correct CRC for every entry but the reader never
+  checked it, so a single corrupted byte (bit-rot, a truncated copy,
+  a mismatched STORED pass-through) would surface as a baffling USDA
+  parse failure or a garbled texture rather than a clear
+  container-integrity error. The check reuses the crate's own
+  CRC-32 routine (`zip_writer::crc32`) so reader and writer can never
+  drift, and the zero-length empty-file case (`crc32(b"") == 0`)
+  verifies naturally. This is plain PKWARE-format structure — the
+  CRC field is not USD-specific.
+- **`zip::walk` unit tests** — `rejects_crc_mismatch` (a central
+  directory advertising the wrong CRC for an otherwise-valid payload
+  is rejected) and `accepts_empty_payload_crc` (a zero-length entry's
+  all-zero CRC field passes). `tests/cube_usdz.rs::corrupted_payload_is_rejected_by_crc`
+  flips a payload byte of a valid archive and asserts the public
+  `UsdzDecoder` surfaces the CRC failure rather than parsing garbage.
+- **Stale `spec_usdz.html` source citations removed.** The
+  project-shipped `spec_usdz.html` was purged from `docs/3d/usd/` on
+  2026-05-24 (clean-room policy — see `docs/3d/usd/README.md`). The
+  five lingering `docs/3d/usd/spec_usdz.html` citations in `zip.rs`,
+  `zip_writer.rs`, and `usd_to_scene.rs` are re-grounded to the
+  surviving `docs/3d/usd/GAP-TRACKER.md` §3 (USDZ container) and to
+  the neutral PKWARE-format / USD relative-asset-path descriptions;
+  no behaviour change.
+
 ### Added — Round 13 (in-layer `inherits` / `specializes` composition)
 
 - **In-layer class-hierarchy arc composition.** A prim carrying

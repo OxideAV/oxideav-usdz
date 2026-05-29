@@ -33,6 +33,31 @@ fn loads_cube_usdz() {
 }
 
 #[test]
+fn corrupted_payload_is_rejected_by_crc() {
+    // A single flipped byte inside the Default Layer payload — the
+    // archive structure stays valid, but the CRC-32 the central
+    // directory recorded no longer matches. The walker must reject
+    // it rather than feeding garbage USDA into the parser.
+    let mut usdz = common::build_usdz(&[common::UsdzEntry {
+        name: "cube.usda",
+        payload: common::CUBE_USDA.as_bytes(),
+    }]);
+    // Locate the `#usda` header inside the payload and flip a byte
+    // of it; this is well inside the stored payload, away from any
+    // header field.
+    let needle = b"#usda";
+    let pos = usdz
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .expect("payload header present");
+    usdz[pos] ^= 0xFF;
+
+    let err = UsdzDecoder::new().decode_bytes(&usdz).unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("CRC-32"), "expected CRC failure, got: {msg}");
+}
+
+#[test]
 fn cube_indices_are_u16() {
     // 24 vertices fits in U16 — the decoder should pick the
     // compact representation rather than promoting to U32.

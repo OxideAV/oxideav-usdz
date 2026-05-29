@@ -227,7 +227,21 @@
 //!   `["usd:composedSpecializes"]`. See
 //!   [`crate::usd_to_scene`]'s `compose_class_arcs`.
 //!
-//! Deferred to round 14+:
+//! Round 14 — CRC-32 integrity verification on the reader:
+//!
+//! * **STORED payloads are verified against the central-directory
+//!   CRC-32.** USDZ is a PKZIP archive (PKWARE APPNOTE.TXT
+//!   container); every entry carries a CRC-32. The writer always
+//!   emitted a correct one, but the reader never checked it. The ZIP
+//!   walker now recomputes the CRC-32/ISO-HDLC of each STORED payload
+//!   and rejects a mismatch with [`Error::InvalidData`](crate::Error),
+//!   catching a corrupted byte at the container boundary instead of
+//!   downstream as a USDA parse failure or a garbled texture. Reuses
+//!   the crate's own [`crate::zip_writer::crc32`] so reader and writer
+//!   can't drift. The CRC field is plain PKWARE structure, not
+//!   USD-specific.
+//!
+//! Deferred to round 15+:
 //!
 //! * Binary `.usdc` "Crate" parser — Pixar publishes no prose spec
 //!   for the wire format (documented gap in `docs/3d/usd/README.md`);

@@ -1,7 +1,8 @@
 //! USDZ-conforming PKZIP writer (STORED-only, 64-byte aligned).
 //!
-//! Writes archives that satisfy the *USDZ File Format Specification*
-//! (`docs/3d/usd/spec_usdz.html`):
+//! Writes archives that satisfy the USDZ container constraints
+//! (`docs/3d/usd/GAP-TRACKER.md` §3) layered on the PKWARE
+//! APPNOTE.TXT ZIP format:
 //!
 //! * Every entry uses PKZIP method 0 (STORED — uncompressed).
 //! * Every payload begins on a multiple-of-64 byte offset from the

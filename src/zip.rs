@@ -1,7 +1,8 @@
 //! Minimal PKZIP central-directory walker — STORED entries only.
 //!
-//! USDZ packages are constrained by the *USDZ File Format
-//! Specification* (`docs/3d/usd/spec_usdz.html`):
+//! USDZ is a PKZIP archive (PKWARE APPNOTE.TXT container) with two
+//! extra constraints, summarised in `docs/3d/usd/GAP-TRACKER.md`
+//! §3 ("USDZ container"):
 //!
 //! * **Zero-compression**: every inner file is stored uncompressed
 //!   (PKZIP method `0`). Any other method (deflate `8`, bzip2 `12`,
@@ -12,11 +13,17 @@
 //!   payload (notably the `.usdc` Default Layer) straight to USD's
 //!   crate-file mmap path without copying.
 //!
-//! The walker reads the End-of-Central-Directory (EOCD) record at
-//! the tail of the archive, then walks the central directory to
-//! collect `(filename, payload_offset, payload_length)` triples.
-//! Each `payload_offset` is verified to be a multiple of 64; any
-//! violation surfaces as `Error::InvalidData`.
+//! Everything else here — the End-of-Central-Directory (EOCD) record,
+//! the central-directory file headers, the local file headers, and
+//! the CRC-32 integrity field — is plain PKWARE-format structure, not
+//! USD-specific.
+//!
+//! The walker reads the EOCD record at the tail of the archive, then
+//! walks the central directory to collect one [`ZipEntry`] per file.
+//! Each `payload_offset` is verified to be a multiple of 64, and each
+//! STORED payload's CRC-32 is verified against the value the central
+//! directory records for it; any violation surfaces as
+//! `Error::InvalidData`.
 //!
 //! We deliberately do NOT implement: ZIP64, encryption,
 //! multi-volume archives, or any compression method. These features
@@ -32,9 +39,10 @@ const EOCD_SIGNATURE: u32 = 0x06054b50;
 const CDIR_SIGNATURE: u32 = 0x02014b50;
 const LFH_SIGNATURE: u32 = 0x04034b50;
 
-/// USDZ alignment constraint (`docs/3d/usd/spec_usdz.html` —
-/// "we require that each file begin on a 64 byte alignment within
-/// the package").
+/// USDZ alignment constraint: every inner-file payload begins on a
+/// multiple-of-64 offset within the package (see
+/// `docs/3d/usd/GAP-TRACKER.md` §3 — the mmap-friendliness rule that
+/// distinguishes a USDZ from a plain STORED ZIP).
 const USDZ_ALIGNMENT: u64 = 64;
 
 /// One central-directory entry.
@@ -56,8 +64,9 @@ pub struct ZipEntry {
 /// [`ZipEntry`] per file.
 ///
 /// Each entry's `payload_offset` is verified to satisfy the USDZ
-/// 64-byte alignment requirement; any violation returns
-/// `Error::InvalidData`.
+/// 64-byte alignment requirement, and each STORED payload is checked
+/// against the CRC-32 the central directory records for it; any
+/// violation returns `Error::InvalidData`.
 pub fn walk(archive: &[u8]) -> Result<Vec<ZipEntry>> {
     let eocd = find_eocd(archive)?;
     let cd_size = u32::from_le_bytes(read4(archive, eocd + 12)?) as u64;
@@ -83,6 +92,7 @@ pub fn walk(archive: &[u8]) -> Result<Vec<ZipEntry>> {
         // Central-directory file-header layout: 46 fixed bytes +
         // filename + extra + comment.
         let method = u16::from_le_bytes(read2(archive, p + 10)?);
+        let expected_crc = u32::from_le_bytes(read4(archive, p + 16)?);
         let comp_size = u32::from_le_bytes(read4(archive, p + 20)?) as u64;
         let uncomp_size = u32::from_le_bytes(read4(archive, p + 24)?) as u64;
         let name_len = u16::from_le_bytes(read2(archive, p + 28)?) as usize;
@@ -121,6 +131,23 @@ pub fn walk(archive: &[u8]) -> Result<Vec<ZipEntry>> {
         if payload_offset % USDZ_ALIGNMENT != 0 {
             return Err(invalid(format!(
                 "USDZ entry '{name}' payload at offset {payload_offset} is not 64-byte aligned"
+            )));
+        }
+
+        // Verify the stored payload against the CRC-32 the central
+        // directory records for it. STORED entries carry the CRC in
+        // the same field a DEFLATE entry would, so a silently-
+        // corrupted byte (bit-rot, a truncated copy, a mismatched
+        // pass-through) is caught at the container boundary instead
+        // of surfacing as a baffling USDA parse error or a garbled
+        // texture downstream. The zero-length / zero-CRC empty-file
+        // case verifies naturally (`crc32(b"") == 0`).
+        let payload = &archive[payload_offset as usize..(payload_offset + comp_size) as usize];
+        let actual_crc = crate::zip_writer::crc32(payload);
+        if actual_crc != expected_crc {
+            return Err(invalid(format!(
+                "USDZ entry '{name}' failed CRC-32 check \
+                 (stored {expected_crc:#010x}, computed {actual_crc:#010x})"
             )));
         }
 
@@ -206,8 +233,17 @@ mod tests {
     use super::*;
 
     /// Build a minimal STORED-method ZIP with one entry whose
-    /// payload starts on the given alignment.
-    fn build_aligned_zip(name: &str, payload: &[u8], alignment: u64) -> Vec<u8> {
+    /// payload starts on the given alignment. `crc_override`, when
+    /// `Some`, is written into both the LFH and the central directory
+    /// in place of the real CRC so a corruption test can exercise the
+    /// walker's CRC-32 check.
+    fn build_zip_with_crc(
+        name: &str,
+        payload: &[u8],
+        alignment: u64,
+        crc_override: Option<u32>,
+    ) -> Vec<u8> {
+        let crc = crc_override.unwrap_or_else(|| crate::zip_writer::crc32(payload));
         let mut out = Vec::new();
         // Local file header: 30 fixed + name + extra.
         out.extend_from_slice(&LFH_SIGNATURE.to_le_bytes());
@@ -215,7 +251,7 @@ mod tests {
         out.extend_from_slice(&[0x00, 0x00]); // gp flags
         out.extend_from_slice(&[0x00, 0x00]); // method: stored
         out.extend_from_slice(&[0x00, 0x00, 0x21, 0x00]); // mod time + date
-        out.extend_from_slice(&0u32.to_le_bytes()); // crc32 (skipped)
+        out.extend_from_slice(&crc.to_le_bytes()); // crc32
         out.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // comp size
         out.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // uncomp size
         out.extend_from_slice(&(name.len() as u16).to_le_bytes());
@@ -234,7 +270,7 @@ mod tests {
         out.extend_from_slice(&[0x14, 0x00, 0x14, 0x00]); // version made / needed
         out.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // flags + method
         out.extend_from_slice(&[0x00, 0x00, 0x21, 0x00]); // mod time + date
-        out.extend_from_slice(&0u32.to_le_bytes()); // crc32
+        out.extend_from_slice(&crc.to_le_bytes()); // crc32
         out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         out.extend_from_slice(&(name.len() as u16).to_le_bytes());
@@ -257,6 +293,12 @@ mod tests {
         out
     }
 
+    /// Build a minimal STORED-method ZIP with a correctly-computed
+    /// CRC-32, payload starting on `alignment`.
+    fn build_aligned_zip(name: &str, payload: &[u8], alignment: u64) -> Vec<u8> {
+        build_zip_with_crc(name, payload, alignment, None)
+    }
+
     #[test]
     fn roundtrip_one_entry() {
         let zip = build_aligned_zip("hello.usda", b"#usda 1.0\n", 64);
@@ -277,5 +319,26 @@ mod tests {
         let err = walk(&zip).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("64-byte aligned"), "got: {msg}");
+    }
+
+    #[test]
+    fn rejects_crc_mismatch() {
+        // A central directory advertising the wrong CRC for an
+        // otherwise-valid STORED payload must be rejected, not
+        // silently accepted.
+        let zip = build_zip_with_crc("hello.usda", b"#usda 1.0\n", 64, Some(0xDEAD_BEEF));
+        let err = walk(&zip).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("CRC-32"), "got: {msg}");
+    }
+
+    #[test]
+    fn accepts_empty_payload_crc() {
+        // A zero-length file has CRC-32 0x00000000; the check must
+        // pass it rather than tripping on the all-zero field.
+        let zip = build_aligned_zip("empty.txt", b"", 64);
+        let entries = walk(&zip).expect("walk ok");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].payload_len, 0);
     }
 }

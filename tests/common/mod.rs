@@ -23,7 +23,7 @@ pub struct UsdzEntry<'a> {
 /// the USDZ spec. The first entry is the Default Layer.
 pub fn build_usdz(entries: &[UsdzEntry<'_>]) -> Vec<u8> {
     let mut out = Vec::new();
-    let mut cd_records: Vec<(u64, u32)> = Vec::new(); // (lfh_offset, payload_len)
+    let mut cd_records: Vec<(u64, u32, u32)> = Vec::new(); // (lfh_offset, payload_len, crc32)
 
     for entry in entries {
         let lfh_offset = out.len() as u64;
@@ -31,6 +31,11 @@ pub fn build_usdz(entries: &[UsdzEntry<'_>]) -> Vec<u8> {
         // then patch the extra_len once we know how much padding
         // we need to land on a 64-byte boundary.
         let payload_len = entry.payload.len() as u32;
+        // The walker now verifies each STORED payload against the
+        // CRC-32 the central directory records, so a faithful test
+        // archive has to carry the real checksum (reuse the crate's
+        // own CRC-32/ISO-HDLC routine so the two never drift).
+        let crc = oxideav_usdz::zip_writer::crc32(entry.payload);
         // Compute the alignment padding required.
         let base = lfh_offset + 30 + entry.name.len() as u64;
         let extra_len = ((ALIGN - (base % ALIGN)) % ALIGN) as u16;
@@ -41,7 +46,7 @@ pub fn build_usdz(entries: &[UsdzEntry<'_>]) -> Vec<u8> {
         out.extend_from_slice(&[0x00, 0x00]); // flags
         out.extend_from_slice(&[0x00, 0x00]); // method = stored
         out.extend_from_slice(&[0x00, 0x00, 0x21, 0x00]); // mod time + date
-        out.extend_from_slice(&0u32.to_le_bytes()); // crc32 (skipped)
+        out.extend_from_slice(&crc.to_le_bytes()); // crc32
         out.extend_from_slice(&payload_len.to_le_bytes()); // comp size
         out.extend_from_slice(&payload_len.to_le_bytes()); // uncomp size
         out.extend_from_slice(&(entry.name.len() as u16).to_le_bytes());
@@ -50,17 +55,17 @@ pub fn build_usdz(entries: &[UsdzEntry<'_>]) -> Vec<u8> {
         out.resize(out.len() + extra_len as usize, 0);
         // Payload.
         out.extend_from_slice(entry.payload);
-        cd_records.push((lfh_offset, payload_len));
+        cd_records.push((lfh_offset, payload_len, crc));
     }
 
     let cd_offset = out.len() as u32;
     for (i, entry) in entries.iter().enumerate() {
-        let (lfh_offset, payload_len) = cd_records[i];
+        let (lfh_offset, payload_len, crc) = cd_records[i];
         out.extend_from_slice(&CDIR_SIG.to_le_bytes());
         out.extend_from_slice(&[0x14, 0x00, 0x14, 0x00]); // version made / needed
         out.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // flags + method
         out.extend_from_slice(&[0x00, 0x00, 0x21, 0x00]); // mod time + date
-        out.extend_from_slice(&0u32.to_le_bytes()); // crc32
+        out.extend_from_slice(&crc.to_le_bytes()); // crc32
         out.extend_from_slice(&payload_len.to_le_bytes());
         out.extend_from_slice(&payload_len.to_le_bytes());
         out.extend_from_slice(&(entry.name.len() as u16).to_le_bytes());
