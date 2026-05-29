@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/OxideAV/oxideav-usdz/compare/v0.0.1...v0.0.2) - 2026-05-29
+
+### Other
+
+- Round 14: CRC-32 integrity verification on the USDZ reader
+- Round 13: in-layer inherits / specializes class-arc composition
+- Round 12: defaultPrim consistency on the USDA writer
+- round 11 — in-archive references / payload arc composition
+- Round 10: anchored in-archive sublayer composition
+- Round 9: composition-arc + layer-metadata round-trip on the writer
+- Round 8: variant writer round-trip
+- Round 7: variant selection composition
+
 ### Added — Round 14 (CRC-32 integrity verification on the reader)
 
 - **STORED payloads are verified against the central-directory
