@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 194 (variantSet-bound Material `usdcat`-flatten oracle)
+
+- **`tests/variant_material_usdcat_oracle.rs`** — black-box cross-validation
+  of the round-7 variantSet resolver against Pixar's `usdcat -f` flatten
+  command on a feature surface combining variant resolution with the
+  round-1 `UsdPreviewSurface` PBR mapping. A `def Material` declared
+  inside a variantSet body (the "metallic" branch of a `finish` variant
+  set) has to be materialised by the resolver, then the typed Scene3D
+  pass has to pick up `inputs:diffuseColor` / `inputs:metallic` /
+  `inputs:roughness` and bind the Mesh's `rel material:binding` to the
+  resulting `MaterialId`. The test feeds the original USDA + the
+  `usdcat -f`-flattened reference through `UsdzDecoder` (each wrapped in
+  USDZ via the in-tree `common::build_usdz` helper) and asserts
+  fingerprint parity: mesh count, primitive vertex count, material count,
+  bound `base_color` / `metallic` / `roughness`. A second test flips the
+  selection metadata to `"matte"` and verifies the bound material's PBR
+  slots track the alternate variant body. Skip-early (NOT `#[ignore]`)
+  when `usdcat` is absent — no `pxr` Python module is needed, so the
+  oracle runs anywhere Apple USD Tools / Pixar's CLI is installed.
+
 ## [0.0.2](https://github.com/OxideAV/oxideav-usdz/compare/v0.0.1...v0.0.2) - 2026-05-29
 
 ### Other

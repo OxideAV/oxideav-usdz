@@ -304,6 +304,26 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   naturally. The CRC field is plain PKWARE structure — not
   USD-specific.
 
+## Round 194 scope (variantSet-bound Material `usdcat`-flatten oracle)
+
+- **Black-box cross-validation of variantSet + Material PBR.**
+  `tests/variant_material_usdcat_oracle.rs` exercises the union of
+  the round-7 variant resolver and the round-1 `UsdPreviewSurface`
+  PBR mapping against Pixar's `usdcat -f` flatten as the oracle. A
+  `def Material` declared INSIDE a variantSet body must be
+  materialised under the selected branch, indexed by the typed
+  Scene3D pass, and bound to the Mesh's `rel material:binding`. The
+  test feeds both the original USDA and the `usdcat -f`-flattened
+  reference through `UsdzDecoder` (each wrapped via the in-tree
+  `common::build_usdz` helper) and asserts a structural fingerprint
+  parity — mesh count, primitive vertex count, material count,
+  bound `base_color` / `metallic` / `roughness`. A companion test
+  flips the selection metadata to `"matte"` and confirms the bound
+  material tracks the alternate variant's PBR values. Skip-early
+  (NOT `#[ignore]`) when `usdcat` is absent — no `pxr` Python
+  module is required, so this oracle runs anywhere Apple USD Tools /
+  Pixar's CLI binary is installed.
+
 ## Deferred to round 15+
 
 - **Binary `.usdc` "Crate" parser.** Pixar publishes no prose
