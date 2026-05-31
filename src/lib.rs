@@ -241,11 +241,41 @@
 //!   can't drift. The CRC field is plain PKWARE structure, not
 //!   USD-specific.
 //!
-//! Deferred to round 15+:
+//! Round 15 — USDC ("Crate") binary-format primitives:
 //!
-//! * Binary `.usdc` "Crate" parser — Pixar publishes no prose spec
-//!   for the wire format (documented gap in `docs/3d/usd/README.md`);
-//!   loading a `.usdc` Default Layer surfaces as `Error::Unsupported`.
+//! * [`usdc`] module — bootstrap-header + Table-of-Contents
+//!   primitives for the binary `.usdc` sibling of the USDA text
+//!   format ([`usdc::Magic`], [`usdc::Version`],
+//!   [`usdc::Bootstrap`], [`usdc::TocEntry`], [`usdc::SectionName`],
+//!   [`usdc::Toc`], [`usdc::UsdcFile::parse`]). Sourced exclusively
+//!   from `docs/3d/usd/usdc-crate-format-trace.md`, the project's
+//!   own clean-room byte-level trace of real `.usdc` samples; cross-
+//!   validated against the trace doc's Elephant fixture (v0.8.0,
+//!   six sections in `TOKENS / STRINGS / FIELDS / FIELDSETS /
+//!   PATHS / SPECS` order, TOC at file offset `0x000cfc9a`).
+//! * **Decoder boundary check.** The USDZ decoder now parses the
+//!   bootstrap + TOC of a `.usdc` Default Layer before surfacing
+//!   `Error::Unsupported` — malformed `.usdc` payloads (truncated
+//!   bootstrap, wrong magic, oversized TOC, section running into
+//!   the TOC, …) are caught at the container boundary as
+//!   `Error::InvalidData` instead of leaking past
+//!   layer-extension dispatch. The Unsupported message records the
+//!   parsed version + section catalogue so callers can see how far
+//!   the boundary check got.
+//!
+//! Deferred to round 16+:
+//!
+//! * **`.usdc` section-payload decoding.** The LZ4 wrapper, the
+//!   "compressed integer" delta + 2-bit-control-stream coding, and
+//!   the six section-payload semantics (TOKENS string-atom pool,
+//!   STRINGS index table, FIELDS (name, value-rep) pairs,
+//!   FIELDSETS field-index lists, PATHS namespace tree, SPECS
+//!   spec table) are next on the slice — the [`usdc`] primitives
+//!   give the surface to build on without re-parsing the bootstrap.
+//!   The trace doc §3-§4 records the encoding shape for each.
+//! * **FIELDS value-rep type-code enumeration.** A separate
+//!   fact-table extraction (gap tracker's Round B) that the
+//!   [`usdc`] primitives don't depend on.
 //! * `UsdSkelSkeleton` + `UsdSkelBindingAPI` skinning — UsdSkel
 //!   schema docs are not in our `docs/3d/usd/` (the spec README
 //!   notes UsdSkel sits behind a per-schema URL pattern not yet
@@ -286,6 +316,7 @@ pub mod error;
 pub mod usd_to_scene;
 pub mod usda;
 pub mod usda_writer;
+pub mod usdc;
 pub mod variant_codec;
 pub mod zip;
 pub mod zip_writer;

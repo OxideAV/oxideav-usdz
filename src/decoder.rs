@@ -20,7 +20,7 @@ use std::sync::Arc;
 use oxideav_mesh3d::{Mesh3DDecoder, Scene3D};
 
 use crate::error::unsupported;
-use crate::{usd_to_scene, usda, zip, Result};
+use crate::{usd_to_scene, usda, usdc, zip, Result};
 
 /// USDZ decoder. Constructed via [`UsdzDecoder::new`] (state is
 /// reset on every `decode()` call so a single instance can be
@@ -57,10 +57,31 @@ impl UsdzDecoder {
                 let layer = usda::parse(payload)?;
                 usd_to_scene::translate(&layer, archive.clone(), &entries)
             }
-            "usdc" => Err(unsupported(
-                "USDZ default layer is in `.usdc` (binary crate) format; \
-                 binary USDC parsing is round-2 work. Re-package with `usdcat -o foo.usda` to convert.",
-            )),
+            "usdc" => {
+                // Validate the Crate bootstrap + TOC so a malformed
+                // `.usdc` is caught at the boundary as InvalidData
+                // instead of silently being deferred. The full
+                // scene-materialisation path (TOKENS / STRINGS /
+                // FIELDS / FIELDSETS / PATHS / SPECS payload
+                // decompression + decoding) is still pending — we
+                // surface the parsed version and section catalogue
+                // in the Unsupported message so callers can see how
+                // far the boundary check got.
+                let file = usdc::UsdcFile::parse(payload)?;
+                let mut sections = String::new();
+                for (i, entry) in file.toc.entries.iter().enumerate() {
+                    if i > 0 {
+                        sections.push_str(", ");
+                    }
+                    sections.push_str(&entry.name);
+                }
+                Err(unsupported(format!(
+                    "USDZ default layer is in `.usdc` (binary crate) format \
+                     v{} with sections [{sections}]; full USDC scene materialisation \
+                     is pending. Re-package with `usdcat -o foo.usda` to convert.",
+                    file.bootstrap.version,
+                )))
+            }
             other => Err(unsupported(format!(
                 "unrecognised USDZ default-layer extension `{other}` (expected .usd / .usda / .usdc)"
             ))),

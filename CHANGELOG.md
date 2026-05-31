@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 15 (USDC binary-format primitives: bootstrap + TOC)
+
+- **`usdc` module** — bootstrap-header and Table-of-Contents
+  primitives for the binary `.usdc` sibling of the USDA text
+  format. Public surface: `Magic` (8-byte `PXR-USDC` signature),
+  `Version` (`major.minor.patch` from bootstrap bytes
+  `0x08`/`0x09`/`0x0A`, with reserved-bytes-zero validation),
+  `Bootstrap` (the fixed 88-byte header including the absolute
+  `toc_offset`), `SectionName` (enum over the six standard
+  section names `TOKENS` / `STRINGS` / `FIELDS` / `FIELDSETS` /
+  `PATHS` / `SPECS` observed in real samples), `TocEntry`
+  (`(name, offset, size)` row in the tail TOC), `Toc::parse`
+  (walks the TOC and validates that each declared section region
+  lives inside the file, doesn't overlap the bootstrap header,
+  and doesn't run into the TOC itself), and a one-call
+  `UsdcFile::parse` that returns both bootstrap and TOC.
+  Sourced exclusively from
+  `docs/3d/usd/usdc-crate-format-trace.md`, the project's own
+  clean-room byte-level trace of real `.usdc` samples.
+- **Decoder boundary check.** A `.usdc` Default Layer now has
+  its bootstrap + TOC validated before the decoder surfaces
+  `Error::Unsupported` — malformed `.usdc` payloads (truncated
+  bootstrap, wrong magic, oversized `sectionCount`, section
+  region running into the TOC, …) are caught at the container
+  boundary as `Error::InvalidData` instead of leaking past
+  layer-extension dispatch. The `Unsupported` message now also
+  records the parsed version and section catalogue so callers
+  can see how far the boundary check got.
+- **Real-fixture cross-check.** `tests/usdc_unsupported.rs`'s
+  new `binary_usdc_real_fixture_reports_trace_doc_facts` test
+  parses the trace doc's Elephant fixture
+  (`docs/3d/usd/fixtures/SoC-ElephantWithMonochord.usdc`) and
+  asserts the every-byte facts: version 0.8.0, six sections in
+  the documented order, TOC at file offset `0x000cfc9a`, section
+  sizes matching the trace doc's decoded table
+  (`TOKENS=1770`, `STRINGS=8`, `FIELDS=998`, `FIELDSETS=611`,
+  `PATHS=548`, `SPECS=331`).
+
 ### Added — Round 194 (variantSet-bound Material `usdcat`-flatten oracle)
 
 - **`tests/variant_material_usdcat_oracle.rs`** — black-box cross-validation

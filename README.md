@@ -324,12 +324,52 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   module is required, so this oracle runs anywhere Apple USD Tools /
   Pixar's CLI binary is installed.
 
-## Deferred to round 15+
+## Round 15 scope (USDC binary-format primitives)
 
-- **Binary `.usdc` "Crate" parser.** Pixar publishes no prose
-  spec for the wire format; loading a `.usdc` Default Layer
-  still surfaces as `Error::Unsupported` with a hint to
-  re-package with `usdcat -o foo.usda`.
+- **`usdc` module — bootstrap + Table-of-Contents primitives.**
+  The binary `.usdc` sibling of the USDA text format that the
+  rest of this crate parses now has a documented surface for the
+  outer parts of the wire format: `Magic` (8-byte `PXR-USDC`
+  signature), `Version` (`major.minor.patch` from bootstrap bytes
+  `0x08`, `0x09`, `0x0A`), `Bootstrap` (the fixed 88-byte header
+  including the absolute `toc_offset`), `TocEntry` /
+  `SectionName` / `Toc` (the tail-written directory whose six
+  standard sections are `TOKENS`, `STRINGS`, `FIELDS`,
+  `FIELDSETS`, `PATHS`, `SPECS`), and a one-call
+  `UsdcFile::parse` that returns both. Sourced exclusively from
+  `docs/3d/usd/usdc-crate-format-trace.md`, the project's own
+  clean-room byte-level trace of real `.usdc` samples; cross-
+  validated against the trace doc's Elephant fixture (v0.8.0,
+  six sections in the documented order, TOC at file offset
+  `0x000cfc9a`, section sizes matching the trace doc's decoded
+  table down to the byte).
+- **USDZ decoder boundary check.** A `.usdc` Default Layer now
+  has its bootstrap + TOC validated before the decoder surfaces
+  `Error::Unsupported`. Malformed `.usdc` payloads (truncated
+  bootstrap, wrong magic, oversized `sectionCount`, section
+  region running into the TOC, …) are caught at the container
+  boundary as `Error::InvalidData` instead of leaking past
+  layer-extension dispatch. The Unsupported message records the
+  parsed version + section catalogue so callers can see how far
+  the boundary check got. Section-payload decoding (LZ4 +
+  delta-int-coding wrappers, plus the six section semantics) is
+  the natural next slice and stacks on top of these primitives
+  without re-parsing the bootstrap.
+
+## Deferred to round 16+
+
+- **`.usdc` section-payload decoding.** The LZ4 block wrapper,
+  the "compressed integer" delta + 2-bit-control-stream coding
+  used inside the index sections, and the per-section semantics
+  (TOKENS string-atom pool, STRINGS index table, FIELDS
+  (name, value-rep) pairs, FIELDSETS field-index lists, PATHS
+  namespace-tree, SPECS spec table) are next on the slice — the
+  round-15 `usdc` primitives surface the bootstrap + TOC so the
+  follow-up work doesn't have to re-parse them. The trace doc
+  §3-§4 records the encoding shape for each.
+- **FIELDS value-rep type-code enumeration.** A separate
+  fact-table extraction (gap tracker's Round B) that the
+  bootstrap + TOC primitives don't depend on.
 - **`UsdSkelSkeleton` + `UsdSkelBindingAPI`** skeletal-animation
   skinning — blocked on `UsdSkel` schema docs not yet staged in
   `docs/3d/usd/`.
