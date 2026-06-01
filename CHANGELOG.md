@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 206 (USDC §3b compressed-integer decoder)
+
+- **`usdc::decode_int_array`** — decodes the §3b "compressed
+  integer" wire shape: a 2-bit-per-element control stream
+  (`ceil(N/4)` bytes, LSB-first) selecting one of four widths
+  per element, then the variable-width payload bytes. Code 0
+  repeats the previous value; codes 1 / 2 encode signed `i8` /
+  `i16` deltas from the previous value; code 3 encodes an
+  absolute `i32` that becomes the new "previous". Returns
+  `Vec<i32>`; rejects a truncated control stream or short
+  payload for the declared width with `Error::InvalidData`.
+  This is the primitive consumed by FIELDS' name-index array,
+  FIELDSETS' field-index array, and SPECS' three index arrays
+  once the §3a LZ4 wrapper lands. Sourced exclusively from
+  `docs/3d/usd/usdc-crate-format-trace.md` §3b.
+- **`usdc::encode_int_array_for_tests`** — test-only
+  companion encoder so the §3b decoder can be exercised
+  end-to-end against synthesised integer sequences (varied
+  zero-delta / i8-delta / i16-delta / absolute-i32 patterns)
+  without first committing a corpus of real `.usdc` byte
+  buffers. Not part of the on-disk writer surface — it picks
+  per-element widths greedily, which exercises every decode
+  path but isn't necessarily byte-identical to what Pixar's
+  writer would produce.
+- **13 new unit tests** in `usdc::tests` cover the empty
+  input, all-zero-delta packing, multi-element LSB-first
+  control-byte layout, single `i8` / `i16` / `i32` elements,
+  the "absolute resets prev" rule, negative-delta wrapping, a
+  five-element sequence forcing two control bytes, a
+  monotonic-token-index pattern mirroring the trace's
+  decoded FIELDS name-index opening, and four error paths
+  (short control stream, short `i8` / `i16` / `i32` payload).
+
 ### Added — Round 15 (USDC binary-format primitives: bootstrap + TOC)
 
 - **`usdc` module** — bootstrap-header and Table-of-Contents

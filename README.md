@@ -324,6 +324,24 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   module is required, so this oracle runs anywhere Apple USD Tools /
   Pixar's CLI binary is installed.
 
+## Round 206 scope (USDC §3b compressed-integer decoder)
+
+- **`usdc::decode_int_array`** — the §3b "compressed integer"
+  decoder. Takes the post-LZ4 bytes of an integer buffer plus the
+  expected element count from the surrounding section header and
+  returns the reconstructed `Vec<i32>`. Per the trace doc the wire
+  shape is: a 2-bit-per-element control stream of `ceil(N/4)` bytes
+  (LSB-first within each byte) selecting one of four widths — code 0
+  repeats the previous value, codes 1 / 2 encode a signed `i8` /
+  `i16` delta from the previous value, code 3 encodes an absolute
+  `i32` that also becomes the new "previous". Variable-width payload
+  bytes follow in array order. The decoder errors with
+  `Error::InvalidData` on a truncated control stream or short
+  payload for the declared width. Used by FIELDS' name-index array,
+  FIELDSETS' field-index array, and SPECS' three index arrays once
+  the LZ4 wrapper lands; sourced exclusively from
+  `docs/3d/usd/usdc-crate-format-trace.md` §3b.
+
 ## Round 15 scope (USDC binary-format primitives)
 
 - **`usdc` module — bootstrap + Table-of-Contents primitives.**
@@ -356,17 +374,20 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   the natural next slice and stacks on top of these primitives
   without re-parsing the bootstrap.
 
-## Deferred to round 16+
+## Deferred to round 207+
 
-- **`.usdc` section-payload decoding.** The LZ4 block wrapper,
-  the "compressed integer" delta + 2-bit-control-stream coding
-  used inside the index sections, and the per-section semantics
-  (TOKENS string-atom pool, STRINGS index table, FIELDS
+- **`.usdc` LZ4 block wrapper (§3a).** The outer per-buffer
+  wrapper documented in trace doc §3a — a one-byte chunk-count
+  prefix then LZ4-block(s) — is the remaining primitive needed
+  before the index sections can be decoded end-to-end. Round 206
+  ships the §3b inner integer-coding decoder; §3a feeds bytes
+  into it.
+- **`.usdc` section-payload semantics.** The per-section
+  decoders (TOKENS string-atom pool, STRINGS index table, FIELDS
   (name, value-rep) pairs, FIELDSETS field-index lists, PATHS
-  namespace-tree, SPECS spec table) are next on the slice — the
-  round-15 `usdc` primitives surface the bootstrap + TOC so the
-  follow-up work doesn't have to re-parse them. The trace doc
-  §3-§4 records the encoding shape for each.
+  namespace-tree, SPECS spec table) stack on top of §3a + §3b
+  without re-parsing the bootstrap. The trace doc §4 records the
+  per-section header shape for each.
 - **FIELDS value-rep type-code enumeration.** A separate
   fact-table extraction (gap tracker's Round B) that the
   bootstrap + TOC primitives don't depend on.

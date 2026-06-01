@@ -21,10 +21,18 @@
 //!   `(offset, size)` ([`Toc::parse`], [`TocEntry`],
 //!   [`SectionName`]).
 //!
+//! What this module **adds in round 206**:
+//!
+//! * [`decode_int_array`] — the §3b "compressed integer" delta +
+//!   2-bit-control-stream decoder. Takes a buffer (already
+//!   LZ4-decompressed, per §3a's outer wrapper) plus the expected
+//!   element count and returns the reconstructed `Vec<i32>`. Used
+//!   by FIELDS' name-index array, FIELDSETS' field-index array, and
+//!   SPECS' three index arrays.
+//!
 //! What this module does **not** do (deferred to a follow-up round):
 //!
 //! * LZ4 block decompression of section payloads,
-//! * the "compressed integer" delta+control-stream coding,
 //! * the TOKENS / STRINGS / FIELDS / FIELDSETS / PATHS / SPECS
 //!   payload semantics,
 //! * the FIELDS value-rep type-code enumeration (a separate
@@ -410,6 +418,139 @@ fn read_u64_le(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(buf)
 }
 
+/// Decode the §3b "compressed integer" stream: a 2-bit-per-element
+/// control stream followed by variable-width payload bytes.
+///
+/// `buf` is the already-decompressed bytes of an §3b integer buffer
+/// (one would normally arrive at this slice by first peeling the §3a
+/// LZ4 wrapper that wraps the compressed buffer on disk). `count` is
+/// the expected element count, carried in the section header.
+///
+/// Per the trace doc:
+///
+/// 1. A **control stream** of `ceil(N/4)` bytes — 2 bits per integer,
+///    **LSB-first** within each byte — encodes one of four operations
+///    per element:
+///    * `0` → repeat previous value (delta 0), 0 payload bytes
+///    * `1` → `int8` signed delta from previous, 1 payload byte
+///    * `2` → `int16` signed delta from previous, 2 payload bytes
+///    * `3` → `int32` **value** (absolute, not a delta), 4 payload bytes
+/// 2. The variable-width **payload bytes**, in array order.
+///
+/// The "previous" value starts at zero for the first element (a
+/// leading code `0` therefore produces `0`; a leading code `1` of
+/// payload byte `0x05` produces `5`).
+///
+/// Returns the reconstructed sequence as `i32`s (the on-disk
+/// representation: token indices, jump offsets, and field indices
+/// all fit in this width per the trace's `int32` code-3 element).
+///
+/// Errors:
+///
+/// * `Error::InvalidData` if the control stream is shorter than
+///   `ceil(count/4)` bytes, or if the payload runs short for the
+///   widths the control stream declared.
+pub fn decode_int_array(buf: &[u8], count: usize) -> Result<Vec<i32>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let control_bytes = count.div_ceil(4);
+    if buf.len() < control_bytes {
+        return Err(invalid(format!(
+            "USDC int-coded array: control stream needs {control_bytes} bytes ({count} elements at 2 bits each), buffer is only {} bytes",
+            buf.len()
+        )));
+    }
+    let (control, mut payload) = buf.split_at(control_bytes);
+    let mut out: Vec<i32> = Vec::with_capacity(count);
+    let mut prev: i32 = 0;
+    for i in 0..count {
+        let byte = control[i / 4];
+        // LSB-first within each byte: element i mod 4 = 0 takes bits 0-1,
+        // = 1 takes bits 2-3, = 2 takes bits 4-5, = 3 takes bits 6-7.
+        let code = (byte >> ((i % 4) * 2)) & 0b11;
+        let value = match code {
+            0 => prev,
+            1 => {
+                if payload.is_empty() {
+                    return Err(invalid(format!(
+                        "USDC int-coded array element {i}: control says int8 delta but payload exhausted",
+                    )));
+                }
+                let delta = payload[0] as i8 as i32;
+                payload = &payload[1..];
+                prev.wrapping_add(delta)
+            }
+            2 => {
+                if payload.len() < 2 {
+                    return Err(invalid(format!(
+                        "USDC int-coded array element {i}: control says int16 delta but only {} payload byte(s) left",
+                        payload.len()
+                    )));
+                }
+                let delta = i16::from_le_bytes([payload[0], payload[1]]) as i32;
+                payload = &payload[2..];
+                prev.wrapping_add(delta)
+            }
+            3 => {
+                if payload.len() < 4 {
+                    return Err(invalid(format!(
+                        "USDC int-coded array element {i}: control says int32 value but only {} payload byte(s) left",
+                        payload.len()
+                    )));
+                }
+                let v = i32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                payload = &payload[4..];
+                v
+            }
+            _ => unreachable!("2-bit code masked with 0b11"),
+        };
+        out.push(value);
+        prev = value;
+    }
+    Ok(out)
+}
+
+/// Encode `values` as a §3b "compressed integer" stream. The inverse
+/// of [`decode_int_array`]; used internally by tests to synthesise
+/// round-trip fixtures from known integer sequences without first
+/// committing a corpus of real `.usdc` byte buffers.
+///
+/// Not part of the on-disk writer surface — the encoder picks
+/// per-element widths greedily (use code `0` when the delta is zero,
+/// else the smallest width that fits the delta), which exercises
+/// every decode path but isn't necessarily byte-identical to what
+/// Pixar's writer would produce.
+pub fn encode_int_array_for_tests(values: &[i32]) -> Vec<u8> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+    let control_bytes = values.len().div_ceil(4);
+    let mut control = vec![0u8; control_bytes];
+    let mut payload: Vec<u8> = Vec::new();
+    let mut prev: i32 = 0;
+    for (i, &v) in values.iter().enumerate() {
+        let delta = v.wrapping_sub(prev);
+        let code: u8 = if delta == 0 {
+            0
+        } else if (-128..=127).contains(&delta) {
+            payload.push((delta as i8) as u8);
+            1
+        } else if (-32_768..=32_767).contains(&delta) {
+            payload.extend_from_slice(&(delta as i16).to_le_bytes());
+            2
+        } else {
+            payload.extend_from_slice(&v.to_le_bytes());
+            3
+        };
+        control[i / 4] |= code << ((i % 4) * 2);
+        prev = v;
+    }
+    let mut out = control;
+    out.extend(payload);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,5 +721,151 @@ mod tests {
             assert_eq!(SectionName::from_bytes(v.as_bytes()), Some(v));
         }
         assert_eq!(SectionName::from_bytes(b"OTHER"), None);
+    }
+
+    // ----- §3b integer-coding tests -----
+
+    #[test]
+    fn int_array_empty() {
+        assert!(decode_int_array(&[], 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn int_array_all_zero_deltas_use_one_control_byte_per_four_elements() {
+        // Four zeros: control = 0x00 (four code-0s), no payload.
+        let buf = vec![0x00];
+        let out = decode_int_array(&buf, 4).unwrap();
+        assert_eq!(out, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn int_array_int8_deltas_pack_lsb_first() {
+        // Three code-1s (int8 delta) packed into one control byte,
+        // LSB-first: bits 0-1 = 1, bits 2-3 = 1, bits 4-5 = 1, bits 6-7 = 0.
+        // = 0b00_01_01_01 = 0x15.
+        // Payload: deltas +5, +5, -3 → values 5, 10, 7.
+        let buf = vec![0x15, 0x05, 0x05, (-3i8) as u8];
+        let out = decode_int_array(&buf, 3).unwrap();
+        assert_eq!(out, vec![5, 10, 7]);
+    }
+
+    #[test]
+    fn int_array_int16_delta() {
+        // Code 2 (int16) for one element: control = 0b00_00_00_10 = 0x02.
+        // Payload: i16 = 300 → [0x2C, 0x01]. From prev=0, value = 300.
+        let buf = vec![0x02, 0x2C, 0x01];
+        let out = decode_int_array(&buf, 1).unwrap();
+        assert_eq!(out, vec![300]);
+    }
+
+    #[test]
+    fn int_array_int32_absolute() {
+        // Code 3 for one element: control = 0b00_00_00_11 = 0x03.
+        // Payload: i32 LE = 0x12345678 → [0x78, 0x56, 0x34, 0x12].
+        let buf = vec![0x03, 0x78, 0x56, 0x34, 0x12];
+        let out = decode_int_array(&buf, 1).unwrap();
+        assert_eq!(out, vec![0x12345678]);
+    }
+
+    #[test]
+    fn int_array_int32_resets_prev_to_absolute_value() {
+        // Two elements: code 3 (absolute 1000), then code 1 (delta +5).
+        // control = 0b00_00_01_11 = 0x07.
+        // Payload: i32 1000 LE = [0xE8, 0x03, 0x00, 0x00], then i8 +5 = 0x05.
+        // Decoded: 1000, then 1005.
+        let buf = vec![0x07, 0xE8, 0x03, 0x00, 0x00, 0x05];
+        let out = decode_int_array(&buf, 2).unwrap();
+        assert_eq!(out, vec![1000, 1005]);
+    }
+
+    #[test]
+    fn int_array_negative_int8_delta_underflows_with_wrapping() {
+        // Two elements: code 1, code 1. control = 0b00_00_01_01 = 0x05.
+        // Deltas: +0x7F (127), then -1 (0xFF).
+        // From prev=0 → 127, then 126.
+        let buf = vec![0x05, 0x7F, 0xFF];
+        let out = decode_int_array(&buf, 2).unwrap();
+        assert_eq!(out, vec![127, 126]);
+    }
+
+    #[test]
+    fn int_array_five_elements_uses_two_control_bytes() {
+        // Five elements → ceil(5/4) = 2 control bytes.
+        // All code-1 (int8 delta of +1): bits arranged so the first
+        // byte's 8 bits = 4*code1 = 0x55; the second byte's low 2 bits
+        // = code1, upper bits unused = 0x01.
+        let buf = vec![0x55, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01];
+        let out = decode_int_array(&buf, 5).unwrap();
+        assert_eq!(out, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn int_array_truncated_control_stream_errors() {
+        // count=8 needs 2 control bytes; supply only 1.
+        let err = decode_int_array(&[0x00], 8).expect_err("truncated control");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("control stream"), "{msg}");
+    }
+
+    #[test]
+    fn int_array_truncated_int8_payload_errors() {
+        // Control says one code-1, but no payload byte follows.
+        let buf = vec![0x01];
+        let err = decode_int_array(&buf, 1).expect_err("missing int8 payload");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("int8"), "{msg}");
+    }
+
+    #[test]
+    fn int_array_truncated_int16_payload_errors() {
+        // Control says one code-2 (int16); only one payload byte.
+        let buf = vec![0x02, 0x05];
+        let err = decode_int_array(&buf, 1).expect_err("missing int16 payload byte");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("int16"), "{msg}");
+    }
+
+    #[test]
+    fn int_array_truncated_int32_payload_errors() {
+        // Control says one code-3 (int32); only three payload bytes.
+        let buf = vec![0x03, 0x05, 0x06, 0x07];
+        let err = decode_int_array(&buf, 1).expect_err("missing int32 payload byte");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("int32"), "{msg}");
+    }
+
+    #[test]
+    fn int_array_round_trip_via_test_helper() {
+        // The test-only encoder + decoder agree on a varied sequence
+        // that exercises every code (0, int8, int16, int32, with
+        // negative deltas).
+        let values: Vec<i32> = vec![
+            0, 1, 1, // delta 0 → code 0
+            0, -1,      // int8 deltas
+            500,     // int16 delta from -1
+            -500,    // negative int16 delta
+            0,       // int8 delta
+            70_000,  // int16-out-of-range delta → code 3 absolute
+            70_001,  // int8 delta from absolute
+            -70_001, // int32 absolute again
+            0,
+        ];
+        let encoded = encode_int_array_for_tests(&values);
+        let decoded = decode_int_array(&encoded, values.len()).unwrap();
+        assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn int_array_monotonic_token_indices() {
+        // Mimics the §4.3 FIELDS name-index pattern: the trace records
+        // the decoded array beginning `[0, 0, …, 0, 20, 101, 106, 107]`
+        // — a run of repeated values then small positive deltas.
+        let values: Vec<i32> = vec![0, 0, 0, 0, 0, 20, 101, 106, 107, 110, 110, 200];
+        let encoded = encode_int_array_for_tests(&values);
+        // The first five zeros pack into a single control byte (0x00)
+        // + a second control byte (also 0x00 for elements 4-7 of which
+        // only one stays zero); the remainder uses int8/int16 codes.
+        let decoded = decode_int_array(&encoded, values.len()).unwrap();
+        assert_eq!(decoded, values);
     }
 }

@@ -263,16 +263,29 @@
 //!   parsed version + section catalogue so callers can see how far
 //!   the boundary check got.
 //!
-//! Deferred to round 16+:
+//! Round 206 — USDC §3b compressed-integer decoder:
 //!
-//! * **`.usdc` section-payload decoding.** The LZ4 wrapper, the
-//!   "compressed integer" delta + 2-bit-control-stream coding, and
-//!   the six section-payload semantics (TOKENS string-atom pool,
-//!   STRINGS index table, FIELDS (name, value-rep) pairs,
-//!   FIELDSETS field-index lists, PATHS namespace tree, SPECS
-//!   spec table) are next on the slice — the [`usdc`] primitives
-//!   give the surface to build on without re-parsing the bootstrap.
-//!   The trace doc §3-§4 records the encoding shape for each.
+//! * [`usdc::decode_int_array`] decodes the §3b "compressed
+//!   integer" wire shape: a 2-bit-per-element control stream
+//!   (`ceil(N/4)` bytes, LSB-first) selecting one of four widths
+//!   per element (`0` = repeat previous, `1` = `i8` delta, `2` =
+//!   `i16` delta, `3` = absolute `i32`), followed by
+//!   variable-width payload bytes. Used by the index arrays
+//!   inside FIELDS / FIELDSETS / SPECS once the §3a LZ4 wrapper
+//!   lands. Sourced exclusively from `docs/3d/usd/usdc-crate-format-trace.md`
+//!   §3b.
+//!
+//! Deferred to round 207+:
+//!
+//! * **`.usdc` §3a LZ4 wrapper.** The outer per-buffer wrapper
+//!   that feeds bytes into §3b. The remaining primitive needed
+//!   before any index section can be decoded end-to-end.
+//! * **`.usdc` section-payload semantics.** The six
+//!   section-payload decoders (TOKENS string-atom pool, STRINGS
+//!   index table, FIELDS (name, value-rep) pairs, FIELDSETS
+//!   field-index lists, PATHS namespace tree, SPECS spec table)
+//!   stack on top of §3a + §3b without re-parsing the bootstrap.
+//!   The trace doc §4 records the per-section header for each.
 //! * **FIELDS value-rep type-code enumeration.** A separate
 //!   fact-table extraction (gap tracker's Round B) that the
 //!   [`usdc`] primitives don't depend on.
