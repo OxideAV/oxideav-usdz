@@ -899,6 +899,141 @@ pub fn encode_int_array_for_tests(values: &[i32]) -> Vec<u8> {
     out
 }
 
+/// The 8-byte header at the start of the §4.2 STRINGS section.
+///
+/// Trace doc §4.2: one little-endian `int64 count`, followed by
+/// `count × uint32` little-endian raw (NOT LZ4-compressed) token
+/// indices. The STRINGS pool is a subset of the TOKENS atom pool —
+/// each `uint32` is an index into the `TOKENS` array of those
+/// tokens whose values are themselves used as USDA *string-typed*
+/// values (as opposed to bare identifiers). String-valued field
+/// reps in §4.3 FIELDS index into this table.
+///
+/// The Elephant fixture has `count = 0` (a STRINGS section consisting
+/// entirely of the 8-byte count). The trace's teapot example shows
+/// the populated form (`count = 15`, then 15 little-endian `uint32`s).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StringsHeader {
+    /// Number of string-token indices encoded in the section.
+    pub count: u64,
+}
+
+/// Defensive upper bound on the §4.2 STRINGS count. The trace's
+/// teapot sample has `count = 15`; we cap several orders of
+/// magnitude above any real file so a hostile or corrupted header
+/// can't trigger a runaway allocation. The cap is independent of —
+/// and tighter than — the implicit ceiling imposed by the section
+/// size (`count * 4` index bytes must fit in the section), but the
+/// section-size check also runs and is the only one that bounds
+/// actual memory in the common path.
+const STRINGS_COUNT_CAP: u64 = 16_777_216; // 16 Mi
+
+impl StringsHeader {
+    /// Fixed on-disk size of the `int64 count` header.
+    pub const SIZE: usize = 8;
+
+    /// Parse the 8-byte `int64 count` from the leading bytes.
+    /// Does not consume the trailing index array — callers thread
+    /// `bytes[Self::SIZE..]` into [`StringsSection::parse`] or use
+    /// the higher-level [`StringsSection::parse_indices`].
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < Self::SIZE {
+            return Err(invalid(format!(
+                "USDC §4.2 STRINGS header truncated: need {} bytes, got {}",
+                Self::SIZE,
+                bytes.len()
+            )));
+        }
+        let count = read_u64_le(&bytes[0..8]);
+        if count > STRINGS_COUNT_CAP {
+            return Err(invalid(format!(
+                "USDC §4.2 STRINGS count {count} exceeds defensive cap {STRINGS_COUNT_CAP}",
+            )));
+        }
+        Ok(Self { count })
+    }
+}
+
+/// A reference to a `STRINGS` section's bytes split into the parsed
+/// `(header, indices_bytes)` pair without yet decoding the raw
+/// `uint32` array.
+///
+/// `indices_bytes` is exactly `header.count * 4` bytes long and is
+/// validated to lie inside the section. Use [`Self::parse_indices`]
+/// to materialise the indices as a `Vec<u32>`.
+#[derive(Debug, Clone)]
+pub struct StringsSection<'a> {
+    /// The 8-byte `int64 count` header.
+    pub header: StringsHeader,
+    /// The raw `count * 4` bytes of little-endian `uint32` token
+    /// indices. Always validated to lie inside the section.
+    pub indices_bytes: &'a [u8],
+}
+
+impl<'a> StringsSection<'a> {
+    /// Parse a complete `STRINGS` section image. `section` is the
+    /// payload bytes addressed by the TOC's `(offset, size)` pair
+    /// for the section.
+    ///
+    /// Errors:
+    ///
+    /// * [`Error::InvalidData`](crate::Error) if the section is
+    ///   shorter than the 8-byte header,
+    /// * [`Error::InvalidData`] if `count > STRINGS_COUNT_CAP`,
+    /// * [`Error::InvalidData`] if `count * 4` overflows or exceeds
+    ///   the bytes remaining after the header,
+    /// * [`Error::InvalidData`] if the section has trailing bytes
+    ///   beyond the declared header + index array (the section is
+    ///   exactly `8 + count * 4` bytes per the trace doc).
+    pub fn parse(section: &'a [u8]) -> Result<Self> {
+        let header = StringsHeader::parse(section)?;
+        let body = &section[StringsHeader::SIZE..];
+        let count = usize::try_from(header.count).map_err(|_| {
+            invalid(format!(
+                "USDC §4.2 STRINGS count {} does not fit in usize",
+                header.count
+            ))
+        })?;
+        let want = count
+            .checked_mul(4)
+            .ok_or_else(|| invalid(format!("USDC §4.2 STRINGS count {count} * 4 overflows")))?;
+        if body.len() < want {
+            return Err(invalid(format!(
+                "USDC §4.2 STRINGS section: count {count} needs {want} index bytes, only {} remain after header",
+                body.len()
+            )));
+        }
+        if body.len() != want {
+            return Err(invalid(format!(
+                "USDC §4.2 STRINGS section: {} trailing bytes after {want}-byte index array (header(8) + count*4 must equal section size)",
+                body.len() - want
+            )));
+        }
+        Ok(Self {
+            header,
+            indices_bytes: &body[..want],
+        })
+    }
+
+    /// Decode the `count` little-endian `uint32` token indices into
+    /// an owned `Vec<u32>`. Each value is an index into the TOKENS
+    /// section's atom pool.
+    pub fn parse_indices(&self) -> Vec<u32> {
+        let count = self.header.count as usize;
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let base = i * 4;
+            out.push(u32::from_le_bytes([
+                self.indices_bytes[base],
+                self.indices_bytes[base + 1],
+                self.indices_bytes[base + 2],
+                self.indices_bytes[base + 3],
+            ]));
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1575,6 +1710,148 @@ mod tests {
             cb.chunks[0].bytes.len() as u64,
             sec.header.compressed_size - 1,
             "single chunk owns all bytes after the 1-byte chunk-count",
+        );
+    }
+
+    // ----- §4.2 STRINGS section tests -----
+
+    /// Build a `STRINGS` section image: 8-byte LE `count` header,
+    /// then `count` LE `uint32` indices. Mirrors the trace's wire
+    /// shape so the parser's bounds checks see realistic byte runs.
+    fn build_strings_section(indices: &[u32]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(8 + indices.len() * 4);
+        buf.extend_from_slice(&(indices.len() as u64).to_le_bytes());
+        for idx in indices {
+            buf.extend_from_slice(&idx.to_le_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn strings_header_parses_zero_count() {
+        // Elephant case: count = 0, section is exactly the 8-byte count.
+        let bytes = build_strings_section(&[]);
+        let h = StringsHeader::parse(&bytes).unwrap();
+        assert_eq!(h.count, 0);
+    }
+
+    #[test]
+    fn strings_header_rejects_truncated_buffer() {
+        let err = StringsHeader::parse(&[0u8; 4]).expect_err("4-byte slice must fail");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("truncated") && msg.contains("STRINGS"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn strings_header_rejects_oversized_count() {
+        // count = STRINGS_COUNT_CAP + 1.
+        let mut bytes = vec![0u8; 8];
+        let oversized = STRINGS_COUNT_CAP + 1;
+        bytes[..8].copy_from_slice(&oversized.to_le_bytes());
+        let err = StringsHeader::parse(&bytes).expect_err("oversized count must fail");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("STRINGS") && msg.contains("cap"), "{msg}");
+    }
+
+    #[test]
+    fn strings_section_parses_empty() {
+        // Trace's Elephant fixture: count = 0; section is the 8-byte
+        // count alone with no trailing bytes.
+        let bytes = build_strings_section(&[]);
+        let sec = StringsSection::parse(&bytes).unwrap();
+        assert_eq!(sec.header.count, 0);
+        assert!(sec.indices_bytes.is_empty());
+        assert!(sec.parse_indices().is_empty());
+    }
+
+    #[test]
+    fn strings_section_parses_teapot_shape() {
+        // Trace's teapot example: count = 15, then 15 LE uint32s
+        // beginning `02 00 00 00 03 00 00 00 04 00 00 00 …`. We
+        // exercise the wire shape end-to-end and decode the indices.
+        let want: Vec<u32> = vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        assert_eq!(want.len(), 15, "teapot trace shows count = 15");
+        let bytes = build_strings_section(&want);
+        let sec = StringsSection::parse(&bytes).unwrap();
+        assert_eq!(sec.header.count, 15);
+        assert_eq!(sec.indices_bytes.len(), 15 * 4);
+        assert_eq!(sec.parse_indices(), want);
+    }
+
+    #[test]
+    fn strings_section_rejects_short_index_array() {
+        // Header says count = 3 (12 bytes of indices needed) but we
+        // ship only 8 trailing bytes.
+        let mut bytes = vec![0u8; 8];
+        bytes[..8].copy_from_slice(&3u64.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 8]);
+        let err = StringsSection::parse(&bytes).expect_err("short index array must fail");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("STRINGS") && msg.contains("index"), "{msg}");
+    }
+
+    #[test]
+    fn strings_section_rejects_trailing_bytes() {
+        // Header says count = 1 (4-byte index) but the section is 16
+        // bytes — i.e. there's a stray 4-byte tail. Per trace doc the
+        // section size is exactly `8 + count * 4`.
+        let mut bytes = build_strings_section(&[42]);
+        bytes.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        let err = StringsSection::parse(&bytes).expect_err("trailing bytes must fail");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("STRINGS") && msg.contains("trailing"), "{msg}");
+    }
+
+    #[test]
+    fn strings_section_header_truncation_propagates() {
+        // Shorter than the 8-byte header.
+        let err = StringsSection::parse(&[0u8; 3]).expect_err("short header must fail");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("STRINGS") && msg.contains("truncated"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn real_fixture_strings_section_parses_zero_count() {
+        // Cross-validate against the trace-doc-published Elephant
+        // facts: STRINGS section at offset 0x0cf2da with size 8 —
+        // the trace records count = 0, so the whole section is the
+        // 8-byte count.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/3d/usd/fixtures/SoC-ElephantWithMonochord.usdc");
+        if !fixture.exists() {
+            eprintln!("skip: fixture {fixture:?} not present");
+            return;
+        }
+        let bytes = std::fs::read(&fixture).expect("read fixture");
+        let file = UsdcFile::parse(&bytes).expect("parse Elephant USDC");
+        let str_entry = file
+            .toc
+            .find(SectionName::Strings)
+            .expect("STRINGS section present");
+        // Trace doc table: STRINGS offset = 0x0cf2da, size = 8.
+        assert_eq!(str_entry.offset, 0x0cf2da, "trace doc §2 STRINGS offset");
+        assert_eq!(str_entry.size, 8, "trace doc §2 STRINGS size");
+        let off = str_entry.offset as usize;
+        let sz = str_entry.size as usize;
+        let section = &bytes[off..off + sz];
+        let sec = StringsSection::parse(section).expect("parse STRINGS section");
+        assert_eq!(
+            sec.header.count, 0,
+            "trace doc §4.2 records Elephant STRINGS count = 0",
+        );
+        assert!(sec.indices_bytes.is_empty());
+        assert!(sec.parse_indices().is_empty());
+        // 8 + 0*4 = 8 = section size.
+        assert_eq!(
+            StringsHeader::SIZE as u64,
+            str_entry.size,
+            "header(8) + count*4 must equal section size",
         );
     }
 }

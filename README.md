@@ -324,6 +324,26 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   module is required, so this oracle runs anywhere Apple USD Tools /
   Pixar's CLI binary is installed.
 
+## Round 217 scope (USDC §4.2 STRINGS section parser)
+
+- **`usdc::StringsHeader` / `usdc::StringsSection`** — the §4.2
+  STRINGS section: an 8-byte little-endian `int64 count` followed
+  by `count × uint32` token indices (raw, NOT LZ4-compressed per
+  the trace doc). The STRINGS pool is the subset of TOKENS atoms
+  that are used as USDA *string-typed* values (string-valued field
+  reps in §4.3 FIELDS reference token indices through this pool).
+  `StringsSection::parse` enforces `8 + count * 4 == section_size`
+  exactly — trailing bytes the trace doesn't authorise are an
+  `Error::InvalidData`. `StringsSection::parse_indices` decodes the
+  raw `uint32` array into a `Vec<u32>` for callers that want to
+  walk the pool. Defensive cap on `count` (16 Mi) protects against
+  runaway allocation from a hostile or corrupted header.
+- Cross-validated against the Elephant fixture under
+  `docs/3d/usd/fixtures/`: the TOC's STRINGS entry sits at
+  `offset = 0x0cf2da` with `size = 8`, the section header parses
+  to exactly the trace doc's `count = 0`, and the
+  `8 + count * 4 = section_size` invariant holds on the wire.
+
 ## Round 212 scope (USDC §3a compressed-buffer framing + §4.1 TOKENS section header)
 
 - **`usdc::CompressedBuffer` / `CompressedChunk`** — the §3a outer
@@ -413,7 +433,7 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   the natural next slice and stacks on top of these primitives
   without re-parsing the bootstrap.
 
-## Deferred to round 207+
+## Deferred to round 218+
 
 - **`.usdc` LZ4 *block* decoder.** Round 212 ships the §3a outer
   framing (`CompressedBuffer` walks the chunk count + per-chunk
@@ -422,12 +442,13 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   block decompression is left to the caller. Once a clean-room
   trace of the public LZ4 block format lands, the chunk-payload
   decoder slots in here without changing the framing surface.
-- **`.usdc` section-payload semantics.** The per-section
-  decoders (TOKENS string-atom pool, STRINGS index table, FIELDS
-  (name, value-rep) pairs, FIELDSETS field-index lists, PATHS
-  namespace-tree, SPECS spec table) stack on top of §3a + §3b
-  without re-parsing the bootstrap. The trace doc §4 records the
-  per-section header shape for each.
+- **`.usdc` section-payload semantics.** Rounds 212 / 217 land the
+  TOKENS string-atom pool header (§4.1) and the STRINGS index
+  table (§4.2). The remaining per-section decoders — FIELDS
+  (name, value-rep) pairs (§4.3), FIELDSETS field-index lists
+  (§4.4), PATHS namespace-tree (§4.5), SPECS spec table (§4.6) —
+  stack on top of §3a + §3b without re-parsing the bootstrap.
+  The trace doc §4 records the per-section header shape for each.
 - **FIELDS value-rep type-code enumeration.** A separate
   fact-table extraction (gap tracker's Round B) that the
   bootstrap + TOC primitives don't depend on.

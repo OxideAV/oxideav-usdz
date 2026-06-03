@@ -275,7 +275,22 @@
 //!   lands. Sourced exclusively from `docs/3d/usd/usdc-crate-format-trace.md`
 //!   §3b.
 //!
-//! Deferred to round 207+:
+//! Round 217 — USDC §4.2 STRINGS section parser:
+//!
+//! * [`usdc::StringsHeader`] / [`usdc::StringsSection`] — parse
+//!   the §4.2 STRINGS section: an 8-byte little-endian `int64`
+//!   count followed by `count * 4` bytes of raw (NOT
+//!   LZ4-compressed) little-endian `uint32` token indices. The
+//!   STRINGS pool is the subset of TOKENS atoms used as
+//!   USDA *string-typed* values, and §4.3 FIELDS string-valued
+//!   reps index into it. [`usdc::StringsSection::parse_indices`]
+//!   materialises the wire `uint32` array as a `Vec<u32>`.
+//!   Defensive cap on `count` (16 Mi) plus a strict
+//!   `8 + count * 4 == section size` check rejects trailing
+//!   bytes the trace doesn't authorise. Cross-validated against
+//!   the Elephant fixture (`count = 0`, section size = 8).
+//!
+//! Deferred to round 218+:
 //!
 //! * **`.usdc` §3a LZ4 wrapper.** The outer per-buffer wrapper
 //!   that feeds bytes into §3b. The remaining primitive needed

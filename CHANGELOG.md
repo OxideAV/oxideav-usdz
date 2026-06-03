@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 217 (USDC §4.2 STRINGS section parser)
+
+- **`usdc::StringsHeader` / `usdc::StringsSection`** — the §4.2
+  STRINGS section: an 8-byte little-endian `int64 count` header
+  followed by `count × uint32` (raw, NOT LZ4-compressed per the
+  trace doc) little-endian token indices. The STRINGS pool is the
+  subset of TOKENS atoms used as USDA *string-typed* values —
+  §4.3 FIELDS string-valued reps index into this table by `uint32`
+  position. `StringsHeader::parse` reads the 8-byte count;
+  `StringsSection::parse` enforces `8 + count * 4 == section_size`
+  strictly so any trailing byte the trace doesn't authorise is an
+  `Error::InvalidData`; `StringsSection::parse_indices` decodes
+  the raw `uint32` array into an owned `Vec<u32>` for callers that
+  want to walk the pool. Defensive cap on `count` (16 Mi, several
+  orders of magnitude above the teapot trace's `count = 15`)
+  protects against runaway allocation from a hostile or corrupted
+  header. Sourced exclusively from
+  `docs/3d/usd/usdc-crate-format-trace.md` §4.2.
+- **8 new unit tests** in `usdc::tests` cover the §4.2 header
+  parsing for `count = 0` (Elephant's empty case) and the
+  truncated-input error path, the oversized-count rejection
+  against the defensive cap, the empty-section happy path, the
+  trace's teapot-shape worked example (15 sequential `uint32`s
+  walked through `parse_indices`), short-index-array and
+  trailing-bytes error paths exercising the strict
+  `header(8) + count * 4 == section size` invariant, and a
+  short-header propagation case where `StringsSection::parse`
+  bubbles up `StringsHeader::parse`'s truncation error.
+- **Real-fixture cross-validation** —
+  `real_fixture_strings_section_parses_zero_count` reads
+  `docs/3d/usd/fixtures/SoC-ElephantWithMonochord.usdc` through
+  `UsdcFile::parse`, locates the STRINGS TOC entry, and asserts
+  the trace-doc-published `offset = 0x0cf2da` / `size = 8` facts
+  hold on the wire — then parses the section and confirms
+  `count = 0` (matching the trace's §4.2 worked example), no
+  index bytes, and `parse_indices()` yields an empty vector.
+  Skips silently when the fixture is absent so CI remains green
+  in submodule-less checkouts.
+
 ### Added — Round 212 (USDC §3a compressed-buffer framing + §4.1 TOKENS section header)
 
 - **`usdc::CompressedBuffer` / `CompressedChunk`** — the §3a
