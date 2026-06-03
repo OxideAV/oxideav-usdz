@@ -53,7 +53,7 @@ pub const PRIM_METADATA_EXTRAS_KEY: &str = "usd:primMetadata";
 
 /// Metadata keys we always emit with the `prepend` list-edit
 /// operator.  These are USD composition arcs — every authoring tool
-/// (Pixar's `usdedit`, Apple's `usdzconvert`, Houdini, Maya) writes
+/// (see the various authoring tools that emit USD) writes
 /// them with `prepend` because that's the standard LIVRPS-strength
 /// authoring intent: the new opinion sits at the front of the list,
 /// strongest. We follow the same convention so a USDZ round-trip

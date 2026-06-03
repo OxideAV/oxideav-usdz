@@ -2,7 +2,7 @@
 //! + Table-of-Contents walker.
 //!
 //! USDC is the binary sibling of the USDA text format that the rest
-//! of this crate parses. Pixar publishes no prose spec for the wire
+//! of this crate parses. the format has no published prose spec for the wire
 //! format; the field layout this module implements is sourced
 //! exclusively from `docs/3d/usd/usdc-crate-format-trace.md`, the
 //! project's own clean-room byte-level trace of real `.usdc` samples.
@@ -888,7 +888,7 @@ pub fn decode_int_array(buf: &[u8], count: usize) -> Result<Vec<i32>> {
 /// per-element widths greedily (use code `0` when the delta is zero,
 /// else the smallest width that fits the delta), which exercises
 /// every decode path but isn't necessarily byte-identical to what
-/// Pixar's writer would produce.
+/// a reference writer would produce.
 pub fn encode_int_array_for_tests(values: &[i32]) -> Vec<u8> {
     if values.is_empty() {
         return Vec::new();

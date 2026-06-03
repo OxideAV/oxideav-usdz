@@ -1,7 +1,7 @@
 # oxideav-usdz
 
 Pure-Rust **USDZ** (Universal Scene Description, zipped) reader **and writer**.
-USDZ is Pixar's container for shipping ready-to-go USD assets — an
+USDZ is USD container for shipping ready-to-go USD assets — an
 uncompressed, 64-byte-aligned ZIP archive whose first entry is a
 `.usd` / `.usda` / `.usdc` "Default Layer" referenced by every
 companion file (textures, audio, sub-layers). Apple Quick Look on
@@ -309,7 +309,7 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
 - **Black-box cross-validation of variantSet + Material PBR.**
   `tests/variant_material_usdcat_oracle.rs` exercises the union of
   the round-7 variant resolver and the round-1 `UsdPreviewSurface`
-  PBR mapping against Pixar's `usdcat -f` flatten as the oracle. A
+  PBR mapping against the `usdcat -f` flatten as the oracle. A
   `def Material` declared INSIDE a variantSet body must be
   materialised under the selected branch, indexed by the typed
   Scene3D pass, and bound to the Mesh's `rel material:binding`. The
@@ -322,7 +322,7 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   material tracks the alternate variant's PBR values. Skip-early
   (NOT `#[ignore]`) when `usdcat` is absent — no `pxr` Python
   module is required, so this oracle runs anywhere Apple USD Tools /
-  Pixar's CLI binary is installed.
+  the USD CLI binary is installed.
 
 ## Round 229 scope (USDC §4.4 FIELDSETS section framing)
 

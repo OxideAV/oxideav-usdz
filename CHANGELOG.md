@@ -239,7 +239,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without first committing a corpus of real `.usdc` byte
   buffers. Not part of the on-disk writer surface — it picks
   per-element widths greedily, which exercises every decode
-  path but isn't necessarily byte-identical to what Pixar's
+  path but isn't necessarily byte-identical to what a reference
   writer would produce.
 - **13 new unit tests** in `usdc::tests` cover the empty
   input, all-zero-delta packing, multi-element LSB-first
@@ -291,7 +291,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added — Round 194 (variantSet-bound Material `usdcat`-flatten oracle)
 
 - **`tests/variant_material_usdcat_oracle.rs`** — black-box cross-validation
-  of the round-7 variantSet resolver against Pixar's `usdcat -f` flatten
+  of the round-7 variantSet resolver against the `usdcat -f` flatten
   command on a feature surface combining variant resolution with the
   round-1 `UsdPreviewSurface` PBR mapping. A `def Material` declared
   inside a variantSet body (the "metallic" branch of a `finish` variant
@@ -306,7 +306,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   selection metadata to `"matte"` and verifies the bound material's PBR
   slots track the alternate variant body. Skip-early (NOT `#[ignore]`)
   when `usdcat` is absent — no `pxr` Python module is needed, so the
-  oracle runs anywhere Apple USD Tools / Pixar's CLI is installed.
+  oracle runs anywhere Apple USD Tools / the USD CLI is installed.
 
 ## [0.0.2](https://github.com/OxideAV/oxideav-usdz/compare/v0.0.1...v0.0.2) - 2026-05-29
 
@@ -756,7 +756,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matches OpenUSD glossary's `simpleVariantSet.usd` and
   `referenceVariantSet` examples — variants with composition-arc
   metadata (`prepend references = @...@`) round-trip too. Empty
-  `variantSet "foo" = {}` blocks (Pixar's tooling emits these when
+  `variantSet "foo" = {}` blocks (the standard tooling emits these when
   a variant is removed but the declaration stub remains) parse to
   an empty inner map. The Scene3D translator continues to ignore
   variant_sets — round 6 is parser-side capture only; semantic
@@ -820,10 +820,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the smallest viable Apple-shaped USDA snippets: typed-dict
   metadata, references with prim selectors, sub-layer arrays,
   per-attribute `colorSpace` blocks, prim `kind`/`active`
-  metadata, `over`/`class` specs, Pixar's same-line-or-next-line
+  metadata, `over`/`class` specs, the same-line-or-next-line
   brace layout, triple-quoted `doc` metadata.
 - `tests/apple_oracle_local.rs` — opportunistic smoke test that
-  builds an Apple-style USDZ via the system `usdcat` + Pixar's
+  builds an Apple-style USDZ via the system `usdcat` +
   `pxr.UsdUtils.CreateNewUsdzPackage`, then decodes it through
   our `UsdzDecoder`. Skips with an `eprintln!` notice when either
   binary is absent (per workspace rule "no `#[ignore]`").

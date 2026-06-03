@@ -1,6 +1,6 @@
 //! Pure-Rust USDZ (Universal Scene Description, zipped) reader.
 //!
-//! USDZ is Pixar's container for ship-ready USD assets — an
+//! USDZ is USD container for ship-ready USD assets — an
 //! uncompressed ZIP archive whose first entry is a `.usd` / `.usda`
 //! / `.usdc` "Default Layer" referenced by every other file in the
 //! package (textures, audio, sub-layers). Apple Quick Look on iOS /
