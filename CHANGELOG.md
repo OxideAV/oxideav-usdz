@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 212 (USDC §3a compressed-buffer framing + §4.1 TOKENS section header)
+
+- **`usdc::CompressedBuffer` / `CompressedChunk`** — the §3a
+  outer "compressed buffer" framing: a leading byte that
+  declares "extra chunks" (so `total = extra + 1`) followed
+  either by the entire remainder as a single LZ4-block chunk
+  (the common `0x00` case the trace doc cites for every
+  observed buffer in both samples) or by `(int32 LE length,
+  bytes)` chunk records. The LZ4 *block* payload inside each
+  chunk is left opaque — the public LZ4 block-format spec is
+  not staged under `docs/`, so this module stops at the
+  envelope. Borrows from the input slice; bounded against
+  truncated length prefixes, chunks running past end-of-buffer,
+  and negative declared lengths. `as_single_chunk()` shortcut
+  for the common path.
+- **`usdc::TokensHeader` / `TokensSection`** — the §4.1 TOKENS
+  section header: three little-endian `int64`s (`numTokens`,
+  `uncompressedSize`, `compressedSize`) plus the bounded §3a
+  compressed-buffer slice that follows it. Defensive caps on
+  `numTokens` (16 Mi) and `uncompressedSize` (256 MiB) protect
+  against runaway allocation from a hostile or corrupted
+  header — both are several orders of magnitude above the
+  Elephant sample's 192 / 4195 figures published in the trace
+  doc. `TokensSection::parse` slices exactly
+  `compressed_size` bytes after the 24-byte header so a
+  caller never reads past the section bounds, and the
+  convenience `buffer()` method forwards into
+  `CompressedBuffer::parse`.
+- **`usdc::split_tokens_blob`** — the cross-section seam for
+  callers that have plugged in their own LZ4 decoder for the
+  inner block: takes the *decompressed* TOKENS blob plus the
+  original `TokensHeader`, verifies the
+  `blob.len() == uncompressed_size` equality, NUL-splits into
+  the recorded `numTokens` UTF-8 strings (accepting either a
+  trailing NUL or a NUL-as-delimiter encoding — the trace
+  doesn't constrain the trailing byte), and validates UTF-8
+  per token. Returns `Vec<String>`.
+- **17 new unit tests** in `usdc::tests` cover §3a empty-input
+  rejection, the single-chunk `0x00` form, an empty
+  single-chunk buffer, two- and three-chunk forms walking
+  each `(int32 length, bytes)` record, three error paths
+  (truncated length prefix, chunk overrun, negative declared
+  length), the §4.1 header parsing the Elephant's
+  `numTokens=192 / uncompressedSize=4195 / compressedSize=1746`
+  triple from the trace doc, three header error paths
+  (truncated buffer, oversize `numTokens`, oversize
+  `uncompressedSize`), section-bounds clamping at
+  `compressed_size`, a truncated-buffer error path, two
+  `split_tokens_blob` happy paths (trailing-NUL and
+  delimiter-only forms), three error paths (size mismatch,
+  count mismatch, non-UTF-8 byte), and a 14-token round-trip
+  exercising the §4.1 trace-doc-published string set
+  (`defaultPrim`, `endTimeCode`, `xformOp:transform`, …).
+- **Real-fixture cross-validation** — `real_fixture_tokens_section_header_parses`
+  reads `docs/3d/usd/fixtures/SoC-ElephantWithMonochord.usdc`
+  through `UsdcFile::parse`, locates the TOKENS TOC entry,
+  parses the section header, and asserts the
+  `numTokens=192 / uncompressedSize=4195 / compressedSize=1746`
+  trace-doc facts hold on the real bytes — plus
+  `header(24) + compressed_size = section.size` (1770) and
+  that the §3a framing parses to a single chunk whose payload
+  is exactly `compressed_size - 1` bytes long (the LZ4 block
+  proper). Skips silently when the fixture is absent so CI
+  remains green in submodule-less checkouts.
+
 ### Added — Round 206 (USDC §3b compressed-integer decoder)
 
 - **`usdc::decode_int_array`** — decodes the §3b "compressed

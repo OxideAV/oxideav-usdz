@@ -30,11 +30,31 @@
 //!   by FIELDS' name-index array, FIELDSETS' field-index array, and
 //!   SPECS' three index arrays.
 //!
+//! What this module **adds in round 212**:
+//!
+//! * [`CompressedBuffer`] / [`CompressedChunk`] — the §3a
+//!   "compressed buffer" outer framing. Reads the leading
+//!   chunk-count byte and either yields the entire remainder as a
+//!   single LZ4-block chunk, or walks the `(int32 LE length, bytes)`
+//!   chunk records that follow it. LZ4 block decoding itself is
+//!   **left to the caller** — the public LZ4 block-format spec is
+//!   not staged under `docs/`, so this module stops at the envelope.
+//! * [`TokensHeader`] / [`TokensSection`] — the §4.1 TOKENS section
+//!   header: three little-endian `int64`s (`numTokens`,
+//!   `uncompressedSize`, `compressedSize`) plus the bounded
+//!   compressed-buffer slice that follows. `TokensSection::parse`
+//!   exposes the byte slice ready for [`CompressedBuffer::parse`].
+//! * [`split_tokens_blob`] — the cross-section seam for callers
+//!   that have plugged in their own LZ4 decoder: takes the
+//!   *decompressed* TOKENS blob plus the original [`TokensHeader`],
+//!   verifies the size match, NUL-splits into the recorded
+//!   `numTokens` UTF-8 strings, and returns them as `Vec<String>`.
+//!
 //! What this module does **not** do (deferred to a follow-up round):
 //!
 //! * LZ4 block decompression of section payloads,
-//! * the TOKENS / STRINGS / FIELDS / FIELDSETS / PATHS / SPECS
-//!   payload semantics,
+//! * the STRINGS / FIELDS / FIELDSETS / PATHS / SPECS payload
+//!   semantics,
 //! * the FIELDS value-rep type-code enumeration (a separate
 //!   fact-table extraction — see the gap tracker's Round B).
 //!
@@ -416,6 +436,334 @@ fn read_u64_le(bytes: &[u8]) -> u64 {
     let mut buf = [0u8; 8];
     buf.copy_from_slice(&bytes[..8]);
     u64::from_le_bytes(buf)
+}
+
+#[inline]
+fn read_i32_le(bytes: &[u8]) -> i32 {
+    i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+/// One chunk inside a parsed §3a "compressed buffer".
+///
+/// Each chunk's bytes are an opaque LZ4 *block* payload — this
+/// crate's [`CompressedBuffer::parse`] only decomposes the outer
+/// framing (chunk count + per-chunk length prefixes); the LZ4 block
+/// format itself is described by a public spec that is not staged
+/// under `docs/` so the actual decompression is left to the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompressedChunk<'a> {
+    /// Raw LZ4 *block* bytes for this chunk. Layout is per the public
+    /// LZ4 block format (4-bit literal-len / 4-bit match-len token,
+    /// 15-extension bytes, 2-byte LE match offset, +4 min match) —
+    /// the same shape the trace doc cites.
+    pub bytes: &'a [u8],
+}
+
+/// The §3a "compressed buffer" framing: a leading byte giving the
+/// number of **extra** chunks (i.e. total = `extra + 1`) followed
+/// by the chunks themselves.
+///
+/// Trace doc §3a:
+///
+/// * leading byte `0x00` → a **single LZ4 block** follows
+///   immediately (the common case; the entire remaining buffer is
+///   one chunk).
+/// * leading byte `k > 0` → `k+1` chunks, each prefixed by an
+///   `int32 LE` compressed length — the per-chunk payload is the
+///   next `length` bytes after that prefix.
+///
+/// The parser borrows from the input slice — no allocation aside
+/// from the small `Vec<CompressedChunk>` describing the chunks
+/// found.
+#[derive(Debug, Clone)]
+pub struct CompressedBuffer<'a> {
+    /// The chunks discovered in declaration order. Always at least
+    /// one entry.
+    pub chunks: Vec<CompressedChunk<'a>>,
+}
+
+impl<'a> CompressedBuffer<'a> {
+    /// Parse the framing of a §3a compressed buffer. `buf` is the
+    /// full on-disk slice of the buffer (so its first byte is the
+    /// chunk-count byte).
+    ///
+    /// Returns the chunk catalogue without touching the LZ4 block
+    /// payloads. Errors:
+    ///
+    /// * `Error::InvalidData` if `buf` is empty,
+    /// * `Error::InvalidData` for a multi-chunk buffer whose
+    ///   per-chunk `int32` length prefixes or chunk bodies run past
+    ///   the end of `buf`,
+    /// * `Error::InvalidData` for a negative `int32` chunk length
+    ///   (the trace doc records the length as a count of bytes — a
+    ///   negative value would mean we mis-aligned).
+    pub fn parse(buf: &'a [u8]) -> Result<Self> {
+        if buf.is_empty() {
+            return Err(invalid(
+                "USDC §3a compressed buffer: leading chunk-count byte is missing",
+            ));
+        }
+        // The trace doc names the leading byte "extra chunks" — i.e.
+        // `total = extra + 1`.
+        let extra = buf[0];
+        let total = (extra as usize) + 1;
+        let rest = &buf[1..];
+        if extra == 0 {
+            // Single LZ4 block, no per-chunk length prefix. The rest
+            // of the buffer is one chunk.
+            return Ok(Self {
+                chunks: vec![CompressedChunk { bytes: rest }],
+            });
+        }
+        let mut cursor = rest;
+        let mut chunks = Vec::with_capacity(total);
+        for i in 0..total {
+            if cursor.len() < 4 {
+                return Err(invalid(format!(
+                    "USDC §3a multi-chunk buffer: chunk {i}/{total} \
+                     length prefix truncated (need 4 bytes, have {})",
+                    cursor.len()
+                )));
+            }
+            let raw_len = read_i32_le(&cursor[..4]);
+            if raw_len < 0 {
+                return Err(invalid(format!(
+                    "USDC §3a multi-chunk buffer: chunk {i}/{total} \
+                     declares negative length {raw_len}"
+                )));
+            }
+            let len = raw_len as usize;
+            cursor = &cursor[4..];
+            if cursor.len() < len {
+                return Err(invalid(format!(
+                    "USDC §3a multi-chunk buffer: chunk {i}/{total} \
+                     declares {len} payload bytes but only {} remain",
+                    cursor.len()
+                )));
+            }
+            let (payload, tail) = cursor.split_at(len);
+            chunks.push(CompressedChunk { bytes: payload });
+            cursor = tail;
+        }
+        Ok(Self { chunks })
+    }
+
+    /// Convenience: returns `Some(&[u8])` when the buffer is the
+    /// common single-chunk form. `None` otherwise — multi-chunk
+    /// callers must walk `self.chunks` directly.
+    pub fn as_single_chunk(&self) -> Option<&'a [u8]> {
+        match self.chunks.as_slice() {
+            [only] => Some(only.bytes),
+            _ => None,
+        }
+    }
+}
+
+/// The 24-byte header at the start of the §4.1 TOKENS section.
+///
+/// Trace doc §4.1: three little-endian `int64` counts —
+/// `numTokens`, `uncompressedSize`, `compressedSize` — followed by
+/// one §3a compressed buffer of `compressedSize` bytes whose
+/// decompressed form is `uncompressedSize` bytes of NUL-separated
+/// UTF-8 strings (exactly `numTokens` of them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokensHeader {
+    /// Number of token strings encoded in the decompressed blob.
+    pub num_tokens: u64,
+    /// Decompressed size of the NUL-joined token blob.
+    pub uncompressed_size: u64,
+    /// Compressed size of the §3a buffer that follows the three
+    /// `int64`s.
+    pub compressed_size: u64,
+}
+
+/// Defensive upper bound on TOKENS section counts. The Elephant
+/// sample has 192 tokens; we cap several orders of magnitude above
+/// any real file so a hostile or corrupted header can't trigger a
+/// runaway allocation.
+const TOKENS_NUM_CAP: u64 = 16_777_216; // 16 Mi
+
+/// Same defensive bound on the decompressed blob size (the
+/// Elephant's is 4195 bytes).
+const TOKENS_UNCOMPRESSED_CAP: u64 = 256 * 1024 * 1024; // 256 MiB
+
+impl TokensHeader {
+    /// Fixed on-disk size of the three-`int64` header.
+    pub const SIZE: usize = 24;
+
+    /// Parse the three `int64`s from the first 24 bytes of `bytes`.
+    /// Does **not** consume the trailing §3a buffer; callers thread
+    /// `bytes[Self::SIZE..]` into [`CompressedBuffer::parse`]
+    /// themselves (bounded by `compressed_size`).
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < Self::SIZE {
+            return Err(invalid(format!(
+                "USDC §4.1 TOKENS header truncated: need {} bytes, got {}",
+                Self::SIZE,
+                bytes.len()
+            )));
+        }
+        let num_tokens = read_u64_le(&bytes[0..8]);
+        let uncompressed_size = read_u64_le(&bytes[8..16]);
+        let compressed_size = read_u64_le(&bytes[16..24]);
+        if num_tokens > TOKENS_NUM_CAP {
+            return Err(invalid(format!(
+                "USDC §4.1 TOKENS numTokens {num_tokens} exceeds defensive cap {TOKENS_NUM_CAP}",
+            )));
+        }
+        if uncompressed_size > TOKENS_UNCOMPRESSED_CAP {
+            return Err(invalid(format!(
+                "USDC §4.1 TOKENS uncompressedSize {uncompressed_size} \
+                 exceeds defensive cap {TOKENS_UNCOMPRESSED_CAP}",
+            )));
+        }
+        Ok(Self {
+            num_tokens,
+            uncompressed_size,
+            compressed_size,
+        })
+    }
+}
+
+/// A reference to a `TOKENS` section's bytes split into the parsed
+/// `(header, compressed_buffer_bytes)` pair without yet decoding
+/// the LZ4 wrapper.
+///
+/// Returned by [`TokensSection::parse`]; the compressed-buffer
+/// slice is exactly `header.compressed_size` bytes long and is
+/// suitable for [`CompressedBuffer::parse`].
+#[derive(Debug, Clone)]
+pub struct TokensSection<'a> {
+    /// The three-`int64` header.
+    pub header: TokensHeader,
+    /// The §3a compressed-buffer bytes — the next
+    /// `header.compressed_size` bytes after the header. Always
+    /// validated to lie inside the section.
+    pub buffer_bytes: &'a [u8],
+}
+
+impl<'a> TokensSection<'a> {
+    /// Parse a complete `TOKENS` section image. `section` is the
+    /// payload bytes between the TOC's `(offset, size)` for the
+    /// section.
+    pub fn parse(section: &'a [u8]) -> Result<Self> {
+        let header = TokensHeader::parse(section)?;
+        let body = &section[TokensHeader::SIZE..];
+        let csz = usize::try_from(header.compressed_size).map_err(|_| {
+            invalid(format!(
+                "USDC §4.1 TOKENS compressedSize {} does not fit in usize",
+                header.compressed_size
+            ))
+        })?;
+        if body.len() < csz {
+            return Err(invalid(format!(
+                "USDC §4.1 TOKENS section: compressedSize {csz} \
+                 exceeds remaining section bytes {}",
+                body.len()
+            )));
+        }
+        Ok(Self {
+            header,
+            buffer_bytes: &body[..csz],
+        })
+    }
+
+    /// Forward to [`CompressedBuffer::parse`] on the section's
+    /// `buffer_bytes`. Convenience for callers that already have
+    /// the section parsed and just need the chunk catalogue.
+    pub fn buffer(&self) -> Result<CompressedBuffer<'a>> {
+        CompressedBuffer::parse(self.buffer_bytes)
+    }
+}
+
+/// Split a *decompressed* TOKENS blob (NUL-separated UTF-8 strings,
+/// `header.uncompressed_size` bytes long) into the `numTokens`
+/// individual strings recorded by the section header.
+///
+/// This is the cross-section seam — the LZ4 inner block has been
+/// decoded by an outside crate / a binary, and the caller hands the
+/// raw uncompressed bytes back to us along with the original
+/// `TokensHeader`. We do the bounded NUL-split + UTF-8 validation +
+/// `numTokens` count check.
+///
+/// Errors:
+///
+/// * `Error::InvalidData` if `blob.len() != header.uncompressed_size`,
+/// * `Error::InvalidData` if the NUL-split yields fewer or more
+///   than `header.num_tokens` strings,
+/// * `Error::InvalidData` if any individual token isn't valid UTF-8.
+pub fn split_tokens_blob(blob: &[u8], header: &TokensHeader) -> Result<Vec<String>> {
+    let want = usize::try_from(header.uncompressed_size).map_err(|_| {
+        invalid(format!(
+            "USDC TOKENS uncompressedSize {} does not fit in usize",
+            header.uncompressed_size
+        ))
+    })?;
+    if blob.len() != want {
+        return Err(invalid(format!(
+            "USDC TOKENS decompressed blob: header records {want} bytes, got {}",
+            blob.len()
+        )));
+    }
+    let num = usize::try_from(header.num_tokens).map_err(|_| {
+        invalid(format!(
+            "USDC TOKENS numTokens {} does not fit in usize",
+            header.num_tokens
+        ))
+    })?;
+    if num == 0 {
+        // Header declares zero tokens; the blob must be empty.
+        if !blob.is_empty() {
+            return Err(invalid(format!(
+                "USDC TOKENS numTokens = 0 but blob is {} bytes",
+                blob.len()
+            )));
+        }
+        return Ok(Vec::new());
+    }
+    // Per the trace's §4.1 worked example (`defaultPrim\0` …), tokens
+    // are NUL-separated. The trace doesn't constrain the trailing
+    // byte; we accept either a trailing NUL (terminator after the
+    // last token) or no trailing NUL (delimiter only) and produce
+    // the same `num` strings.
+    let mut tokens = Vec::with_capacity(num);
+    let mut start = 0usize;
+    for (i, byte) in blob.iter().enumerate() {
+        if *byte == 0 {
+            let s = std::str::from_utf8(&blob[start..i]).map_err(|e| {
+                invalid(format!(
+                    "USDC TOKENS token {} contains non-UTF-8 bytes: {e}",
+                    tokens.len()
+                ))
+            })?;
+            tokens.push(s.to_owned());
+            start = i + 1;
+            if tokens.len() == num {
+                // Stop — trailing bytes (a final NUL or anything
+                // else) are ignored for the count match.
+                break;
+            }
+        }
+    }
+    // Allow the "no trailing NUL" form: if we walked the whole blob
+    // and have `num - 1` tokens, the tail from `start..blob.len()`
+    // is the last token.
+    if tokens.len() == num - 1 && start <= blob.len() {
+        let s = std::str::from_utf8(&blob[start..]).map_err(|e| {
+            invalid(format!(
+                "USDC TOKENS token {} contains non-UTF-8 bytes: {e}",
+                tokens.len()
+            ))
+        })?;
+        tokens.push(s.to_owned());
+    }
+    if tokens.len() != num {
+        return Err(invalid(format!(
+            "USDC TOKENS numTokens = {num} but blob yields {} tokens",
+            tokens.len()
+        )));
+    }
+    Ok(tokens)
 }
 
 /// Decode the §3b "compressed integer" stream: a 2-bit-per-element
@@ -867,5 +1215,366 @@ mod tests {
         // only one stays zero); the remainder uses int8/int16 codes.
         let decoded = decode_int_array(&encoded, values.len()).unwrap();
         assert_eq!(decoded, values);
+    }
+
+    // ----- §3a compressed-buffer framing tests -----
+
+    #[test]
+    fn compressed_buffer_empty_input_errors() {
+        let err = CompressedBuffer::parse(&[]).expect_err("empty buffer must fail");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("leading chunk-count"), "{msg}");
+    }
+
+    #[test]
+    fn compressed_buffer_single_chunk_form() {
+        // Leading byte 0x00 → entire remainder is one chunk.
+        let buf = vec![0x00, 0xDE, 0xAD, 0xBE, 0xEF];
+        let parsed = CompressedBuffer::parse(&buf).unwrap();
+        assert_eq!(parsed.chunks.len(), 1);
+        assert_eq!(parsed.chunks[0].bytes, &[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(
+            parsed.as_single_chunk(),
+            Some(&[0xDE, 0xAD, 0xBE, 0xEF][..])
+        );
+    }
+
+    #[test]
+    fn compressed_buffer_empty_single_chunk() {
+        // Leading byte 0x00 + nothing else → one zero-length chunk.
+        let buf = vec![0x00];
+        let parsed = CompressedBuffer::parse(&buf).unwrap();
+        assert_eq!(parsed.chunks.len(), 1);
+        assert!(parsed.chunks[0].bytes.is_empty());
+    }
+
+    #[test]
+    fn compressed_buffer_two_chunk_form() {
+        // Leading 0x01 → 2 total chunks. Each chunk: int32 LE length, then bytes.
+        let mut buf = vec![0x01];
+        // chunk 0: length 3, payload [0x10, 0x11, 0x12]
+        buf.extend_from_slice(&3i32.to_le_bytes());
+        buf.extend_from_slice(&[0x10, 0x11, 0x12]);
+        // chunk 1: length 5, payload [0x20..0x24]
+        buf.extend_from_slice(&5i32.to_le_bytes());
+        buf.extend_from_slice(&[0x20, 0x21, 0x22, 0x23, 0x24]);
+        let parsed = CompressedBuffer::parse(&buf).unwrap();
+        assert_eq!(parsed.chunks.len(), 2);
+        assert_eq!(parsed.chunks[0].bytes, &[0x10, 0x11, 0x12]);
+        assert_eq!(parsed.chunks[1].bytes, &[0x20, 0x21, 0x22, 0x23, 0x24]);
+        assert!(
+            parsed.as_single_chunk().is_none(),
+            "multi-chunk must not report as single"
+        );
+    }
+
+    #[test]
+    fn compressed_buffer_three_chunk_form() {
+        let mut buf = vec![0x02];
+        for (i, payload) in [
+            &[0xAA, 0xBB][..],
+            &[0xCC][..],
+            &[0xDD, 0xEE, 0xFF, 0x11][..],
+        ]
+        .iter()
+        .enumerate()
+        {
+            buf.extend_from_slice(&(payload.len() as i32).to_le_bytes());
+            buf.extend_from_slice(payload);
+            let _ = i;
+        }
+        let parsed = CompressedBuffer::parse(&buf).unwrap();
+        assert_eq!(parsed.chunks.len(), 3);
+        assert_eq!(parsed.chunks[0].bytes, &[0xAA, 0xBB]);
+        assert_eq!(parsed.chunks[1].bytes, &[0xCC]);
+        assert_eq!(parsed.chunks[2].bytes, &[0xDD, 0xEE, 0xFF, 0x11]);
+    }
+
+    #[test]
+    fn compressed_buffer_truncated_length_prefix_errors() {
+        // Leading 0x01 → 2 chunks expected. Provide only a partial
+        // length prefix for the first chunk.
+        let buf = vec![0x01, 0x03, 0x00, 0x00];
+        let err = CompressedBuffer::parse(&buf).expect_err("truncated length");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("length prefix truncated"), "{msg}");
+    }
+
+    #[test]
+    fn compressed_buffer_chunk_overruns_buffer_errors() {
+        // Leading 0x00 single-chunk would have happily eaten anything;
+        // multi-chunk form is where the bound matters. 2 chunks declared,
+        // first chunk claims 100 bytes but only 4 follow.
+        let mut buf = vec![0x01];
+        buf.extend_from_slice(&100i32.to_le_bytes());
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        let err = CompressedBuffer::parse(&buf).expect_err("chunk overrun");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("payload bytes"), "{msg}");
+    }
+
+    #[test]
+    fn compressed_buffer_negative_length_errors() {
+        let mut buf = vec![0x01];
+        buf.extend_from_slice(&(-1i32).to_le_bytes());
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        let err = CompressedBuffer::parse(&buf).expect_err("negative length");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("negative length"), "{msg}");
+    }
+
+    // ----- §4.1 TOKENS section header tests -----
+
+    #[test]
+    fn tokens_header_parses_elephant_numbers() {
+        // From the trace doc's §4.1 table: numTokens=192, uncompressedSize=4195,
+        // compressedSize=1746.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&192u64.to_le_bytes());
+        buf.extend_from_slice(&4195u64.to_le_bytes());
+        buf.extend_from_slice(&1746u64.to_le_bytes());
+        let h = TokensHeader::parse(&buf).unwrap();
+        assert_eq!(h.num_tokens, 192);
+        assert_eq!(h.uncompressed_size, 4195);
+        assert_eq!(h.compressed_size, 1746);
+    }
+
+    #[test]
+    fn tokens_header_rejects_truncated() {
+        let buf = vec![0u8; 23];
+        let err = TokensHeader::parse(&buf).expect_err("23 bytes < 24");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("truncated"), "{msg}");
+    }
+
+    #[test]
+    fn tokens_header_rejects_oversize_num_tokens() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&u64::MAX.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        let err = TokensHeader::parse(&buf).expect_err("oversize numTokens");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("numTokens"), "{msg}");
+    }
+
+    #[test]
+    fn tokens_header_rejects_oversize_uncompressed() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u64.to_le_bytes());
+        buf.extend_from_slice(&u64::MAX.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        let err = TokensHeader::parse(&buf).expect_err("oversize uncompressedSize");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("uncompressedSize"), "{msg}");
+    }
+
+    #[test]
+    fn tokens_section_parse_bounds_compressed_buffer() {
+        // Build a TOKENS section: header(24) + single-chunk §3a buffer
+        // whose declared compressed_size matches the slice we hand in.
+        let payload = vec![0x00, 0xAB, 0xCD]; // 0x00 chunk-count + 2 bytes of "LZ4"
+        let csz = payload.len() as u64;
+        let mut section = Vec::new();
+        section.extend_from_slice(&5u64.to_le_bytes()); // numTokens (synthetic)
+        section.extend_from_slice(&20u64.to_le_bytes()); // uncompressedSize
+        section.extend_from_slice(&csz.to_le_bytes());
+        section.extend_from_slice(&payload);
+        // Append trailing junk that the section walker should NOT
+        // expose through buffer_bytes (must stop at compressed_size).
+        section.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
+        let sec = TokensSection::parse(&section).unwrap();
+        assert_eq!(sec.header.num_tokens, 5);
+        assert_eq!(sec.header.compressed_size, csz);
+        assert_eq!(sec.buffer_bytes, &payload[..]);
+        // The buffer framing parses to a single chunk.
+        let cb = sec.buffer().unwrap();
+        assert_eq!(cb.chunks.len(), 1);
+        assert_eq!(cb.chunks[0].bytes, &[0xAB, 0xCD]);
+    }
+
+    #[test]
+    fn tokens_section_truncated_compressed_buffer_errors() {
+        // Header says compressed_size=10 but only 4 bytes of buffer follow.
+        let mut section = Vec::new();
+        section.extend_from_slice(&1u64.to_le_bytes());
+        section.extend_from_slice(&8u64.to_le_bytes());
+        section.extend_from_slice(&10u64.to_le_bytes());
+        section.extend_from_slice(&[0x00, 0xAA, 0xBB, 0xCC]);
+        let err = TokensSection::parse(&section).expect_err("compressed buffer truncated");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("compressedSize"), "{msg}");
+    }
+
+    // ----- split_tokens_blob tests -----
+
+    #[test]
+    fn split_tokens_blob_three_tokens_trailing_nul() {
+        // Three tokens: "foo\0bar\0baz\0" (with trailing NUL).
+        let blob: Vec<u8> = b"foo\0bar\0baz\0".to_vec();
+        let header = TokensHeader {
+            num_tokens: 3,
+            uncompressed_size: blob.len() as u64,
+            compressed_size: 0,
+        };
+        let out = split_tokens_blob(&blob, &header).unwrap();
+        assert_eq!(out, vec!["foo", "bar", "baz"]);
+    }
+
+    #[test]
+    fn split_tokens_blob_three_tokens_no_trailing_nul() {
+        // Three tokens: "foo\0bar\0baz" (no trailing NUL — last token
+        // runs to end-of-blob).
+        let blob: Vec<u8> = b"foo\0bar\0baz".to_vec();
+        let header = TokensHeader {
+            num_tokens: 3,
+            uncompressed_size: blob.len() as u64,
+            compressed_size: 0,
+        };
+        let out = split_tokens_blob(&blob, &header).unwrap();
+        assert_eq!(out, vec!["foo", "bar", "baz"]);
+    }
+
+    #[test]
+    fn split_tokens_blob_zero_tokens_empty_blob() {
+        let header = TokensHeader {
+            num_tokens: 0,
+            uncompressed_size: 0,
+            compressed_size: 0,
+        };
+        let out = split_tokens_blob(&[], &header).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn split_tokens_blob_rejects_size_mismatch() {
+        let blob: Vec<u8> = b"foo\0bar\0".to_vec();
+        let header = TokensHeader {
+            num_tokens: 2,
+            uncompressed_size: 99, // wrong
+            compressed_size: 0,
+        };
+        let err = split_tokens_blob(&blob, &header).expect_err("size mismatch");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("uncompressedSize") || msg.contains("blob"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn split_tokens_blob_rejects_count_mismatch() {
+        let blob: Vec<u8> = b"foo\0bar\0".to_vec();
+        let header = TokensHeader {
+            num_tokens: 5, // we only have 2 tokens in the blob
+            uncompressed_size: blob.len() as u64,
+            compressed_size: 0,
+        };
+        let err = split_tokens_blob(&blob, &header).expect_err("count mismatch");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("numTokens"), "{msg}");
+    }
+
+    #[test]
+    fn split_tokens_blob_rejects_non_utf8() {
+        // 0x80 alone is not a valid UTF-8 start byte.
+        let blob: Vec<u8> = vec![0x80, 0x00, b'o', b'k', 0x00];
+        let header = TokensHeader {
+            num_tokens: 2,
+            uncompressed_size: blob.len() as u64,
+            compressed_size: 0,
+        };
+        let err = split_tokens_blob(&blob, &header).expect_err("invalid UTF-8");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("non-UTF-8"), "{msg}");
+    }
+
+    #[test]
+    fn split_tokens_blob_trace_doc_strings_round_trip() {
+        // From §4.1: tokens like `defaultPrim`, `SoC_ElephantWithMonochord`,
+        // `endTimeCode`, `framesPerSecond`, `metersPerUnit`, `upAxis`,
+        // `primChildren`, `specifier`, `typeName`, `Xform`, `Material`,
+        // `xformOp:transform`, `auralMode`, `filePath`.
+        let tokens: &[&str] = &[
+            "defaultPrim",
+            "SoC_ElephantWithMonochord",
+            "endTimeCode",
+            "framesPerSecond",
+            "metersPerUnit",
+            "upAxis",
+            "primChildren",
+            "specifier",
+            "typeName",
+            "Xform",
+            "Material",
+            "xformOp:transform",
+            "auralMode",
+            "filePath",
+        ];
+        let mut blob: Vec<u8> = Vec::new();
+        for t in tokens {
+            blob.extend_from_slice(t.as_bytes());
+            blob.push(0);
+        }
+        let header = TokensHeader {
+            num_tokens: tokens.len() as u64,
+            uncompressed_size: blob.len() as u64,
+            compressed_size: 0,
+        };
+        let out = split_tokens_blob(&blob, &header).unwrap();
+        let want: Vec<String> = tokens.iter().map(|s| (*s).to_owned()).collect();
+        assert_eq!(out, want);
+    }
+
+    #[test]
+    fn real_fixture_tokens_section_header_parses() {
+        // Cross-validate against the trace-doc-published Elephant facts:
+        // TOKENS section at offset 0x0cebf0 with size 1770, header
+        // numTokens=192, uncompressedSize=4195, compressedSize=1746.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/3d/usd/fixtures/SoC-ElephantWithMonochord.usdc");
+        if !fixture.exists() {
+            eprintln!("skip: fixture {fixture:?} not present");
+            return;
+        }
+        let bytes = std::fs::read(&fixture).expect("read fixture");
+        let file = UsdcFile::parse(&bytes).expect("parse Elephant USDC");
+        let tok_entry = file
+            .toc
+            .find(SectionName::Tokens)
+            .expect("TOKENS section present");
+        let off = tok_entry.offset as usize;
+        let sz = tok_entry.size as usize;
+        let section = &bytes[off..off + sz];
+        let sec = TokensSection::parse(section).expect("parse TOKENS section");
+        assert_eq!(sec.header.num_tokens, 192, "trace doc §4.1 numTokens");
+        assert_eq!(
+            sec.header.uncompressed_size, 4195,
+            "trace doc §4.1 uncompressedSize"
+        );
+        assert_eq!(
+            sec.header.compressed_size, 1746,
+            "trace doc §4.1 compressedSize"
+        );
+        // The compressed buffer bytes are exactly `compressed_size`
+        // long and lie inside the section.
+        assert_eq!(sec.buffer_bytes.len() as u64, sec.header.compressed_size);
+        // Header (24 B) + compressed buffer (1746 B) = 1770 B == section size.
+        assert_eq!(
+            TokensHeader::SIZE as u64 + sec.header.compressed_size,
+            tok_entry.size,
+            "header + buffer must exactly equal the section size",
+        );
+        // The §3a framing parses — trace doc shows chunk-count 0x00.
+        let cb = sec.buffer().expect("parse §3a framing");
+        assert_eq!(cb.chunks.len(), 1, "trace doc §4.1: single LZ4 block");
+        // The single chunk's bytes are the LZ4 block payload — opaque
+        // to us, but its length must match: `compressed_size - 1` for
+        // the chunk-count byte.
+        assert_eq!(
+            cb.chunks[0].bytes.len() as u64,
+            sec.header.compressed_size - 1,
+            "single chunk owns all bytes after the 1-byte chunk-count",
+        );
     }
 }

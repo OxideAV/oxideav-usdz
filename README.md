@@ -324,6 +324,45 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   module is required, so this oracle runs anywhere Apple USD Tools /
   Pixar's CLI binary is installed.
 
+## Round 212 scope (USDC §3a compressed-buffer framing + §4.1 TOKENS section header)
+
+- **`usdc::CompressedBuffer` / `CompressedChunk`** — the §3a outer
+  "compressed buffer" framing. Reads the leading chunk-count byte
+  and either yields the entire remainder as a single LZ4-block
+  chunk (the common `0x00` case the trace doc cites for every
+  observed buffer in both samples) or walks the `(int32 LE length,
+  bytes)` chunk records that follow. The LZ4 *block* payload inside
+  each chunk is kept opaque — the public LZ4 block-format spec is
+  not staged under `docs/`, so this module stops at the envelope;
+  callers thread the chunk slice into their own block decoder.
+  Bounded against truncated length prefixes, chunks running past
+  end-of-buffer, and negative declared lengths.
+- **`usdc::TokensHeader` / `TokensSection`** — the §4.1 TOKENS
+  section header: three little-endian `int64`s (`numTokens`,
+  `uncompressedSize`, `compressedSize`) plus the bounded §3a
+  compressed-buffer slice that follows. Defensive caps on
+  `numTokens` (16 Mi) and `uncompressedSize` (256 MiB) several
+  orders of magnitude above the Elephant sample's 192 / 4195
+  figures keep a hostile or corrupted header from triggering a
+  runaway allocation. `TokensSection::parse` slices exactly
+  `compressed_size` bytes after the 24-byte header so callers
+  never read past the section bounds.
+- **`usdc::split_tokens_blob`** — the cross-section seam for
+  callers that have plugged in their own LZ4 decoder for the
+  inner block: takes the *decompressed* TOKENS blob plus the
+  original `TokensHeader`, verifies the
+  `blob.len() == uncompressed_size` equality, NUL-splits into the
+  recorded `numTokens` UTF-8 strings (accepting either a trailing
+  NUL or a NUL-as-delimiter form), and validates UTF-8 per token.
+- Cross-validated against the Elephant fixture under
+  `docs/3d/usd/fixtures/`: the TOC's TOKENS entry walks to a
+  section whose header parses to exactly the trace doc's
+  `numTokens=192 / uncompressedSize=4195 / compressedSize=1746`
+  triple, `header(24) + compressed_size = section.size` (1770),
+  and the §3a framing decomposes to a single chunk of
+  `compressed_size - 1` bytes — i.e. the leading `0x00`
+  chunk-count plus the LZ4 block proper.
+
 ## Round 206 scope (USDC §3b compressed-integer decoder)
 
 - **`usdc::decode_int_array`** — the §3b "compressed integer"
@@ -376,12 +415,13 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
 
 ## Deferred to round 207+
 
-- **`.usdc` LZ4 block wrapper (§3a).** The outer per-buffer
-  wrapper documented in trace doc §3a — a one-byte chunk-count
-  prefix then LZ4-block(s) — is the remaining primitive needed
-  before the index sections can be decoded end-to-end. Round 206
-  ships the §3b inner integer-coding decoder; §3a feeds bytes
-  into it.
+- **`.usdc` LZ4 *block* decoder.** Round 212 ships the §3a outer
+  framing (`CompressedBuffer` walks the chunk count + per-chunk
+  length prefixes) and exposes each chunk's raw bytes, but the LZ4
+  block-format spec is not staged under `docs/` so the actual
+  block decompression is left to the caller. Once a clean-room
+  trace of the public LZ4 block format lands, the chunk-payload
+  decoder slots in here without changing the framing surface.
 - **`.usdc` section-payload semantics.** The per-section
   decoders (TOKENS string-atom pool, STRINGS index table, FIELDS
   (name, value-rep) pairs, FIELDSETS field-index lists, PATHS
