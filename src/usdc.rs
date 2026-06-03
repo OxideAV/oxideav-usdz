@@ -1271,6 +1271,213 @@ fn read_sized_buffer<'a>(
     Ok((csz, body, tail))
 }
 
+/// The 8-byte header at the start of the §4.4 FIELDSETS section.
+///
+/// Trace doc §4.4: one little-endian `int64 count`, followed by
+/// **one** §3a compressed buffer (its own `int64 compressedSize`
+/// prefix + `compressedSize` bytes of LZ4-framed payload). The
+/// decompressed buffer, when fed through the §3b integer decoder,
+/// yields `count` `i32` values where the field-index runs that make
+/// up each *field set* are concatenated and separated by a
+/// `-1` / `0xFFFFFFFF` sentinel.
+///
+/// On the Elephant fixture this header decodes to `count = 576`,
+/// the trailing `compressedSize` prefix is `595`, and the section's
+/// total 611 bytes break down exactly as
+/// `8 (count) + 8 (compressedSize) + 595`.
+///
+/// This is the **header struct only** — it carries the parsed
+/// `count`. The `(compressedSize, buffer)` pair is surfaced by
+/// [`FieldSetsSection`] below.
+///
+/// Per the trace doc's §4.4 caveat the §3b stream uses the "common
+/// value" fast path, which means a naive [`decode_int_array`] call on
+/// the decompressed buffer recovers the **structure** (count, run
+/// boundaries) but not the literal field indices; the per-element
+/// semantic recovery needs a separate decoder step that the trace
+/// doc records as a future fact extraction. This module deliberately
+/// stops at the framing — the LZ4 block payload and the common-value
+/// step are both deferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldSetsHeader {
+    /// Number of post-decode `i32` elements the buffer carries. Each
+    /// `-1` / `0xFFFFFFFF` sentinel inside that array marks the end
+    /// of one field set; the remaining (non-sentinel) entries are
+    /// indices into the §4.3 FIELDS array.
+    pub count: u64,
+}
+
+/// Defensive upper bound on the §4.4 FIELDSETS count. The Elephant
+/// sample has 576 entries; the cap is several orders of magnitude
+/// above any realistic file so a hostile or corrupted header can't
+/// trigger a runaway allocation. The cap is independent of — and
+/// tighter than — the implicit ceiling imposed by the section size
+/// (the trailing compressed buffer also bounds it in practice).
+const FIELDSETS_COUNT_CAP: u64 = 16_777_216; // 16 Mi
+
+impl FieldSetsHeader {
+    /// Fixed on-disk size of the `int64 count` header.
+    pub const SIZE: usize = 8;
+
+    /// Parse the 8-byte `int64 count` from the leading bytes. Does
+    /// not consume the trailing `(compressedSize, buffer)` pair —
+    /// callers thread `bytes[Self::SIZE..]` into
+    /// [`FieldSetsSection::parse`] for the full split.
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < Self::SIZE {
+            return Err(invalid(format!(
+                "USDC §4.4 FIELDSETS header truncated: need {} bytes, got {}",
+                Self::SIZE,
+                bytes.len()
+            )));
+        }
+        let count = read_u64_le(&bytes[0..8]);
+        if count > FIELDSETS_COUNT_CAP {
+            return Err(invalid(format!(
+                "USDC §4.4 FIELDSETS count {count} exceeds defensive cap {FIELDSETS_COUNT_CAP}",
+            )));
+        }
+        Ok(Self { count })
+    }
+}
+
+/// A reference to a `FIELDSETS` section's bytes split into the
+/// parsed header plus the trailing `(compressed_size, buffer_bytes)`
+/// pair, without yet decoding the LZ4 wrapper.
+///
+/// Use [`FieldSetsSection::buffer`] to walk the §3a framing of the
+/// buffer slice. Once the §3a LZ4 block decoder is wired in, the
+/// decompressed bytes are the input to [`decode_int_array`] with
+/// `count = header.count`, recovering the concatenated field-set
+/// `i32` array. The per-element common-value step that turns the
+/// raw `i32`s into final field indices is its own follow-up — the
+/// framing and run-structure recovery are stable now.
+#[derive(Debug, Clone)]
+pub struct FieldSetsSection<'a> {
+    /// The 8-byte `int64 count` header.
+    pub header: FieldSetsHeader,
+    /// `compressedSize` of the §3a buffer.
+    pub compressed_size: u64,
+    /// Raw bytes of the §3a buffer — exactly `compressed_size` long,
+    /// ready for [`CompressedBuffer::parse`].
+    pub buffer_bytes: &'a [u8],
+}
+
+/// Defensive upper bound on the buffer's declared `compressedSize`.
+/// The Elephant fixture's buffer is 595 bytes; the cap is several
+/// orders of magnitude above that to leave room for real asset
+/// files while still rejecting an obviously corrupt header before
+/// allocation.
+const FIELDSETS_BUFFER_SIZE_CAP: u64 = 256 * 1024 * 1024; // 256 MiB
+
+impl<'a> FieldSetsSection<'a> {
+    /// Parse a complete `FIELDSETS` section image. `section` is the
+    /// payload bytes addressed by the TOC's `(offset, size)` pair
+    /// for the section.
+    ///
+    /// Errors:
+    ///
+    /// * [`Error::InvalidData`](crate::Error) if the section is
+    ///   shorter than the 8-byte count header,
+    /// * [`Error::InvalidData`] if `count` exceeds
+    ///   `FIELDSETS_COUNT_CAP`,
+    /// * [`Error::InvalidData`] if the `compressedSize` prefix is
+    ///   truncated, oversize-cap-rejected, or refers to bytes past
+    ///   the section end,
+    /// * [`Error::InvalidData`] if the section has trailing bytes
+    ///   beyond the declared header + buffer (the section is exactly
+    ///   `8 + 8 + compressedSize` bytes per the trace doc).
+    pub fn parse(section: &'a [u8]) -> Result<Self> {
+        let header = FieldSetsHeader::parse(section)?;
+        let after_header = &section[FieldSetsHeader::SIZE..];
+        // Read the (int64 compressedSize, bytes) pair. The remaining
+        // section footprint must hold the 8-byte prefix plus the
+        // declared buffer bytes exactly.
+        if after_header.len() < 8 {
+            return Err(invalid(format!(
+                "USDC §4.4 FIELDSETS buffer: compressedSize prefix truncated (need 8 bytes, only {} remain)",
+                after_header.len()
+            )));
+        }
+        let csz = read_u64_le(&after_header[0..8]);
+        if csz > FIELDSETS_BUFFER_SIZE_CAP {
+            return Err(invalid(format!(
+                "USDC §4.4 FIELDSETS buffer compressedSize {csz} exceeds defensive cap {FIELDSETS_BUFFER_SIZE_CAP}",
+            )));
+        }
+        let csz_usize = usize::try_from(csz).map_err(|_| {
+            invalid(format!(
+                "USDC §4.4 FIELDSETS buffer compressedSize {csz} does not fit in usize",
+            ))
+        })?;
+        let need = 8usize.checked_add(csz_usize).ok_or_else(|| {
+            invalid(format!(
+                "USDC §4.4 FIELDSETS buffer: 8 + compressedSize {csz} overflows usize",
+            ))
+        })?;
+        if after_header.len() < need {
+            return Err(invalid(format!(
+                "USDC §4.4 FIELDSETS buffer: prefix + compressedSize {csz} need {need} bytes, only {} remain in section after header",
+                after_header.len()
+            )));
+        }
+        if after_header.len() != need {
+            return Err(invalid(format!(
+                "USDC §4.4 FIELDSETS section: {} trailing bytes after the declared buffer (header(8) + compressedSize prefix(8) + compressedSize must equal section size)",
+                after_header.len() - need
+            )));
+        }
+        let body = &after_header[8..8 + csz_usize];
+        Ok(Self {
+            header,
+            compressed_size: csz,
+            buffer_bytes: body,
+        })
+    }
+
+    /// Forward to [`CompressedBuffer::parse`] on the buffer slice.
+    /// Once the LZ4 block-format decoder is wired in, the
+    /// decompressed output is the input to [`decode_int_array`] with
+    /// `count = header.count`, yielding the concatenated field-set
+    /// `i32` array (each `-1` separating one set from the next).
+    pub fn buffer(&self) -> Result<CompressedBuffer<'a>> {
+        CompressedBuffer::parse(self.buffer_bytes)
+    }
+}
+
+/// Split a decoded `FIELDSETS` integer array (the output of
+/// [`decode_int_array`] applied to the decompressed buffer once the
+/// LZ4 block decoder lands) into one `Vec<i32>` per field set.
+///
+/// The trace doc §4.4 records that the array is the concatenation of
+/// per-set field-index runs, with each run terminated by a
+/// `-1` / `0xFFFFFFFF` sentinel. This helper takes the flat array
+/// and returns one inner `Vec<i32>` per run — sentinels themselves
+/// are dropped. A trailing run that ends at end-of-array without a
+/// sentinel is accepted (the trace doc doesn't constrain the final
+/// terminator); a leading sentinel produces an initial empty set.
+///
+/// The per-element common-value decoder step (the §4.4 caveat) is
+/// a separate transformation the trace doc leaves as a future fact
+/// extraction — this helper operates on whatever `i32` array the
+/// caller supplies, so it can be exercised today on synthesised
+/// inputs without first decoding LZ4.
+pub fn split_field_sets(values: &[i32]) -> Vec<Vec<i32>> {
+    let mut out: Vec<Vec<i32>> = Vec::new();
+    let mut current: Vec<i32> = Vec::new();
+    for &v in values {
+        if v == -1 {
+            out.push(core::mem::take(&mut current));
+        } else {
+            current.push(v);
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2341,6 +2548,273 @@ mod tests {
         let rb = sec.reps_buffer().expect("parse §3a framing on reps buffer");
         assert!(
             !rb.chunks.is_empty(),
+            "every §3a buffer has at least one chunk"
+        );
+    }
+
+    // === §4.4 FIELDSETS section tests ===
+
+    #[test]
+    fn field_sets_header_parses_elephant_count() {
+        // Trace doc §4.4 records count = 576 for the Elephant fixture.
+        let bytes = 576u64.to_le_bytes();
+        let h = FieldSetsHeader::parse(&bytes).expect("parse header");
+        assert_eq!(h.count, 576);
+    }
+
+    #[test]
+    fn field_sets_header_rejects_truncated_buffer() {
+        let err = FieldSetsHeader::parse(&[0u8; 7]).expect_err("short header must fail");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("FIELDSETS") && msg.contains("truncated"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn field_sets_header_rejects_oversized_count() {
+        let bytes = (FIELDSETS_COUNT_CAP + 1).to_le_bytes();
+        let err = FieldSetsHeader::parse(&bytes).expect_err("over-cap must fail");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("FIELDSETS") && msg.contains("cap"), "{msg}");
+    }
+
+    #[test]
+    fn field_sets_section_parses_elephant_shape() {
+        // Synthesise the Elephant's framing shape: count = 576,
+        // compressedSize = 595, total 8 + 8 + 595 = 611 bytes. The
+        // 595-byte buffer body starts with the trace doc's §3a
+        // leading-chunk-count byte 0x00 so the buffer parses as a
+        // single LZ4 chunk of 594 bytes — but we don't check the LZ4
+        // inner block here, only the outer framing.
+        let count: u64 = 576;
+        let csz: u64 = 595;
+        let mut section = Vec::with_capacity(8 + 8 + csz as usize);
+        section.extend_from_slice(&count.to_le_bytes());
+        section.extend_from_slice(&csz.to_le_bytes());
+        // 0x00 chunk-count + 594 filler bytes (opaque inner block).
+        section.push(0x00);
+        section.resize(8 + 8 + csz as usize, 0xAA);
+        assert_eq!(section.len(), 611);
+        let sec = FieldSetsSection::parse(&section).expect("parse section");
+        assert_eq!(sec.header.count, 576);
+        assert_eq!(sec.compressed_size, 595);
+        assert_eq!(sec.buffer_bytes.len() as u64, 595);
+        // 8 + 8 + 595 = 611 — the trace doc's footprint identity.
+        assert_eq!(
+            FieldSetsHeader::SIZE as u64 + 8 + sec.compressed_size,
+            section.len() as u64,
+            "header(8) + compressedSize prefix(8) + compressedSize must equal section size",
+        );
+        // The buffer parses as a single §3a chunk (the 0x00 leading
+        // byte case the trace doc cites as the common path).
+        let buf = sec.buffer().expect("§3a framing parses");
+        assert_eq!(buf.chunks.len(), 1);
+    }
+
+    #[test]
+    fn field_sets_section_parses_minimal_zero_count() {
+        // Synthetic minimum: count = 0, compressedSize = 0, section
+        // is exactly 16 bytes. A zero-byte buffer trivially has no
+        // chunks but the framing must still validate.
+        let mut section = Vec::with_capacity(16);
+        section.extend_from_slice(&0u64.to_le_bytes());
+        section.extend_from_slice(&0u64.to_le_bytes());
+        let sec = FieldSetsSection::parse(&section).expect("parse zero-count");
+        assert_eq!(sec.header.count, 0);
+        assert_eq!(sec.compressed_size, 0);
+        assert!(sec.buffer_bytes.is_empty());
+        // An empty §3a buffer is rejected because the leading
+        // chunk-count byte is required — this matches the existing
+        // CompressedBuffer::parse contract and gives callers a clean
+        // signal that no chunks are available.
+        assert!(sec.buffer().is_err());
+    }
+
+    #[test]
+    fn field_sets_section_forwards_to_compressed_buffer_framing() {
+        // Build a two-chunk §3a buffer to verify FieldSetsSection
+        // hands the bytes through verbatim. Leading byte = 1 means
+        // "1 extra chunk" (so total = 2); each chunk has an int32 LE
+        // length prefix.
+        let chunk_a: &[u8] = b"first-payload";
+        let chunk_b: &[u8] = b"second";
+        let mut buffer = Vec::new();
+        buffer.push(0x01); // leading "extra chunks" byte
+        buffer.extend_from_slice(&(chunk_a.len() as i32).to_le_bytes());
+        buffer.extend_from_slice(chunk_a);
+        buffer.extend_from_slice(&(chunk_b.len() as i32).to_le_bytes());
+        buffer.extend_from_slice(chunk_b);
+        let csz = buffer.len() as u64;
+        let mut section = Vec::new();
+        section.extend_from_slice(&5u64.to_le_bytes()); // count
+        section.extend_from_slice(&csz.to_le_bytes()); // compressedSize
+        section.extend_from_slice(&buffer);
+        let sec = FieldSetsSection::parse(&section).expect("parse");
+        let buf = sec.buffer().expect("framing parses");
+        assert_eq!(buf.chunks.len(), 2);
+        assert_eq!(buf.chunks[0].bytes, chunk_a);
+        assert_eq!(buf.chunks[1].bytes, chunk_b);
+    }
+
+    #[test]
+    fn field_sets_section_rejects_truncated_csize_prefix() {
+        // Header parses but only 4 bytes of the 8-byte csize prefix
+        // follow — should error at the prefix-truncation check.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // count = 1
+        bytes.extend_from_slice(&[0u8; 4]); // partial csize prefix
+        let err = FieldSetsSection::parse(&bytes).expect_err("short prefix must fail");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("FIELDSETS") && msg.contains("compressedSize prefix"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn field_sets_section_rejects_buffer_running_past_section_end() {
+        // header(8) + csize prefix(8) + csize claims 100 but only 50
+        // bytes are actually present. parse must reject before
+        // reading off the end.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // count
+        bytes.extend_from_slice(&100u64.to_le_bytes()); // csize
+        bytes.extend(std::iter::repeat(0u8).take(50));
+        let err = FieldSetsSection::parse(&bytes).expect_err("short body must fail");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("FIELDSETS") && msg.contains("compressedSize"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn field_sets_section_rejects_trailing_bytes() {
+        // header + csize prefix + buffer exactly + ONE extra byte
+        // beyond the declared footprint — trace doc §4.4 records
+        // "section consumes exactly its 611 bytes" so trailing
+        // bytes are rejected.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // count
+        bytes.extend_from_slice(&4u64.to_le_bytes()); // csize = 4
+        bytes.extend_from_slice(&[0u8; 4]); // buffer body
+        bytes.push(0xFF); // trailing byte
+        let err = FieldSetsSection::parse(&bytes).expect_err("trailing byte must fail");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("FIELDSETS") && msg.contains("trailing"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn field_sets_section_header_truncation_propagates() {
+        // section bytes too short even for the count header — the
+        // FieldSetsHeader::parse error must propagate through
+        // FieldSetsSection::parse.
+        let err = FieldSetsSection::parse(&[0u8; 3]).expect_err("short section must fail");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("FIELDSETS") && msg.contains("truncated"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn field_sets_section_rejects_oversized_csize_cap() {
+        // compressedSize = FIELDSETS_BUFFER_SIZE_CAP + 1 — should be
+        // caught before any allocation against section bytes.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // count
+        bytes.extend_from_slice(&(FIELDSETS_BUFFER_SIZE_CAP + 1).to_le_bytes());
+        let err = FieldSetsSection::parse(&bytes).expect_err("over-cap csize must fail");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("FIELDSETS") && msg.contains("cap"), "{msg}");
+    }
+
+    // === split_field_sets helper ===
+
+    #[test]
+    fn split_field_sets_handles_empty_input() {
+        assert!(split_field_sets(&[]).is_empty());
+    }
+
+    #[test]
+    fn split_field_sets_splits_two_runs() {
+        // Two field sets: [10, 11, 12] and [20, 21]; sentinel-
+        // terminated each.
+        let flat = [10, 11, 12, -1, 20, 21, -1];
+        let sets = split_field_sets(&flat);
+        assert_eq!(sets, vec![vec![10, 11, 12], vec![20, 21]]);
+    }
+
+    #[test]
+    fn split_field_sets_accepts_unterminated_trailing_run() {
+        // Trace doc §4.4 doesn't constrain the final sentinel; a
+        // trailing run that ends at EOA is accepted.
+        let flat = [1, 2, -1, 3, 4];
+        let sets = split_field_sets(&flat);
+        assert_eq!(sets, vec![vec![1, 2], vec![3, 4]]);
+    }
+
+    #[test]
+    fn split_field_sets_handles_leading_sentinel_as_empty_set() {
+        let flat = [-1, 7, 8, -1];
+        let sets = split_field_sets(&flat);
+        assert_eq!(sets, vec![Vec::<i32>::new(), vec![7, 8]]);
+    }
+
+    #[test]
+    fn split_field_sets_handles_consecutive_sentinels() {
+        // Two empty sets in the middle of a stream.
+        let flat = [1, -1, -1, 2];
+        let sets = split_field_sets(&flat);
+        assert_eq!(sets, vec![vec![1], Vec::<i32>::new(), vec![2]]);
+    }
+
+    // === Real-fixture cross-validation ===
+
+    #[test]
+    fn real_fixture_field_sets_section_parses() {
+        // Cross-validate against the trace doc's §4.4 Elephant facts:
+        // FIELDSETS offset = 0x0cf6c8, size = 611. The §4.4 table
+        // records count = 576 and notes the section "consumes
+        // exactly its 611 bytes" — i.e. 8 + 8 + compressedSize.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/3d/usd/fixtures/SoC-ElephantWithMonochord.usdc");
+        if !fixture.exists() {
+            eprintln!("skip: fixture {fixture:?} not present");
+            return;
+        }
+        let bytes = std::fs::read(&fixture).expect("read fixture");
+        let file = UsdcFile::parse(&bytes).expect("parse Elephant USDC");
+        let entry = file
+            .toc
+            .find(SectionName::FieldSets)
+            .expect("FIELDSETS section present");
+        // Trace doc §2 TOC: FIELDSETS offset = 0x0cf6c8, size = 611.
+        assert_eq!(entry.offset, 0x0cf6c8, "trace doc §2 FIELDSETS offset");
+        assert_eq!(entry.size, 611, "trace doc §2 FIELDSETS size");
+        let off = entry.offset as usize;
+        let sz = entry.size as usize;
+        let section = &bytes[off..off + sz];
+        let sec = FieldSetsSection::parse(section).expect("parse FIELDSETS section");
+        assert_eq!(sec.header.count, 576, "trace doc §4.4 count");
+        // header(8) + csize prefix(8) + csize must equal section size.
+        assert_eq!(
+            FieldSetsHeader::SIZE as u64 + 8 + sec.compressed_size,
+            entry.size,
+            "header(8) + compressedSize prefix(8) + compressedSize must equal section size",
+        );
+        assert_eq!(sec.buffer_bytes.len() as u64, sec.compressed_size);
+        // §3a framing parses to at least one chunk — the LZ4 block
+        // inside is opaque without the block decoder, but the outer
+        // envelope shape is verifiable on the wire today.
+        let buf = sec.buffer().expect("parse §3a framing on FIELDSETS buffer");
+        assert!(
+            !buf.chunks.is_empty(),
             "every §3a buffer has at least one chunk"
         );
     }

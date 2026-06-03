@@ -290,6 +290,39 @@
 //!   bytes the trace doesn't authorise. Cross-validated against
 //!   the Elephant fixture (`count = 0`, section size = 8).
 //!
+//! Round 229 — USDC §4.4 FIELDSETS section framing parser:
+//!
+//! * [`usdc::FieldSetsHeader`] / [`usdc::FieldSetsSection`] — parse
+//!   the §4.4 FIELDSETS section's outer framing: an 8-byte
+//!   little-endian `int64 count` header followed by a single
+//!   `(int64 compressedSize, §3a buffer)` pair. The decompressed
+//!   buffer, once the LZ4 block decoder lands, feeds `count` `i32`
+//!   values through the §3b integer decoder; the trace doc records
+//!   that the array is the concatenation of per-set field-index
+//!   runs separated by a `-1` (`0xFFFFFFFF`) sentinel — each spec
+//!   (§4.6) references one such set to get its full property list.
+//!   [`usdc::FieldSetsSection::buffer`] forwards to
+//!   [`usdc::CompressedBuffer::parse`] on the bounded buffer slice
+//!   ready for §3a / §3b chained decoding once the LZ4 block
+//!   decoder lands. Defensive caps on `count` (16 Mi) and on the
+//!   buffer's `compressedSize` (256 MiB) plus a strict
+//!   `8 + 8 + compressedSize == section size` check reject trailing
+//!   bytes the trace doesn't authorise. Cross-validated against the
+//!   Elephant fixture (`count = 576`, `compressedSize = 595`,
+//!   section size = 611). The trace doc's §4.4 caveat — that the
+//!   buffer uses a "common value" fast path on top of §3b so a
+//!   naive [`usdc::decode_int_array`] recovers the run structure
+//!   but not the literal field indices — is recorded in the module
+//!   docs; the per-element semantic-recovery step is its own
+//!   follow-up.
+//! * [`usdc::split_field_sets`] — companion helper that splits the
+//!   flat post-§3b `i32` array into one `Vec<i32>` per field set,
+//!   dropping the `-1` sentinels. Accepts a trailing run without a
+//!   sentinel (trace doc leaves the final terminator
+//!   unconstrained), surfaces a leading sentinel as an initial
+//!   empty set, and emits empty inner sets between consecutive
+//!   sentinels.
+//!
 //! Round 222 — USDC §4.3 FIELDS section framing parser:
 //!
 //! * [`usdc::FieldsHeader`] / [`usdc::FieldsSection`] — parse the
@@ -312,19 +345,28 @@
 //!   (`numFields = 157`, `csize₁ = 141`, `csize₂ = 833`, section
 //!   size = 998).
 //!
-//! Deferred to round 223+:
+//! Deferred to round 230+:
 //!
 //! * **`.usdc` §3a LZ4 wrapper.** The outer per-buffer wrapper
 //!   that feeds bytes into §3b. The remaining primitive needed
 //!   before any index section can be decoded end-to-end.
-//! * **`.usdc` section-payload semantics.** Rounds 212 / 217 / 222
-//!   land the TOKENS string-atom pool header (§4.1), the STRINGS
-//!   index table (§4.2) and the FIELDS two-buffer framing (§4.3).
-//!   The remaining per-section decoders — FIELDSETS field-index
-//!   lists (§4.4), PATHS namespace tree (§4.5), SPECS spec table
-//!   (§4.6) — stack on top of §3a + §3b without re-parsing the
-//!   bootstrap. The trace doc §4 records the per-section header
-//!   shape for each.
+//! * **`.usdc` section-payload semantics.** Rounds 212 / 217 / 222 /
+//!   229 land the TOKENS string-atom pool header (§4.1), the
+//!   STRINGS index table (§4.2), the FIELDS two-buffer framing
+//!   (§4.3) and the FIELDSETS single-buffer framing (§4.4). The
+//!   remaining per-section decoders — PATHS namespace tree (§4.5;
+//!   trace doc caveat: a recursive child/sibling jump encoding
+//!   rather than three flat §3b arrays) and SPECS three-buffer
+//!   spec table (§4.6) — stack on top of §3a + §3b without
+//!   re-parsing the bootstrap. The trace doc §4 records the
+//!   per-section header shape for each.
+//! * **§3b "common value" fast path.** Round 229's §4.4 framing
+//!   exposes the buffer but the trace doc records that FIELDSETS
+//!   (and PATHS) layer a common-value compression step on top of
+//!   the §3b shape. [`usdc::decode_int_array`] recovers the
+//!   structural run boundaries but not the literal field indices;
+//!   the per-element semantic-recovery step is a separate decoder
+//!   pass the trace doc leaves as a future fact extraction.
 //! * **FIELDS value-rep type-code enumeration.** A separate
 //!   fact-table extraction (gap tracker's Round B) that the
 //!   [`usdc`] primitives don't depend on.

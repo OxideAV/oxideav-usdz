@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 229 (USDC §4.4 FIELDSETS section framing + sentinel-split helper)
+
+- **`usdc::FieldSetsHeader` / `usdc::FieldSetsSection`** — the §4.4
+  FIELDSETS section's outer framing. The section is an 8-byte
+  little-endian `int64 count` header followed by a single
+  `(int64 compressedSize, §3a buffer)` pair. The decompressed
+  buffer, once the LZ4 block decoder lands, feeds `count` `i32`
+  values through the §3b integer decoder; the trace doc records
+  that the array is the concatenation of per-set field-index runs
+  separated by a `-1` (`0xFFFFFFFF`) sentinel — each spec (§4.6)
+  references one such set to get its full property list.
+  `FieldSetsHeader::parse` reads the 8-byte count;
+  `FieldSetsSection::parse` enforces
+  `8 + 8 + compressedSize == section_size` strictly so any trailing
+  byte the trace doesn't authorise is an `Error::InvalidData`;
+  `FieldSetsSection::buffer` forwards to `CompressedBuffer::parse`
+  on the bounded buffer slice for callers walking the §3a framing
+  ahead of the LZ4 block decoder. Defensive caps on `count`
+  (16 Mi) and on the buffer's `compressedSize` (256 MiB) protect
+  against runaway allocation from a hostile or corrupted header.
+  The trace doc's §4.4 caveat — that a naive §3b decode of the
+  buffer recovers the run structure but the literal values need a
+  separate "common value" step — is recorded in the module docs;
+  this round deliberately stops at the framing.
+- **`usdc::split_field_sets`** — small companion helper that splits
+  a flat `&[i32]` (the eventual output of the §3b decoder on the
+  decompressed buffer) into one `Vec<i32>` per field set, dropping
+  the `-1` sentinels. Accepts a trailing run without a sentinel
+  (trace doc leaves that case unconstrained) and surfaces a
+  leading sentinel as an initial empty set; consecutive sentinels
+  produce empty sets between non-empty ones. Lets the run-split
+  semantics get exercised today on synthesised input without
+  first wiring the LZ4 block decoder.
+- **15 new unit tests** in `usdc::tests` cover §4.4 header parsing
+  on the trace's Elephant `count = 576` worked example, the
+  truncated-input error path, the oversized-count rejection
+  against the defensive cap, the synthesised Elephant-shape
+  section (count = 576, compressedSize = 595, section size = 611),
+  the zero-count minimal section, end-to-end §3a forwarding into
+  `CompressedBuffer::parse` on a two-chunk buffer, the
+  truncated-prefix error path, the oversize-csize error path, the
+  short-body error path, the strict trailing-byte rejection,
+  header-truncation propagation through `FieldSetsSection::parse`,
+  the over-cap defensive `compressedSize` rejection, plus five
+  `split_field_sets` cases (empty input, two sentinel-terminated
+  runs, unterminated trailing run, leading sentinel as empty set,
+  consecutive sentinels as inner empty sets).
+- **Real-fixture cross-validation** —
+  `real_fixture_field_sets_section_parses` reads
+  `docs/3d/usd/fixtures/SoC-ElephantWithMonochord.usdc` through
+  `UsdcFile::parse`, finds the `FIELDSETS` TOC entry (offset
+  `0x0cf6c8`, size `611`), parses the section, and asserts the
+  trace doc's published numbers verbatim — `count = 576`,
+  `compressedSize = 595`, plus the `8 + 8 + 595 = 611`
+  total-footprint invariant on the wire. Walks the §3a framing to
+  confirm the buffer has at least one chunk. Sourced exclusively
+  from `docs/3d/usd/usdc-crate-format-trace.md` §4.4.
+
 ### Added — Round 222 (USDC §4.3 FIELDS section framing)
 
 - **`usdc::FieldsHeader` / `usdc::FieldsSection`** — the §4.3

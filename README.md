@@ -324,6 +324,44 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   module is required, so this oracle runs anywhere Apple USD Tools /
   Pixar's CLI binary is installed.
 
+## Round 229 scope (USDC §4.4 FIELDSETS section framing)
+
+- **`usdc::FieldSetsHeader` / `usdc::FieldSetsSection`** — the §4.4
+  FIELDSETS section's outer framing. The section is an 8-byte
+  little-endian `int64 count` header followed by a single
+  `(int64 compressedSize, §3a buffer)` pair. The decompressed
+  buffer, once the LZ4 block decoder lands, feeds `count` `i32`
+  values through the §3b integer decoder; the trace doc records
+  that the array is the concatenation of per-set field-index runs
+  separated by a `-1` (`0xFFFFFFFF`) sentinel. Each spec (§4.6)
+  references one such set to get its full property list.
+  `FieldSetsSection::parse` enforces
+  `8 + 8 + compressedSize == section_size` exactly — trailing
+  bytes the trace doesn't authorise are an `Error::InvalidData`.
+  `FieldSetsSection::buffer` forwards to `CompressedBuffer::parse`
+  on the bounded buffer slice for callers walking the §3a framing
+  ahead of the LZ4 block decoder. Defensive caps on `count`
+  (16 Mi) and on the buffer's `compressedSize` (256 MiB) cut off a
+  hostile or corrupted header before allocation.
+- **`usdc::split_field_sets`** — small companion that splits the
+  flat post-§3b `i32` array into one `Vec<i32>` per set, dropping
+  sentinels. Accepts a trailing run without a sentinel (trace doc
+  leaves that case unconstrained), surfaces a leading sentinel as
+  an initial empty set, and emits empty sets between consecutive
+  sentinels. Lets the run-split semantics get exercised today on
+  synthesised input without first wiring the LZ4 block decoder.
+- Cross-validated against the Elephant fixture under
+  `docs/3d/usd/fixtures/`: the TOC's FIELDSETS entry sits at
+  `offset = 0x0cf6c8` with `size = 611`, the section header parses
+  to exactly the trace doc's `count = 576`, the trailing buffer's
+  `compressedSize` is `595`, and the total footprint
+  `8 + 8 + 595 = 611` matches the section size on the wire.
+- Trace doc §4.4 caveat (the §3b buffer uses a "common value"
+  fast path so a naive `decode_int_array` recovers the run
+  structure but not the literal field indices) is recorded in the
+  module docs; the per-element semantic-recovery step is its own
+  follow-up.
+
 ## Round 222 scope (USDC §4.3 FIELDS section framing)
 
 - **`usdc::FieldsHeader` / `usdc::FieldsSection`** — the §4.3
@@ -463,7 +501,7 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   the natural next slice and stacks on top of these primitives
   without re-parsing the bootstrap.
 
-## Deferred to round 223+
+## Deferred to round 230+
 
 - **`.usdc` LZ4 *block* decoder.** Round 212 ships the §3a outer
   framing (`CompressedBuffer` walks the chunk count + per-chunk
@@ -472,14 +510,23 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   block decompression is left to the caller. Once a clean-room
   trace of the public LZ4 block format lands, the chunk-payload
   decoder slots in here without changing the framing surface.
-- **`.usdc` section-payload semantics.** Rounds 212 / 217 / 222
-  land the TOKENS string-atom pool header (§4.1), the STRINGS
-  index table (§4.2), and the FIELDS two-buffer framing (§4.3).
-  The remaining per-section decoders — FIELDSETS field-index
-  lists (§4.4), PATHS namespace-tree (§4.5), SPECS spec table
-  (§4.6) — stack on top of §3a + §3b without re-parsing the
-  bootstrap. The trace doc §4 records the per-section header
-  shape for each.
+- **`.usdc` section-payload semantics.** Rounds 212 / 217 / 222 /
+  229 land the TOKENS string-atom pool header (§4.1), the STRINGS
+  index table (§4.2), the FIELDS two-buffer framing (§4.3), and
+  the FIELDSETS single-buffer framing (§4.4). The remaining
+  per-section decoders — PATHS namespace-tree (§4.5; the trace
+  doc's caveat notes a recursive child/sibling jump encoding
+  rather than three flat §3b arrays) and SPECS three-buffer
+  spec table (§4.6) — stack on top of §3a + §3b without
+  re-parsing the bootstrap. The trace doc §4 records the
+  per-section header shape for each.
+- **§3b "common value" fast path.** Round 229's §4.4 framing
+  exposes the buffer but the trace doc records that FIELDSETS
+  (and PATHS) use a common-value compression step on top of
+  the §3b shape. `decode_int_array` recovers the structural
+  run boundaries but not the literal field indices; the
+  per-element semantic-recovery step is a separate decoder
+  pass the trace doc leaves as a future fact extraction.
 - **FIELDS value-rep type-code enumeration.** A separate
   fact-table extraction (gap tracker's Round B) that the
   bootstrap + TOC primitives don't depend on.
