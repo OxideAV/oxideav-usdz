@@ -324,6 +324,36 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   module is required, so this oracle runs anywhere Apple USD Tools /
   Pixar's CLI binary is installed.
 
+## Round 222 scope (USDC §4.3 FIELDS section framing)
+
+- **`usdc::FieldsHeader` / `usdc::FieldsSection`** — the §4.3
+  FIELDS section's outer two-buffer framing. The section is an
+  8-byte little-endian `int64 numFields` header followed by
+  **two** `(int64 compressedSize, §3a buffer)` pairs:
+  1. an int-coded array (§3b, once the LZ4 layer is peeled) of
+     `numFields` token indices, one per field, giving each field
+     its name (an index into the §4.1 TOKENS atom pool);
+  2. `numFields × uint64` value-rep entries — a packed
+     representation carrying type code, flags (`is-array`,
+     `is-inlined`, `is-compressed`), and either an inline value
+     or a file offset to the value's bytes elsewhere in the file.
+  `FieldsSection::parse` enforces
+  `8 + 8 + csize₁ + 8 + csize₂ == section_size` exactly —
+  trailing bytes the trace doesn't authorise are an
+  `Error::InvalidData`. `FieldsSection::names_buffer` /
+  `reps_buffer` forward to `CompressedBuffer::parse` on the
+  bounded buffer slices for callers walking the §3a framing
+  ahead of the LZ4 block decoder. Defensive caps on `numFields`
+  (16 Mi) and on either buffer's `compressedSize` (256 MiB) cut
+  off a hostile or corrupted header before allocation.
+- Cross-validated against the Elephant fixture under
+  `docs/3d/usd/fixtures/`: the TOC's FIELDS entry sits at
+  `offset = 0x0cf2e2` with `size = 998`, the section header
+  parses to exactly the trace doc's `numFields = 157`, the two
+  buffer prefixes carry `csize₁ = 141` and `csize₂ = 833`, and
+  the total footprint `8 + 8 + 141 + 8 + 833 = 998` matches the
+  section size on the wire.
+
 ## Round 217 scope (USDC §4.2 STRINGS section parser)
 
 - **`usdc::StringsHeader` / `usdc::StringsSection`** — the §4.2
@@ -433,7 +463,7 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   the natural next slice and stacks on top of these primitives
   without re-parsing the bootstrap.
 
-## Deferred to round 218+
+## Deferred to round 223+
 
 - **`.usdc` LZ4 *block* decoder.** Round 212 ships the §3a outer
   framing (`CompressedBuffer` walks the chunk count + per-chunk
@@ -442,13 +472,14 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   block decompression is left to the caller. Once a clean-room
   trace of the public LZ4 block format lands, the chunk-payload
   decoder slots in here without changing the framing surface.
-- **`.usdc` section-payload semantics.** Rounds 212 / 217 land the
-  TOKENS string-atom pool header (§4.1) and the STRINGS index
-  table (§4.2). The remaining per-section decoders — FIELDS
-  (name, value-rep) pairs (§4.3), FIELDSETS field-index lists
-  (§4.4), PATHS namespace-tree (§4.5), SPECS spec table (§4.6) —
-  stack on top of §3a + §3b without re-parsing the bootstrap.
-  The trace doc §4 records the per-section header shape for each.
+- **`.usdc` section-payload semantics.** Rounds 212 / 217 / 222
+  land the TOKENS string-atom pool header (§4.1), the STRINGS
+  index table (§4.2), and the FIELDS two-buffer framing (§4.3).
+  The remaining per-section decoders — FIELDSETS field-index
+  lists (§4.4), PATHS namespace-tree (§4.5), SPECS spec table
+  (§4.6) — stack on top of §3a + §3b without re-parsing the
+  bootstrap. The trace doc §4 records the per-section header
+  shape for each.
 - **FIELDS value-rep type-code enumeration.** A separate
   fact-table extraction (gap tracker's Round B) that the
   bootstrap + TOC primitives don't depend on.

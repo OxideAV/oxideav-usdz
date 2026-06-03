@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 222 (USDC §4.3 FIELDS section framing)
+
+- **`usdc::FieldsHeader` / `usdc::FieldsSection`** — the §4.3
+  FIELDS section's outer two-buffer framing. The section is an
+  8-byte little-endian `int64 numFields` header followed by two
+  `(int64 compressedSize, §3a buffer)` pairs: the first buffer's
+  decompressed form is an int-coded array (§3b) of `numFields`
+  token indices giving each field its name (an index into the
+  §4.1 TOKENS atom pool); the second buffer's decompressed form
+  is `numFields × uint64` packed value-rep entries — a packed
+  representation carrying type code, flags (`is-array`,
+  `is-inlined`, `is-compressed`), and either an inline value or
+  a file offset to the value's bytes elsewhere in the file.
+  `FieldsHeader::parse` reads the 8-byte numFields;
+  `FieldsSection::parse` enforces
+  `8 + 8 + csize₁ + 8 + csize₂ == section_size` strictly so any
+  trailing byte the trace doesn't authorise is an
+  `Error::InvalidData`; `FieldsSection::names_buffer` /
+  `reps_buffer` forward to `CompressedBuffer::parse` on the
+  bounded buffer slices for callers walking the §3a framing
+  ahead of the LZ4 block decoder. Defensive caps on `numFields`
+  (16 Mi) and on either buffer's `compressedSize` (256 MiB)
+  protect against runaway allocation from a hostile or corrupted
+  header. Sourced exclusively from
+  `docs/3d/usd/usdc-crate-format-trace.md` §4.3.
+- **12 new unit tests** in `usdc::tests` cover the §4.3 header
+  parsing on the trace's Elephant `numFields = 157` worked
+  example, the truncated-input error path, the
+  oversized-numFields rejection against the defensive cap, the
+  zero-fields synthetic minimal section, end-to-end section
+  parsing on the trace's three documented `(numFields, csize₁,
+  csize₂)` values, §3a forward-to-`CompressedBuffer` on both
+  buffers, truncated-prefix error paths for both buffers,
+  oversize-csize error paths for both buffers, the strict
+  trailing-byte rejection, header-truncation propagation through
+  `FieldsSection::parse`, and the over-cap defensive
+  `compressedSize` rejection.
+- **Real-fixture cross-validation** —
+  `real_fixture_fields_section_parses` reads
+  `docs/3d/usd/fixtures/SoC-ElephantWithMonochord.usdc` through
+  `UsdcFile::parse`, finds the `FIELDS` TOC entry (offset
+  `0x0cf2e2`, size `998`), parses the section, and asserts the
+  trace doc's published numbers verbatim — `numFields = 157`,
+  `csize₁ = 141`, `csize₂ = 833`, plus the `8 + 8 + 141 + 8 +
+  833 = 998` total-footprint invariant on the wire. Walks the §3a
+  framing on both buffers to confirm each compressed buffer has
+  at least one chunk.
+
 ### Added — Round 217 (USDC §4.2 STRINGS section parser)
 
 - **`usdc::StringsHeader` / `usdc::StringsSection`** — the §4.2

@@ -50,11 +50,31 @@
 //!   verifies the size match, NUL-splits into the recorded
 //!   `numTokens` UTF-8 strings, and returns them as `Vec<String>`.
 //!
+//! What this module **adds in round 217**:
+//!
+//! * [`StringsHeader`] / [`StringsSection`] — the §4.2 STRINGS
+//!   section: an 8-byte `int64 count` header followed by
+//!   `count × uint32` raw little-endian token indices (NOT
+//!   LZ4-compressed). `StringsSection::parse_indices` materialises
+//!   the indices as `Vec<u32>`.
+//!
+//! What this module **adds in round 222**:
+//!
+//! * [`FieldsHeader`] / [`FieldsSection`] — the §4.3 FIELDS section
+//!   framing: an 8-byte `int64 numFields` header followed by two
+//!   `(int64 compressedSize, §3a buffer)` pairs. The first buffer's
+//!   decompressed form is an int-coded array (§3b) of `numFields`
+//!   token indices (each field's name); the second buffer's
+//!   decompressed form is `numFields × uint64` packed value-rep
+//!   words. This module surfaces the bounded buffer slices ready
+//!   for [`CompressedBuffer::parse`] but stops at the envelope —
+//!   the LZ4 block decoder and the value-rep type-code enumeration
+//!   are deferred (see the gap tracker's Round B).
+//!
 //! What this module does **not** do (deferred to a follow-up round):
 //!
 //! * LZ4 block decompression of section payloads,
-//! * the STRINGS / FIELDS / FIELDSETS / PATHS / SPECS payload
-//!   semantics,
+//! * the FIELDSETS / PATHS / SPECS payload semantics,
 //! * the FIELDS value-rep type-code enumeration (a separate
 //!   fact-table extraction — see the gap tracker's Round B).
 //!
@@ -1034,6 +1054,223 @@ impl<'a> StringsSection<'a> {
     }
 }
 
+/// The 8-byte header at the start of the §4.3 FIELDS section.
+///
+/// Trace doc §4.3: one little-endian `int64 numFields`, followed by
+/// **two** §3a compressed buffers — each prefixed by its own
+/// `int64 compressedSize`:
+///
+/// 1. an int-coded array (§3b, once the LZ4 layer is peeled) of
+///    `numFields` **token indices**, one per field, giving each
+///    field its name (an index into the §4.1 TOKENS atom pool);
+/// 2. `numFields` × `uint64` **value-rep** entries — a packed
+///    representation carrying the field's type code, flags
+///    (`is-array`, `is-inlined`, `is-compressed`), and either an
+///    inline value or a file offset to the value's bytes elsewhere
+///    in the file.
+///
+/// On the Elephant fixture the header decodes to
+/// `numFields = 157`. The two `compressedSize` prefixes carry 141
+/// and 833 respectively — the section's total 998 bytes break down
+/// exactly as `8 (numFields) + 8 (csize₁) + 141 + 8 (csize₂) + 833`.
+///
+/// This is the **header struct only** — it carries the parsed
+/// `numFields`. The two `(compressedSize, buffer)` pairs are
+/// surfaced by [`FieldsSection`] below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldsHeader {
+    /// Number of field entries (one name-index + one value-rep
+    /// each) recorded in the section.
+    pub num_fields: u64,
+}
+
+/// Defensive upper bound on the §4.3 FIELDS count. The Elephant
+/// sample has 157 fields; we cap several orders of magnitude above
+/// any real file so a hostile or corrupted header can't trigger a
+/// runaway allocation. The cap is independent of — and tighter
+/// than — the implicit ceiling imposed by the section size (the
+/// two buffer prefixes also bound this in practice).
+const FIELDS_COUNT_CAP: u64 = 16_777_216; // 16 Mi
+
+impl FieldsHeader {
+    /// Fixed on-disk size of the `int64 numFields` header.
+    pub const SIZE: usize = 8;
+
+    /// Parse the 8-byte `int64 numFields` from the leading bytes.
+    /// Does not consume the two trailing `(compressedSize, buffer)`
+    /// pairs — callers thread `bytes[Self::SIZE..]` into
+    /// [`FieldsSection::parse`] for the full split.
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < Self::SIZE {
+            return Err(invalid(format!(
+                "USDC §4.3 FIELDS header truncated: need {} bytes, got {}",
+                Self::SIZE,
+                bytes.len()
+            )));
+        }
+        let num_fields = read_u64_le(&bytes[0..8]);
+        if num_fields > FIELDS_COUNT_CAP {
+            return Err(invalid(format!(
+                "USDC §4.3 FIELDS numFields {num_fields} exceeds defensive cap {FIELDS_COUNT_CAP}",
+            )));
+        }
+        Ok(Self { num_fields })
+    }
+}
+
+/// A reference to a `FIELDS` section's bytes split into the parsed
+/// header plus the two `(compressed_size, buffer_bytes)` pairs
+/// without yet decoding the LZ4 wrapper around either buffer.
+///
+/// Use [`FieldsSection::names_buffer`] / [`FieldsSection::reps_buffer`]
+/// to walk the §3a framing of each buffer. The §3b integer decoder
+/// (for the names buffer once decompressed) is exposed separately as
+/// [`decode_int_array`]. The reps buffer's decompressed form is an
+/// array of `num_fields × uint64` packed value-rep words; this
+/// module does not yet enumerate the type codes those words carry
+/// (deferred — the trace doc records that enumeration as a separate
+/// fact-table extraction).
+#[derive(Debug, Clone)]
+pub struct FieldsSection<'a> {
+    /// The 8-byte `int64 numFields` header.
+    pub header: FieldsHeader,
+    /// `compressedSize` of the first §3a buffer (the names buffer).
+    pub names_compressed_size: u64,
+    /// Raw bytes of the first §3a buffer — exactly
+    /// `names_compressed_size` long, ready for
+    /// [`CompressedBuffer::parse`].
+    pub names_buffer_bytes: &'a [u8],
+    /// `compressedSize` of the second §3a buffer (the value-rep
+    /// buffer).
+    pub reps_compressed_size: u64,
+    /// Raw bytes of the second §3a buffer — exactly
+    /// `reps_compressed_size` long, ready for
+    /// [`CompressedBuffer::parse`].
+    pub reps_buffer_bytes: &'a [u8],
+}
+
+/// Defensive upper bound on either buffer's declared `compressedSize`.
+/// The Elephant fixture's two buffers are 141 and 833 bytes; the cap
+/// is several orders of magnitude above that to leave room for real
+/// asset files while still rejecting an obviously corrupt header
+/// before allocation.
+const FIELDS_BUFFER_SIZE_CAP: u64 = 256 * 1024 * 1024; // 256 MiB
+
+impl<'a> FieldsSection<'a> {
+    /// Parse a complete `FIELDS` section image. `section` is the
+    /// payload bytes addressed by the TOC's `(offset, size)` pair
+    /// for the section.
+    ///
+    /// Errors:
+    ///
+    /// * [`Error::InvalidData`](crate::Error) if the section is
+    ///   shorter than the 8-byte numFields header,
+    /// * [`Error::InvalidData`] if `num_fields` exceeds
+    ///   `FIELDS_COUNT_CAP`,
+    /// * [`Error::InvalidData`] if either `compressedSize` prefix
+    ///   is truncated, oversize-cap-rejected, or refers to bytes
+    ///   past the section end,
+    /// * [`Error::InvalidData`] if the section has trailing bytes
+    ///   beyond the declared two-buffer layout (the section is
+    ///   exactly `8 + 8 + csize₁ + 8 + csize₂` bytes per the trace
+    ///   doc).
+    pub fn parse(section: &'a [u8]) -> Result<Self> {
+        let header = FieldsHeader::parse(section)?;
+        let mut cursor = &section[FieldsHeader::SIZE..];
+        let mut consumed = FieldsHeader::SIZE;
+        let (names_csz, names_bytes, after_names) =
+            read_sized_buffer(cursor, "names", section.len() - consumed)?;
+        cursor = after_names;
+        consumed += 8 + names_bytes.len();
+        let (reps_csz, reps_bytes, after_reps) =
+            read_sized_buffer(cursor, "reps", section.len() - consumed)?;
+        cursor = after_reps;
+        consumed += 8 + reps_bytes.len();
+        if !cursor.is_empty() {
+            return Err(invalid(format!(
+                "USDC §4.3 FIELDS section: {} trailing bytes after the two-buffer layout (header(8) + csize₁ prefix(8) + csize₁ + csize₂ prefix(8) + csize₂ must equal section size)",
+                cursor.len()
+            )));
+        }
+        debug_assert_eq!(consumed, section.len());
+        Ok(Self {
+            header,
+            names_compressed_size: names_csz,
+            names_buffer_bytes: names_bytes,
+            reps_compressed_size: reps_csz,
+            reps_buffer_bytes: reps_bytes,
+        })
+    }
+
+    /// Forward to [`CompressedBuffer::parse`] on the first buffer
+    /// (the names buffer). Once the LZ4 block-format decoder is
+    /// wired in, the decompressed output is the input to
+    /// [`decode_int_array`] with `count = num_fields`, yielding the
+    /// per-field token indices.
+    pub fn names_buffer(&self) -> Result<CompressedBuffer<'a>> {
+        CompressedBuffer::parse(self.names_buffer_bytes)
+    }
+
+    /// Forward to [`CompressedBuffer::parse`] on the second buffer
+    /// (the value-rep buffer). The decompressed output is
+    /// `num_fields × 8` bytes of packed `uint64` rep words —
+    /// type code + flags + inline/offset value — and the
+    /// type-code enumeration is the natural next slice once docs
+    /// stage the fact table.
+    pub fn reps_buffer(&self) -> Result<CompressedBuffer<'a>> {
+        CompressedBuffer::parse(self.reps_buffer_bytes)
+    }
+}
+
+/// Helper used by [`FieldsSection::parse`] to read one
+/// `(int64 compressedSize, bytes)` pair out of a slice. `label` is
+/// the buffer name used in error messages ("names" or "reps").
+/// `remaining` is the number of section bytes that still belong to
+/// the FIELDS section after the current cursor — used to bound the
+/// declared `compressedSize` against the section's footprint
+/// independently of the slice length (`bytes.len()` and `remaining`
+/// always agree at the call site; the parameter just makes the
+/// error message refer to the *section* rather than to a
+/// nondescript "remaining" count).
+fn read_sized_buffer<'a>(
+    bytes: &'a [u8],
+    label: &str,
+    remaining: usize,
+) -> Result<(u64, &'a [u8], &'a [u8])> {
+    if bytes.len() < 8 {
+        return Err(invalid(format!(
+            "USDC §4.3 FIELDS {label} buffer: compressedSize prefix truncated (need 8 bytes, only {} remain)",
+            bytes.len()
+        )));
+    }
+    let csz = read_u64_le(&bytes[0..8]);
+    if csz > FIELDS_BUFFER_SIZE_CAP {
+        return Err(invalid(format!(
+            "USDC §4.3 FIELDS {label} buffer compressedSize {csz} exceeds defensive cap {FIELDS_BUFFER_SIZE_CAP}",
+        )));
+    }
+    let csz_usize = usize::try_from(csz).map_err(|_| {
+        invalid(format!(
+            "USDC §4.3 FIELDS {label} buffer compressedSize {csz} does not fit in usize",
+        ))
+    })?;
+    // The 8-byte prefix plus the buffer bytes must fit inside the
+    // section's remaining footprint.
+    let need = 8usize.checked_add(csz_usize).ok_or_else(|| {
+        invalid(format!(
+            "USDC §4.3 FIELDS {label} buffer: 8 + compressedSize {csz} overflows usize",
+        ))
+    })?;
+    if remaining < need {
+        return Err(invalid(format!(
+            "USDC §4.3 FIELDS {label} buffer: prefix + compressedSize {csz} need {need} bytes, only {remaining} remain in section",
+        )));
+    }
+    let body = &bytes[8..8 + csz_usize];
+    let tail = &bytes[8 + csz_usize..];
+    Ok((csz, body, tail))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1852,6 +2089,259 @@ mod tests {
             StringsHeader::SIZE as u64,
             str_entry.size,
             "header(8) + count*4 must equal section size",
+        );
+    }
+
+    // ----- §4.3 FIELDS section tests -----
+
+    /// Build a synthetic FIELDS section image: 8-byte LE `numFields`
+    /// header, then `(int64 LE compressedSize, bytes)` pairs for the
+    /// names buffer and the reps buffer. Mirrors the trace's wire
+    /// shape so the parser's bounds checks see realistic byte runs.
+    fn build_fields_section(num_fields: u64, names: &[u8], reps: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(8 + 8 + names.len() + 8 + reps.len());
+        buf.extend_from_slice(&num_fields.to_le_bytes());
+        buf.extend_from_slice(&(names.len() as u64).to_le_bytes());
+        buf.extend_from_slice(names);
+        buf.extend_from_slice(&(reps.len() as u64).to_le_bytes());
+        buf.extend_from_slice(reps);
+        buf
+    }
+
+    #[test]
+    fn fields_header_parses_elephant_num_fields() {
+        // Trace doc §4.3 worked example: Elephant numFields = 157.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&157u64.to_le_bytes());
+        let h = FieldsHeader::parse(&buf).unwrap();
+        assert_eq!(h.num_fields, 157);
+    }
+
+    #[test]
+    fn fields_header_rejects_truncated_buffer() {
+        let err = FieldsHeader::parse(&[0u8; 4]).expect_err("4-byte slice must fail");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("truncated") && msg.contains("FIELDS"), "{msg}");
+    }
+
+    #[test]
+    fn fields_header_rejects_oversized_count() {
+        let mut bytes = vec![0u8; 8];
+        let oversized = FIELDS_COUNT_CAP + 1;
+        bytes[..8].copy_from_slice(&oversized.to_le_bytes());
+        let err = FieldsHeader::parse(&bytes).expect_err("oversized count must fail");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("FIELDS") && msg.contains("cap"), "{msg}");
+    }
+
+    #[test]
+    fn fields_section_parses_elephant_csizes() {
+        // Trace doc §4.3 table: numFields=157, csize₁=141, csize₂=833.
+        // The buffer contents themselves are opaque LZ4 blocks; this
+        // test only exercises the section framing.
+        let names_bytes = vec![0xABu8; 141];
+        let reps_bytes = vec![0xCDu8; 833];
+        let bytes = build_fields_section(157, &names_bytes, &reps_bytes);
+        // Trace doc Elephant section size = 998.
+        assert_eq!(bytes.len(), 998, "trace doc §2 FIELDS section size");
+        let sec = FieldsSection::parse(&bytes).unwrap();
+        assert_eq!(sec.header.num_fields, 157);
+        assert_eq!(sec.names_compressed_size, 141);
+        assert_eq!(sec.reps_compressed_size, 833);
+        assert_eq!(sec.names_buffer_bytes, &names_bytes[..]);
+        assert_eq!(sec.reps_buffer_bytes, &reps_bytes[..]);
+    }
+
+    #[test]
+    fn fields_section_parses_minimal_zero_fields() {
+        // numFields = 0 is structurally valid: both buffers can be
+        // empty too. The wire layout still has both 8-byte
+        // compressedSize prefixes — the trace doc records the
+        // section as `numFields + two compressed buffers`, not as a
+        // numFields-dependent variant header.
+        let bytes = build_fields_section(0, &[], &[]);
+        // Layout: numFields(8) + csize₁(8) + 0 bytes + csize₂(8) + 0 bytes.
+        assert_eq!(bytes.len(), 24);
+        let sec = FieldsSection::parse(&bytes).unwrap();
+        assert_eq!(sec.header.num_fields, 0);
+        assert_eq!(sec.names_compressed_size, 0);
+        assert_eq!(sec.reps_compressed_size, 0);
+        assert!(sec.names_buffer_bytes.is_empty());
+        assert!(sec.reps_buffer_bytes.is_empty());
+    }
+
+    #[test]
+    fn fields_section_forwards_to_compressed_buffer_framing() {
+        // Hand-build single-chunk §3a buffers (leading 0x00 chunk-count
+        // byte + opaque LZ4-block payload). FieldsSection::names_buffer
+        // and reps_buffer must walk the §3a framing without copying.
+        let names = vec![0x00u8, 0xDE, 0xAD]; // chunk-count 0, then 2 opaque bytes
+        let reps = vec![0x00u8, 0xBE, 0xEF, 0x42];
+        let bytes = build_fields_section(1, &names, &reps);
+        let sec = FieldsSection::parse(&bytes).unwrap();
+        let nb = sec.names_buffer().unwrap();
+        assert_eq!(nb.chunks.len(), 1);
+        assert_eq!(nb.chunks[0].bytes, &[0xDE, 0xAD]);
+        let rb = sec.reps_buffer().unwrap();
+        assert_eq!(rb.chunks.len(), 1);
+        assert_eq!(rb.chunks[0].bytes, &[0xBE, 0xEF, 0x42]);
+    }
+
+    #[test]
+    fn fields_section_rejects_truncated_names_prefix() {
+        // numFields header (8 B) then only 4 of the 8 bytes that
+        // would form the names buffer's compressedSize prefix.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 4]);
+        let err = FieldsSection::parse(&bytes).expect_err("short names prefix must fail");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("FIELDS") && msg.contains("names") && msg.contains("truncated"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn fields_section_rejects_truncated_reps_prefix() {
+        // Valid names buffer (csize = 0), then only 4 of the 8 bytes
+        // for the reps buffer's compressedSize prefix.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // numFields
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // names csize = 0
+        bytes.extend_from_slice(&[0u8; 4]); // partial reps csize
+        let err = FieldsSection::parse(&bytes).expect_err("short reps prefix must fail");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("FIELDS") && msg.contains("reps") && msg.contains("truncated"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn fields_section_rejects_names_buffer_running_past_section_end() {
+        // names compressedSize = 100 but only 4 bytes follow.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // numFields
+        bytes.extend_from_slice(&100u64.to_le_bytes()); // names csize = 100
+        bytes.extend_from_slice(&[0u8; 4]); // only 4 bytes follow
+        let err = FieldsSection::parse(&bytes).expect_err("oversize names csize must fail");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("FIELDS") && msg.contains("names") && msg.contains("100"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn fields_section_rejects_reps_buffer_running_past_section_end() {
+        // Valid names buffer, then reps compressedSize = 100 with no
+        // payload bytes following.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // numFields
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // names csize = 0
+        bytes.extend_from_slice(&100u64.to_le_bytes()); // reps csize = 100
+                                                        // No reps payload bytes — section ends here.
+        let err = FieldsSection::parse(&bytes).expect_err("oversize reps csize must fail");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("FIELDS") && msg.contains("reps") && msg.contains("100"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn fields_section_rejects_trailing_bytes() {
+        // Append a stray byte after a valid two-buffer layout — the
+        // trace doc records the section as exactly
+        // `8 + 8 + csize₁ + 8 + csize₂` bytes with no tail.
+        let mut bytes = build_fields_section(1, &[0xAA], &[0xBB, 0xCC]);
+        bytes.push(0x99);
+        let err = FieldsSection::parse(&bytes).expect_err("trailing byte must fail");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("FIELDS") && msg.contains("trailing"), "{msg}");
+    }
+
+    #[test]
+    fn fields_section_header_truncation_propagates() {
+        let err = FieldsSection::parse(&[0u8; 3]).expect_err("short header must fail");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("FIELDS") && msg.contains("truncated"), "{msg}");
+    }
+
+    #[test]
+    fn fields_section_rejects_oversized_csize_cap() {
+        // names compressedSize = FIELDS_BUFFER_SIZE_CAP + 1 — should
+        // be caught before any allocation against the section bytes.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // numFields
+        bytes.extend_from_slice(&(FIELDS_BUFFER_SIZE_CAP + 1).to_le_bytes());
+        let err = FieldsSection::parse(&bytes).expect_err("over-cap csize must fail");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("FIELDS") && msg.contains("cap"), "{msg}");
+    }
+
+    #[test]
+    fn real_fixture_fields_section_parses() {
+        // Cross-validate against the trace doc's §4.3 Elephant facts:
+        // FIELDS offset = 0x0cf2e2, size = 998. The §4.3 table records
+        // numFields = 157, csize₁ = 141, csize₂ = 833 and observes
+        // that the section consumes exactly its 998 bytes (i.e.
+        // `8 + 8 + 141 + 8 + 833 = 998`).
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/3d/usd/fixtures/SoC-ElephantWithMonochord.usdc");
+        if !fixture.exists() {
+            eprintln!("skip: fixture {fixture:?} not present");
+            return;
+        }
+        let bytes = std::fs::read(&fixture).expect("read fixture");
+        let file = UsdcFile::parse(&bytes).expect("parse Elephant USDC");
+        let entry = file
+            .toc
+            .find(SectionName::Fields)
+            .expect("FIELDS section present");
+        // Trace doc §2 TOC: FIELDS offset = 0x0cf2e2, size = 998.
+        assert_eq!(entry.offset, 0x0cf2e2, "trace doc §2 FIELDS offset");
+        assert_eq!(entry.size, 998, "trace doc §2 FIELDS size");
+        let off = entry.offset as usize;
+        let sz = entry.size as usize;
+        let section = &bytes[off..off + sz];
+        let sec = FieldsSection::parse(section).expect("parse FIELDS section");
+        assert_eq!(sec.header.num_fields, 157, "trace doc §4.3 numFields");
+        assert_eq!(
+            sec.names_compressed_size, 141,
+            "trace doc §4.3 csize₁ (names buffer)"
+        );
+        assert_eq!(
+            sec.reps_compressed_size, 833,
+            "trace doc §4.3 csize₂ (reps buffer)"
+        );
+        assert_eq!(
+            sec.names_buffer_bytes.len() as u64,
+            sec.names_compressed_size
+        );
+        assert_eq!(sec.reps_buffer_bytes.len() as u64, sec.reps_compressed_size);
+        // Total footprint: 8 + 8 + 141 + 8 + 833 = 998.
+        assert_eq!(
+            FieldsHeader::SIZE as u64 + 8 + sec.names_compressed_size + 8 + sec.reps_compressed_size,
+            entry.size,
+            "header(8) + csize₁ prefix(8) + csize₁ + csize₂ prefix(8) + csize₂ must equal section size",
+        );
+        // The §3a framing of either buffer can be walked even though
+        // the LZ4 block bytes inside are opaque to us — the trace
+        // doc's "compressed buffer = leading chunk-count byte + chunks"
+        // shape applies to both buffers.
+        let nb = sec
+            .names_buffer()
+            .expect("parse §3a framing on names buffer");
+        assert!(
+            !nb.chunks.is_empty(),
+            "every §3a buffer has at least one chunk"
+        );
+        let rb = sec.reps_buffer().expect("parse §3a framing on reps buffer");
+        assert!(
+            !rb.chunks.is_empty(),
+            "every §3a buffer has at least one chunk"
         );
     }
 }

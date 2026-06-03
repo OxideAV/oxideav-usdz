@@ -290,17 +290,41 @@
 //!   bytes the trace doesn't authorise. Cross-validated against
 //!   the Elephant fixture (`count = 0`, section size = 8).
 //!
-//! Deferred to round 218+:
+//! Round 222 — USDC §4.3 FIELDS section framing parser:
+//!
+//! * [`usdc::FieldsHeader`] / [`usdc::FieldsSection`] — parse the
+//!   §4.3 FIELDS section's outer two-buffer framing: an 8-byte
+//!   little-endian `int64 numFields` header followed by two
+//!   `(int64 compressedSize, §3a buffer)` pairs. The first
+//!   buffer's decompressed form is an int-coded array (§3b) of
+//!   `numFields` token indices giving each field its name; the
+//!   second buffer's decompressed form is `numFields × uint64`
+//!   packed value-rep words (type code + flags + inline / offset
+//!   value). [`usdc::FieldsSection::names_buffer`] and
+//!   [`usdc::FieldsSection::reps_buffer`] forward to
+//!   [`usdc::CompressedBuffer::parse`] on the bounded buffer
+//!   slices ready for §3a / §3b chained decoding once the LZ4
+//!   block decoder lands. Defensive caps on `numFields` (16 Mi)
+//!   and on either buffer's `compressedSize` (256 MiB) plus a
+//!   strict `8 + 8 + csize₁ + 8 + csize₂ == section size` check
+//!   reject trailing bytes the trace doesn't authorise.
+//!   Cross-validated against the Elephant fixture
+//!   (`numFields = 157`, `csize₁ = 141`, `csize₂ = 833`, section
+//!   size = 998).
+//!
+//! Deferred to round 223+:
 //!
 //! * **`.usdc` §3a LZ4 wrapper.** The outer per-buffer wrapper
 //!   that feeds bytes into §3b. The remaining primitive needed
 //!   before any index section can be decoded end-to-end.
-//! * **`.usdc` section-payload semantics.** The six
-//!   section-payload decoders (TOKENS string-atom pool, STRINGS
-//!   index table, FIELDS (name, value-rep) pairs, FIELDSETS
-//!   field-index lists, PATHS namespace tree, SPECS spec table)
-//!   stack on top of §3a + §3b without re-parsing the bootstrap.
-//!   The trace doc §4 records the per-section header for each.
+//! * **`.usdc` section-payload semantics.** Rounds 212 / 217 / 222
+//!   land the TOKENS string-atom pool header (§4.1), the STRINGS
+//!   index table (§4.2) and the FIELDS two-buffer framing (§4.3).
+//!   The remaining per-section decoders — FIELDSETS field-index
+//!   lists (§4.4), PATHS namespace tree (§4.5), SPECS spec table
+//!   (§4.6) — stack on top of §3a + §3b without re-parsing the
+//!   bootstrap. The trace doc §4 records the per-section header
+//!   shape for each.
 //! * **FIELDS value-rep type-code enumeration.** A separate
 //!   fact-table extraction (gap tracker's Round B) that the
 //!   [`usdc`] primitives don't depend on.
