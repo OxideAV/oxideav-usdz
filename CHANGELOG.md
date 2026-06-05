@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 239 (USDC §4.6 SPECS section three-buffer framing)
+
+- **`usdc::SpecsHeader` / `usdc::SpecsSection`** — the §4.6 SPECS
+  section's outer three-buffer framing. Trace doc §4.6 records the
+  section opens with an 8-byte little-endian `int64 count`
+  immediately followed by **three** `(int64 compressedSize, §3a
+  buffer)` triples. The three decompressed buffers carry, in
+  order, `count × i32` path indices (into the §4.5 PATHS namespace
+  tree), `count × i32` field-set indices (into the §4.4 FIELDSETS
+  array), and `count × i32` spec-type codes (a small enum
+  identifying prim / attribute / relationship / …). Each spec row
+  is therefore the join `(pathIndex, fieldSetIndex, specType)`, so
+  the SPECS section is the table a reader iterates to materialise
+  the stage. `SpecsHeader::parse` reads the 8-byte count and
+  bounds it under a defensive cap (16 Mi — several orders of
+  magnitude above the Elephant fixture's 248); `SpecsSection::parse`
+  slices each `(compressedSize, bytes)` triple under a strict
+  `8 + 3*(8 + compressedSize) == section_size` invariant.
+  `SpecsSection::paths_buffer` / `fieldsets_buffer` /
+  `types_buffer` forward to `CompressedBuffer::parse` on each
+  bounded buffer slice ready for §3a / §3b chained decoding once
+  the LZ4 block decoder lands. The spec-type enumeration that the
+  third buffer's `i32`s eventually resolve into is its own
+  fact-table extraction and stays deferred. Sourced exclusively
+  from `docs/3d/usd/usdc-crate-format-trace.md` §4.6 (header
+  layout + Elephant numbers) and §2 (TOC entry
+  `offset = 0x0cfb4f`, `size = 331`).
+- **10 new unit tests** in `usdc::tests` cover §4.6 header parsing
+  on the Elephant `count = 248` worked example, header truncation,
+  the oversized-count rejection against the defensive cap, the
+  synthesised Elephant-shape section
+  (`8 + 8 + 60 + 8 + 200 + 8 + 39 = 331`), the zero-count minimal
+  framing (`8 + 3 × 8` total), truncated-csize-prefix error on the
+  second buffer, the third buffer overrunning the section,
+  trailing-bytes rejection, header-truncation propagation through
+  `SpecsSection::parse`, and the §3a single-chunk round-trip on
+  each of the three buffer forwarders. An additional
+  `real_fixture_specs_section_parses` test cross-validates against
+  the in-tree Elephant fixture: the trace doc's `count = 248` and
+  the three `compressedSize` values 60 / 200 / 39 are recovered
+  from the wire bytes; the three buffer slices are non-overlapping
+  borrows into the section at the documented offsets.
+
 ### Added — Round 236 (USDC §4.5 PATHS section leading-prefix framing)
 
 - **`usdc::PathsHeader` / `usdc::PathsSection`** — the §4.5 PATHS

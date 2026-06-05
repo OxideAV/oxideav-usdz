@@ -89,10 +89,36 @@
 //!   round can layer the buffer decomposition once the trace doc
 //!   resolves the buffer count.
 //!
+//! What this module **adds in round 239**:
+//!
+//! * [`SpecsHeader`] / [`SpecsSection`] — the §4.6 SPECS section's
+//!   outer three-buffer framing: an 8-byte `int64 count` header
+//!   followed by **three** `(int64 compressedSize, §3a buffer)`
+//!   triples. The trace doc records the three buffers as: path
+//!   indices (into the §4.5 PATHS tree), field-set indices (into
+//!   the §4.4 FIELDSETS array), and spec types (prim / attribute /
+//!   relationship / …). Each spec row is the join
+//!   `(pathIndex, fieldSetIndex, specType)` so the SPECS section
+//!   is the table a reader iterates to materialise the stage.
+//!   `SpecsHeader::parse` reads the leading `int64 count` and
+//!   bounds it under a defensive cap; `SpecsSection::parse`
+//!   slices out each `(compressedSize, bytes)` triple under a
+//!   strict `8 + 3*(8 + compressedSize) == section_size`
+//!   invariant. [`SpecsSection::paths_buffer`] /
+//!   [`SpecsSection::fieldsets_buffer`] /
+//!   [`SpecsSection::types_buffer`] forward to
+//!   [`CompressedBuffer::parse`] on each bounded buffer slice
+//!   ready for §3a / §3b chained decoding once the LZ4 block
+//!   decoder lands. The spec-type enumeration that the third
+//!   buffer's `i32`s eventually resolve into is its own
+//!   fact-table extraction and stays deferred.
+//!
 //! What this module does **not** do (deferred to a follow-up round):
 //!
 //! * LZ4 block decompression of section payloads,
-//! * the FIELDSETS / PATHS / SPECS payload semantics,
+//! * the FIELDSETS / PATHS payload semantics,
+//! * the SPECS spec-type enumeration (a separate fact-table
+//!   extraction layered on top of the §4.6 framing landing here),
 //! * the FIELDS value-rep type-code enumeration (a separate
 //!   fact-table extraction — see the gap tracker's Round B).
 //!
@@ -1616,6 +1642,249 @@ impl<'a> PathsSection<'a> {
     }
 }
 
+/// The 8-byte header at the start of the §4.6 SPECS section.
+///
+/// Trace doc §4.6: one little-endian `int64 count`, followed by
+/// **three** §3a compressed buffers (each its own
+/// `int64 compressedSize` prefix + `compressedSize` bytes of
+/// LZ4-framed payload). The three decompressed buffers carry, in
+/// order:
+///
+/// 1. `count × i32` **path indices** into the §4.5 PATHS namespace
+///    tree (one per spec row),
+/// 2. `count × i32` **field-set indices** into the §4.4 FIELDSETS
+///    array (one per spec row), and
+/// 3. `count × i32` **spec types** — a small enum identifying the
+///    kind of object the spec describes (prim, attribute,
+///    relationship, …). The enumeration of the integer values is a
+///    separate fact-table extraction and is **not** carried by this
+///    framing primitive.
+///
+/// Each spec row is therefore the join
+/// `(pathIndex, fieldSetIndex, specType)`: "at this namespace path,
+/// of this kind, here are its fields." This is the table a reader
+/// iterates to materialise the stage.
+///
+/// On the Elephant fixture this header decodes to `count = 248`;
+/// the trailing buffers' `compressedSize` prefixes are 60, 200 and
+/// 39; the section's total 331 bytes break down exactly as
+/// `8 (count) + 8 + 60 + 8 + 200 + 8 + 39`.
+///
+/// This is the **header struct only** — it carries the parsed
+/// `count`. The three `(compressedSize, buffer)` triples are
+/// surfaced by [`SpecsSection`] below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpecsHeader {
+    /// Number of spec rows the section carries. Each row joins one
+    /// entry from each of the three buffers.
+    pub count: u64,
+}
+
+/// Defensive upper bound on the §4.6 SPECS count. The Elephant
+/// sample has 248 specs; the cap is several orders of magnitude
+/// above any realistic file so a hostile or corrupted header can't
+/// trigger a runaway allocation. The cap is independent of — and
+/// tighter than — the implicit ceiling imposed by the section
+/// size (the three trailing buffers also bound it in practice).
+const SPECS_COUNT_CAP: u64 = 16_777_216; // 16 Mi
+
+impl SpecsHeader {
+    /// Fixed on-disk size of the `int64 count` header.
+    pub const SIZE: usize = 8;
+
+    /// Parse the 8-byte `int64 count` from the leading bytes. Does
+    /// not consume the three trailing `(compressedSize, buffer)`
+    /// triples — callers thread `bytes[Self::SIZE..]` into
+    /// [`SpecsSection::parse`] for the full split.
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < Self::SIZE {
+            return Err(invalid(format!(
+                "USDC §4.6 SPECS header truncated: need {} bytes, got {}",
+                Self::SIZE,
+                bytes.len()
+            )));
+        }
+        let count = read_u64_le(&bytes[0..8]);
+        if count > SPECS_COUNT_CAP {
+            return Err(invalid(format!(
+                "USDC §4.6 SPECS count {count} exceeds defensive cap {SPECS_COUNT_CAP}",
+            )));
+        }
+        Ok(Self { count })
+    }
+}
+
+/// A reference to a `SPECS` section's bytes split into the parsed
+/// header plus the three `(compressed_size, buffer_bytes)` triples
+/// without yet decoding the LZ4 wrapper around any of them.
+///
+/// Use [`SpecsSection::paths_buffer`] /
+/// [`SpecsSection::fieldsets_buffer`] /
+/// [`SpecsSection::types_buffer`] to walk the §3a framing of each
+/// buffer. The §3b integer decoder (for the decompressed bytes) is
+/// exposed separately as [`decode_int_array`]. The spec-type
+/// enumeration that the third buffer's `i32`s eventually resolve
+/// into is its own fact-table extraction.
+#[derive(Debug, Clone)]
+pub struct SpecsSection<'a> {
+    /// The 8-byte `int64 count` header.
+    pub header: SpecsHeader,
+    /// `compressedSize` of the first §3a buffer (the path-indices
+    /// buffer).
+    pub paths_compressed_size: u64,
+    /// Raw bytes of the first §3a buffer — exactly
+    /// `paths_compressed_size` long, ready for
+    /// [`CompressedBuffer::parse`].
+    pub paths_buffer_bytes: &'a [u8],
+    /// `compressedSize` of the second §3a buffer (the field-set
+    /// indices buffer).
+    pub fieldsets_compressed_size: u64,
+    /// Raw bytes of the second §3a buffer — exactly
+    /// `fieldsets_compressed_size` long, ready for
+    /// [`CompressedBuffer::parse`].
+    pub fieldsets_buffer_bytes: &'a [u8],
+    /// `compressedSize` of the third §3a buffer (the spec-types
+    /// buffer).
+    pub types_compressed_size: u64,
+    /// Raw bytes of the third §3a buffer — exactly
+    /// `types_compressed_size` long, ready for
+    /// [`CompressedBuffer::parse`].
+    pub types_buffer_bytes: &'a [u8],
+}
+
+/// Defensive upper bound on any of the three buffers' declared
+/// `compressedSize`. The Elephant fixture's three buffers are 60,
+/// 200 and 39 bytes; the cap is several orders of magnitude above
+/// that to leave room for real asset files while still rejecting
+/// an obviously corrupt header before allocation.
+const SPECS_BUFFER_SIZE_CAP: u64 = 256 * 1024 * 1024; // 256 MiB
+
+impl<'a> SpecsSection<'a> {
+    /// Parse a complete `SPECS` section image. `section` is the
+    /// payload bytes addressed by the TOC's `(offset, size)` pair
+    /// for the section.
+    ///
+    /// Errors:
+    ///
+    /// * [`Error::InvalidData`](crate::Error) if the section is
+    ///   shorter than the 8-byte count header,
+    /// * [`Error::InvalidData`] if `count` exceeds
+    ///   `SPECS_COUNT_CAP`,
+    /// * [`Error::InvalidData`] if any of the three
+    ///   `compressedSize` prefixes is truncated, oversize-cap-rejected,
+    ///   or refers to bytes past the section end,
+    /// * [`Error::InvalidData`] if the section has trailing bytes
+    ///   beyond the declared three-buffer layout (the section is
+    ///   exactly `8 + 8 + csize₁ + 8 + csize₂ + 8 + csize₃` bytes
+    ///   per the trace doc).
+    pub fn parse(section: &'a [u8]) -> Result<Self> {
+        let header = SpecsHeader::parse(section)?;
+        let mut cursor = &section[SpecsHeader::SIZE..];
+        let mut consumed = SpecsHeader::SIZE;
+        let (paths_csz, paths_bytes, after_paths) =
+            read_specs_buffer(cursor, "paths", section.len() - consumed)?;
+        cursor = after_paths;
+        consumed += 8 + paths_bytes.len();
+        let (fs_csz, fs_bytes, after_fs) =
+            read_specs_buffer(cursor, "fieldsets", section.len() - consumed)?;
+        cursor = after_fs;
+        consumed += 8 + fs_bytes.len();
+        let (types_csz, types_bytes, after_types) =
+            read_specs_buffer(cursor, "types", section.len() - consumed)?;
+        cursor = after_types;
+        consumed += 8 + types_bytes.len();
+        if !cursor.is_empty() {
+            return Err(invalid(format!(
+                "USDC §4.6 SPECS section: {} trailing bytes after the three-buffer layout (header(8) + three (csize prefix(8) + csize) triples must equal section size)",
+                cursor.len()
+            )));
+        }
+        debug_assert_eq!(consumed, section.len());
+        Ok(Self {
+            header,
+            paths_compressed_size: paths_csz,
+            paths_buffer_bytes: paths_bytes,
+            fieldsets_compressed_size: fs_csz,
+            fieldsets_buffer_bytes: fs_bytes,
+            types_compressed_size: types_csz,
+            types_buffer_bytes: types_bytes,
+        })
+    }
+
+    /// Forward to [`CompressedBuffer::parse`] on the first buffer
+    /// (the path-indices buffer). Once the LZ4 block-format decoder
+    /// is wired in, the decompressed output is the input to
+    /// [`decode_int_array`] with `count = header.count`, yielding
+    /// the per-row path index into the §4.5 PATHS namespace tree.
+    pub fn paths_buffer(&self) -> Result<CompressedBuffer<'a>> {
+        CompressedBuffer::parse(self.paths_buffer_bytes)
+    }
+
+    /// Forward to [`CompressedBuffer::parse`] on the second buffer
+    /// (the field-set indices buffer). Once the LZ4 block-format
+    /// decoder is wired in, the decompressed output is the input to
+    /// [`decode_int_array`] with `count = header.count`, yielding
+    /// the per-row field-set index into the §4.4 FIELDSETS array.
+    pub fn fieldsets_buffer(&self) -> Result<CompressedBuffer<'a>> {
+        CompressedBuffer::parse(self.fieldsets_buffer_bytes)
+    }
+
+    /// Forward to [`CompressedBuffer::parse`] on the third buffer
+    /// (the spec-types buffer). Once the LZ4 block-format decoder
+    /// is wired in, the decompressed output is the input to
+    /// [`decode_int_array`] with `count = header.count`, yielding
+    /// per-row integer spec-type codes. The mapping of those codes
+    /// to (prim / attribute / relationship / …) is a separate
+    /// fact-table extraction and is deliberately not covered here.
+    pub fn types_buffer(&self) -> Result<CompressedBuffer<'a>> {
+        CompressedBuffer::parse(self.types_buffer_bytes)
+    }
+}
+
+/// Helper used by [`SpecsSection::parse`] to read one
+/// `(int64 compressedSize, bytes)` pair out of a slice. `label` is
+/// the buffer name used in error messages ("paths", "fieldsets",
+/// or "types"). `remaining` is the number of section bytes that
+/// still belong to the SPECS section after the current cursor —
+/// used to bound the declared `compressedSize` against the
+/// section's footprint independently of the slice length.
+fn read_specs_buffer<'a>(
+    bytes: &'a [u8],
+    label: &str,
+    remaining: usize,
+) -> Result<(u64, &'a [u8], &'a [u8])> {
+    if bytes.len() < 8 {
+        return Err(invalid(format!(
+            "USDC §4.6 SPECS {label} buffer: compressedSize prefix truncated (need 8 bytes, only {} remain)",
+            bytes.len()
+        )));
+    }
+    let csz = read_u64_le(&bytes[0..8]);
+    if csz > SPECS_BUFFER_SIZE_CAP {
+        return Err(invalid(format!(
+            "USDC §4.6 SPECS {label} buffer compressedSize {csz} exceeds defensive cap {SPECS_BUFFER_SIZE_CAP}",
+        )));
+    }
+    let csz_usize = usize::try_from(csz).map_err(|_| {
+        invalid(format!(
+            "USDC §4.6 SPECS {label} buffer compressedSize {csz} does not fit in usize",
+        ))
+    })?;
+    let need = 8usize.checked_add(csz_usize).ok_or_else(|| {
+        invalid(format!(
+            "USDC §4.6 SPECS {label} buffer: 8 + compressedSize {csz} overflows usize",
+        ))
+    })?;
+    if remaining < need {
+        return Err(invalid(format!(
+            "USDC §4.6 SPECS {label} buffer: prefix + compressedSize {csz} need {need} bytes, only {remaining} remain in section",
+        )));
+    }
+    let body = &bytes[8..8 + csz_usize];
+    let tail = &bytes[8 + csz_usize..];
+    Ok((csz, body, tail))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3085,5 +3354,210 @@ mod tests {
         assert_eq!(sec.tail_bytes.len(), 548 - 16);
         // The bytes are a borrow into the input section.
         assert_eq!(sec.tail_bytes.as_ptr(), section[16..].as_ptr());
+    }
+
+    // ----- §4.6 SPECS section framing tests -----
+
+    /// Build a §4.6 SPECS section image with the three buffers
+    /// carrying the supplied raw payload bytes. The wire layout is
+    /// `int64 count + 3 × (int64 compressedSize + bytes)`.
+    fn synth_specs_section(count: u64, paths: &[u8], fieldsets: &[u8], types: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&(paths.len() as u64).to_le_bytes());
+        out.extend_from_slice(paths);
+        out.extend_from_slice(&(fieldsets.len() as u64).to_le_bytes());
+        out.extend_from_slice(fieldsets);
+        out.extend_from_slice(&(types.len() as u64).to_le_bytes());
+        out.extend_from_slice(types);
+        out
+    }
+
+    #[test]
+    fn specs_header_parses_elephant_count() {
+        // Trace doc §4.6 worked example: Elephant `count = 248`.
+        let bytes = 248u64.to_le_bytes();
+        let h = SpecsHeader::parse(&bytes).unwrap();
+        assert_eq!(h.count, 248);
+    }
+
+    #[test]
+    fn specs_header_rejects_truncated() {
+        let err = SpecsHeader::parse(&[0u8; 7]).expect_err("7 bytes < 8");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("SPECS") && msg.contains("truncated"), "{msg}");
+    }
+
+    #[test]
+    fn specs_header_rejects_oversize_count() {
+        let bytes = u64::MAX.to_le_bytes();
+        let err = SpecsHeader::parse(&bytes).expect_err("oversize count");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("count") && msg.contains("cap"), "{msg}");
+    }
+
+    #[test]
+    fn specs_section_parses_synthesised_elephant_shape() {
+        // Trace doc §4.6 Elephant numbers: count = 248, csizes
+        // 60 / 200 / 39. The synthetic section sets the three
+        // buffer payload sizes to those exact widths so the
+        // `8 + 3*(8 + csize) == section size` arithmetic
+        // (= 8 + 8 + 60 + 8 + 200 + 8 + 39 = 331) is exercised
+        // end-to-end.
+        let paths = vec![0x10u8; 60];
+        let fieldsets = vec![0x20u8; 200];
+        let types = vec![0x30u8; 39];
+        let section = synth_specs_section(248, &paths, &fieldsets, &types);
+        assert_eq!(section.len(), 331);
+        let sec = SpecsSection::parse(&section).expect("parse synthesised SPECS section");
+        assert_eq!(sec.header.count, 248);
+        assert_eq!(sec.paths_compressed_size, 60);
+        assert_eq!(sec.fieldsets_compressed_size, 200);
+        assert_eq!(sec.types_compressed_size, 39);
+        assert_eq!(sec.paths_buffer_bytes, &paths[..]);
+        assert_eq!(sec.fieldsets_buffer_bytes, &fieldsets[..]);
+        assert_eq!(sec.types_buffer_bytes, &types[..]);
+    }
+
+    #[test]
+    fn specs_section_zero_count_minimal_framing() {
+        // Even with count = 0 the three (compressedSize, bytes)
+        // triples are present on the wire — synth them as
+        // zero-length buffers (csize = 0).
+        let section = synth_specs_section(0, &[], &[], &[]);
+        assert_eq!(section.len(), 8 + 3 * 8);
+        let sec = SpecsSection::parse(&section).expect("parse zero-count");
+        assert_eq!(sec.header.count, 0);
+        assert_eq!(sec.paths_compressed_size, 0);
+        assert_eq!(sec.fieldsets_compressed_size, 0);
+        assert_eq!(sec.types_compressed_size, 0);
+        assert!(sec.paths_buffer_bytes.is_empty());
+        assert!(sec.fieldsets_buffer_bytes.is_empty());
+        assert!(sec.types_buffer_bytes.is_empty());
+    }
+
+    #[test]
+    fn specs_section_rejects_truncated_second_csize_prefix() {
+        // Build a partial section that has the count header + the
+        // first buffer's csize+bytes, but only 4 bytes of the
+        // second buffer's csize prefix.
+        let mut section = Vec::new();
+        section.extend_from_slice(&5u64.to_le_bytes()); // count
+        section.extend_from_slice(&3u64.to_le_bytes()); // csize1 = 3
+        section.extend_from_slice(&[0xAA, 0xBB, 0xCC]); // 3 bytes of buf1
+        section.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // half of csize2
+        let err = SpecsSection::parse(&section).expect_err("short csize2 prefix");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("fieldsets") && msg.contains("compressedSize prefix"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn specs_section_rejects_oversized_third_buffer() {
+        // count + (csize1, buf1) + (csize2, buf2) + (csize3=100, but only 4 buf3 bytes)
+        let mut section = Vec::new();
+        section.extend_from_slice(&5u64.to_le_bytes()); // count
+        section.extend_from_slice(&2u64.to_le_bytes());
+        section.extend_from_slice(&[0xAA, 0xBB]);
+        section.extend_from_slice(&2u64.to_le_bytes());
+        section.extend_from_slice(&[0xCC, 0xDD]);
+        section.extend_from_slice(&100u64.to_le_bytes()); // csize3 = 100
+        section.extend_from_slice(&[0xEE, 0xFF, 0x11, 0x22]); // only 4 bytes
+        let err = SpecsSection::parse(&section).expect_err("third buffer overrun");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("types") && msg.contains("remain in section"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn specs_section_rejects_trailing_bytes() {
+        // Append a stray byte beyond the declared three-buffer
+        // layout — the strict equality check must surface it.
+        let mut section = synth_specs_section(1, &[0x01, 0x02], &[0x03, 0x04], &[0x05, 0x06]);
+        section.push(0xFF);
+        let err = SpecsSection::parse(&section).expect_err("trailing byte must fail");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("trailing bytes"), "{msg}");
+    }
+
+    #[test]
+    fn specs_section_header_truncation_propagates() {
+        let err = SpecsSection::parse(&[0u8; 4]).expect_err("short section must fail");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("SPECS") && msg.contains("truncated"), "{msg}");
+    }
+
+    #[test]
+    fn specs_section_buffer_forwarders_round_trip_single_chunk() {
+        // Build a SPECS section whose three buffers are each a §3a
+        // single-chunk form (leading 0x00 byte + raw payload). The
+        // three forwarders must surface those payloads through
+        // CompressedBuffer::parse without losing bytes.
+        let p_payload = vec![0x00u8, 0xAA, 0xBB, 0xCC];
+        let f_payload = vec![0x00u8, 0xDD];
+        let t_payload = vec![0x00u8, 0xEE, 0xFF];
+        let section = synth_specs_section(3, &p_payload, &f_payload, &t_payload);
+        let sec = SpecsSection::parse(&section).unwrap();
+        let p = sec.paths_buffer().unwrap();
+        let f = sec.fieldsets_buffer().unwrap();
+        let t = sec.types_buffer().unwrap();
+        assert_eq!(p.chunks.len(), 1);
+        assert_eq!(p.chunks[0].bytes, &[0xAA, 0xBB, 0xCC]);
+        assert_eq!(f.chunks.len(), 1);
+        assert_eq!(f.chunks[0].bytes, &[0xDD]);
+        assert_eq!(t.chunks.len(), 1);
+        assert_eq!(t.chunks[0].bytes, &[0xEE, 0xFF]);
+    }
+
+    #[test]
+    fn real_fixture_specs_section_parses() {
+        // Trace doc §4.6 Elephant facts: SPECS offset = 0x0cfb4f,
+        // size = 331, count = 248, three buffer csizes = 60 / 200 / 39
+        // so the section breaks down as 8 + 8 + 60 + 8 + 200 + 8 + 39.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/3d/usd/fixtures/SoC-ElephantWithMonochord.usdc");
+        if !fixture.exists() {
+            eprintln!("skip: fixture {fixture:?} not present");
+            return;
+        }
+        let bytes = std::fs::read(&fixture).expect("read fixture");
+        let file = UsdcFile::parse(&bytes).expect("parse Elephant USDC");
+        let entry = file
+            .toc
+            .find(SectionName::Specs)
+            .expect("SPECS section present");
+        assert_eq!(entry.offset, 0x0cfb4f, "trace doc §2 SPECS offset");
+        assert_eq!(entry.size, 331, "trace doc §2 SPECS size");
+        let off = entry.offset as usize;
+        let sz = entry.size as usize;
+        let section = &bytes[off..off + sz];
+        let sec = SpecsSection::parse(section).expect("parse SPECS section");
+        assert_eq!(sec.header.count, 248, "trace doc §4.6 count");
+        assert_eq!(sec.paths_compressed_size, 60, "trace doc §4.6 paths csize");
+        assert_eq!(
+            sec.fieldsets_compressed_size, 200,
+            "trace doc §4.6 fieldsets csize"
+        );
+        assert_eq!(sec.types_compressed_size, 39, "trace doc §4.6 types csize");
+        assert_eq!(sec.paths_buffer_bytes.len(), 60);
+        assert_eq!(sec.fieldsets_buffer_bytes.len(), 200);
+        assert_eq!(sec.types_buffer_bytes.len(), 39);
+        // The three buffer slices are non-overlapping borrows into
+        // the input section in the documented order.
+        assert_eq!(sec.paths_buffer_bytes.as_ptr(), section[16..].as_ptr());
+        assert_eq!(
+            sec.fieldsets_buffer_bytes.as_ptr(),
+            section[16 + 60 + 8..].as_ptr()
+        );
+        assert_eq!(
+            sec.types_buffer_bytes.as_ptr(),
+            section[16 + 60 + 8 + 200 + 8..].as_ptr()
+        );
+        // 8 (count) + 8 + 60 + 8 + 200 + 8 + 39 = 331.
+        assert_eq!(16 + 60 + 8 + 200 + 8 + 39, 331);
     }
 }

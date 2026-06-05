@@ -324,6 +324,42 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   module is required, so this oracle runs anywhere Apple USD Tools /
   the USD CLI binary is installed.
 
+## Round 239 scope (USDC §4.6 SPECS section three-buffer framing)
+
+- **`usdc::SpecsHeader` / `usdc::SpecsSection`** — the §4.6 SPECS
+  section's outer three-buffer framing. The section is an 8-byte
+  little-endian `int64 count` header followed by **three**
+  `(int64 compressedSize, §3a buffer)` triples. The three buffers
+  carry, in order, `count × i32` **path indices** into the §4.5
+  PATHS namespace tree, `count × i32` **field-set indices** into
+  the §4.4 FIELDSETS array, and `count × i32` **spec-type** codes
+  (a small enum identifying prim / attribute / relationship /
+  …). Each spec row is therefore the join
+  `(pathIndex, fieldSetIndex, specType)` — "at this namespace
+  path, of this kind, here are its fields" — so SPECS is the
+  table a reader iterates to materialise the stage.
+  `SpecsSection::parse` enforces
+  `8 + 8 + csize₁ + 8 + csize₂ + 8 + csize₃ == section_size`
+  exactly — trailing bytes the trace doesn't authorise are an
+  `Error::InvalidData`. `SpecsSection::paths_buffer` /
+  `fieldsets_buffer` / `types_buffer` forward to
+  `CompressedBuffer::parse` on each bounded buffer slice for
+  callers walking the §3a framing ahead of the LZ4 block decoder.
+  Defensive caps on `count` (16 Mi) and on each buffer's
+  `compressedSize` (256 MiB) cut off a hostile or corrupted
+  header before allocation.
+- Cross-validated against the Elephant fixture under
+  `docs/3d/usd/fixtures/`: the TOC's SPECS entry sits at
+  `offset = 0x0cfb4f` with `size = 331`, the section header
+  parses to exactly the trace doc's `count = 248`, the three
+  buffer prefixes carry `csize₁ = 60`, `csize₂ = 200`,
+  `csize₃ = 39`, and the total footprint
+  `8 + 8 + 60 + 8 + 200 + 8 + 39 = 331` matches the section size
+  on the wire.
+- The spec-type enumeration that the third buffer's `i32`s
+  eventually resolve into is its own fact-table extraction and
+  stays deferred — this primitive lands the framing only.
+
 ## Round 236 scope (USDC §4.5 PATHS section leading prefix)
 
 - **`usdc::PathsHeader` / `usdc::PathsSection`** — the §4.5 PATHS

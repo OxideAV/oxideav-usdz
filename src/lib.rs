@@ -323,6 +323,30 @@
 //!   empty set, and emits empty inner sets between consecutive
 //!   sentinels.
 //!
+//! Round 239 — USDC §4.6 SPECS section three-buffer framing parser:
+//!
+//! * [`usdc::SpecsHeader`] / [`usdc::SpecsSection`] — parse the
+//!   §4.6 SPECS section's outer three-buffer framing: an 8-byte
+//!   little-endian `int64 count` header followed by three
+//!   `(int64 compressedSize, §3a buffer)` triples. The three
+//!   decompressed buffers carry `count × i32` path indices (into
+//!   §4.5 PATHS), `count × i32` field-set indices (into §4.4
+//!   FIELDSETS), and `count × i32` spec-type codes (prim /
+//!   attribute / relationship / …); each row is the join
+//!   `(pathIndex, fieldSetIndex, specType)` so SPECS is the table
+//!   a reader iterates to materialise the stage.
+//!   [`usdc::SpecsSection::paths_buffer`] /
+//!   [`usdc::SpecsSection::fieldsets_buffer`] /
+//!   [`usdc::SpecsSection::types_buffer`] forward to
+//!   [`usdc::CompressedBuffer::parse`] on each bounded buffer
+//!   slice ready for §3a / §3b chained decoding once the LZ4
+//!   block decoder lands. Defensive caps on `count` (16 Mi) and
+//!   on each buffer's `compressedSize` (256 MiB) plus a strict
+//!   `8 + 3*(8 + compressedSize) == section_size` check reject
+//!   trailing bytes the trace doesn't authorise. Cross-validated
+//!   against the Elephant fixture (`count = 248`,
+//!   `compressedSizes = 60 / 200 / 39`, section size = 331).
+//!
 //! Round 222 — USDC §4.3 FIELDS section framing parser:
 //!
 //! * [`usdc::FieldsHeader`] / [`usdc::FieldsSection`] — parse the
@@ -351,15 +375,15 @@
 //!   that feeds bytes into §3b. The remaining primitive needed
 //!   before any index section can be decoded end-to-end.
 //! * **`.usdc` section-payload semantics.** Rounds 212 / 217 / 222 /
-//!   229 land the TOKENS string-atom pool header (§4.1), the
-//!   STRINGS index table (§4.2), the FIELDS two-buffer framing
-//!   (§4.3) and the FIELDSETS single-buffer framing (§4.4). The
-//!   remaining per-section decoders — PATHS namespace tree (§4.5;
-//!   trace doc caveat: a recursive child/sibling jump encoding
-//!   rather than three flat §3b arrays) and SPECS three-buffer
-//!   spec table (§4.6) — stack on top of §3a + §3b without
-//!   re-parsing the bootstrap. The trace doc §4 records the
-//!   per-section header shape for each.
+//!   229 / 236 / 239 land the TOKENS string-atom pool header
+//!   (§4.1), the STRINGS index table (§4.2), the FIELDS two-buffer
+//!   framing (§4.3), the FIELDSETS single-buffer framing (§4.4),
+//!   the PATHS 16-byte leading prefix (§4.5) and the SPECS
+//!   three-buffer framing (§4.6). The remaining payload-semantic
+//!   step is the PATHS namespace tree's compressed-buffer
+//!   decomposition (trace doc caveat: a recursive child/sibling
+//!   jump encoding rather than three flat §3b arrays — see
+//!   #1463) layered on top of §3a + §3b.
 //! * **§3b "common value" fast path.** Round 229's §4.4 framing
 //!   exposes the buffer but the trace doc records that FIELDSETS
 //!   (and PATHS) layer a common-value compression step on top of
