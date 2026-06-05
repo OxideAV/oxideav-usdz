@@ -324,6 +324,31 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   module is required, so this oracle runs anywhere Apple USD Tools /
   the USD CLI binary is installed.
 
+## Round 236 scope (USDC §4.5 PATHS section leading prefix)
+
+- **`usdc::PathsHeader` / `usdc::PathsSection`** — the §4.5 PATHS
+  section's 16-byte leading prefix. Trace doc §4.5 records the
+  section opens with `int64 numPaths` immediately followed by a
+  second `int64` that repeats the same count (both observed as
+  `0xF8` = 248 on the Elephant fixture); the rest of the section
+  carries the namespace path tree as one or more §3a compressed
+  buffers. `PathsHeader::parse` reads the two int64s, enforces the
+  repeat-equals-numPaths invariant the trace doc grounds in the
+  bytes, and applies a defensive cap on `numPaths` (16 Mi) to
+  bound downstream allocation against a hostile header.
+  `PathsSection::parse` surfaces the trailing bytes after the
+  prefix as an opaque `tail_bytes` slice so a future round can
+  layer the compressed-buffer decomposition once the trace doc
+  resolves whether §4.5 carries one §3a buffer or three (the
+  Elephant's 532 trailing bytes do not match the trace's stated
+  single-buffer count — see `CHANGELOG.md` for the open docs
+  question).
+- Cross-validated against the Elephant fixture under
+  `docs/3d/usd/fixtures/`: the TOC's PATHS entry sits at
+  `offset = 0x0cf92b` with `size = 548`, the section parses to
+  exactly the trace doc's `num_paths = 248`, and the trailing
+  opaque region is `548 − 16 = 532` bytes long.
+
 ## Round 229 scope (USDC §4.4 FIELDSETS section framing)
 
 - **`usdc::FieldSetsHeader` / `usdc::FieldSetsSection`** — the §4.4

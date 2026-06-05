@@ -71,6 +71,24 @@
 //!   the LZ4 block decoder and the value-rep type-code enumeration
 //!   are deferred (see the gap tracker's Round B).
 //!
+//! What this module **adds in round 236**:
+//!
+//! * [`PathsHeader`] / [`PathsSection`] — the §4.5 PATHS section's
+//!   16-byte leading prefix: `int64 numPaths` followed by a second
+//!   `int64` that the trace doc grounds as a repeat of `numPaths`
+//!   (both observed at `0x000000F8` = 248 on the Elephant fixture).
+//!   `PathsHeader::parse` reads the two int64s and enforces the
+//!   repeat-equals-numPaths invariant; `PathsSection::parse`
+//!   surfaces the trailing bytes after the prefix as an opaque
+//!   `tail_bytes` slice. The trailing region holds the
+//!   compressed-buffer payload(s) carrying the path-tree (parallel
+//!   path-token / element-token / sibling+child-jump arrays per the
+//!   trace doc) — but the trace doc's "single buffer" claim does
+//!   not exhaust the Elephant's 524 trailing bytes, so the §3a
+//!   envelope is deliberately NOT applied to the tail yet. A future
+//!   round can layer the buffer decomposition once the trace doc
+//!   resolves the buffer count.
+//!
 //! What this module does **not** do (deferred to a follow-up round):
 //!
 //! * LZ4 block decompression of section payloads,
@@ -1478,6 +1496,126 @@ pub fn split_field_sets(values: &[i32]) -> Vec<Vec<i32>> {
     out
 }
 
+/// The 16-byte fixed prefix of the §4.5 PATHS section.
+///
+/// Trace doc §4.5 records the section opens with `int64 numPaths`
+/// immediately followed by a second `int64` that **repeats** the
+/// same count, then a compressed-buffer region holding the namespace
+/// path tree. The header struct here covers exactly the two
+/// `int64`s — i.e. the leading 16 bytes — and enforces the
+/// repeat-equals-numPaths invariant the trace doc grounds in the
+/// Elephant bytes (`f8 00 …` twice in a row at the section start).
+///
+/// On the Elephant fixture this header decodes to `num_paths = 248`,
+/// matching the trace doc's §4.5 worked example.
+///
+/// This is the **leading prefix only.** The trailing bytes (the
+/// section size minus 16) hold one or more §3a compressed buffers
+/// whose precise layout — the trace doc §4.5 hints at parallel
+/// arrays of path-token indices + element-token indices +
+/// sibling/child jump offsets, but its single-buffer claim does not
+/// exhaust the Elephant fixture's 524 remaining bytes — is left as a
+/// docs gap rather than guessed at. Callers receive the trailing
+/// region as an opaque slice via [`PathsSection::tail_bytes`] so a
+/// future round can layer the buffer decomposition on top once the
+/// trace doc is refined; the framing primitive landing here lets the
+/// `num_paths` + repeat consistency check run on real files today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathsHeader {
+    /// Number of paths the namespace tree carries. Both Elephant and
+    /// teapot fixtures publish 248 and a four-digit count
+    /// respectively per the trace doc § 4.5.
+    pub num_paths: u64,
+}
+
+/// Defensive upper bound on the §4.5 PATHS `numPaths`. The Elephant
+/// sample has 248 paths; the cap is several orders of magnitude
+/// above any realistic file so a hostile or corrupted header can't
+/// trigger a runaway allocation downstream when the path tree is
+/// eventually materialised.
+const PATHS_COUNT_CAP: u64 = 16_777_216; // 16 Mi
+
+impl PathsHeader {
+    /// Fixed on-disk size of the leading prefix (two `int64`s).
+    pub const SIZE: usize = 16;
+
+    /// Parse the leading 16 bytes — `int64 numPaths` + repeated
+    /// `int64` count — and require the two int64s match.
+    ///
+    /// Errors:
+    ///
+    /// * [`Error::InvalidData`](crate::Error) if `bytes` is shorter
+    ///   than 16 bytes,
+    /// * [`Error::InvalidData`] if `numPaths` exceeds
+    ///   `PATHS_COUNT_CAP`,
+    /// * [`Error::InvalidData`] if the repeated `int64` does not
+    ///   equal `numPaths` — the trace doc grounds this invariant in
+    ///   the Elephant bytes (both `int64`s read `0x00000000_000000F8`
+    ///   = 248).
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < Self::SIZE {
+            return Err(invalid(format!(
+                "USDC §4.5 PATHS header truncated: need {} bytes, got {}",
+                Self::SIZE,
+                bytes.len()
+            )));
+        }
+        let num_paths = read_u64_le(&bytes[0..8]);
+        if num_paths > PATHS_COUNT_CAP {
+            return Err(invalid(format!(
+                "USDC §4.5 PATHS numPaths {num_paths} exceeds defensive cap {PATHS_COUNT_CAP}",
+            )));
+        }
+        let repeat = read_u64_le(&bytes[8..16]);
+        if repeat != num_paths {
+            return Err(invalid(format!(
+                "USDC §4.5 PATHS repeat-count {repeat} does not match numPaths {num_paths} (trace doc §4.5 records the two int64s are equal on the wire)",
+            )));
+        }
+        Ok(Self { num_paths })
+    }
+}
+
+/// A reference to a `PATHS` section's bytes split into the parsed
+/// 16-byte header plus an opaque trailing slice carrying the
+/// compressed-buffer region whose decomposition is a docs gap.
+///
+/// Use [`PathsSection::tail_bytes`] to obtain the trailing slice.
+/// The trailing slice is exactly `section.len() - PathsHeader::SIZE`
+/// bytes long; the §3a [`CompressedBuffer::parse`] envelope cannot
+/// safely be applied to it until the buffer-count question is
+/// resolved.
+#[derive(Debug, Clone)]
+pub struct PathsSection<'a> {
+    /// Parsed 16-byte header (numPaths plus enforced repeat).
+    pub header: PathsHeader,
+    /// Trailing bytes of the section (everything after the 16-byte
+    /// header). Holds one or more §3a compressed buffers whose
+    /// precise count + per-buffer semantics the trace doc does not
+    /// yet bottom out for §4.5.
+    pub tail_bytes: &'a [u8],
+}
+
+impl<'a> PathsSection<'a> {
+    /// Parse a complete `PATHS` section image. `section` is the
+    /// payload bytes addressed by the TOC's `(offset, size)` pair
+    /// for the section.
+    ///
+    /// Errors propagate from [`PathsHeader::parse`].
+    pub fn parse(section: &'a [u8]) -> Result<Self> {
+        let header = PathsHeader::parse(section)?;
+        let tail_bytes = &section[PathsHeader::SIZE..];
+        Ok(Self { header, tail_bytes })
+    }
+
+    /// The trailing bytes after the 16-byte header. Opaque until the
+    /// compressed-buffer layout for §4.5 is grounded in the trace
+    /// doc — see the module docs for the docs gap.
+    pub fn tail_bytes(&self) -> &'a [u8] {
+        self.tail_bytes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2817,5 +2955,135 @@ mod tests {
             !buf.chunks.is_empty(),
             "every §3a buffer has at least one chunk"
         );
+    }
+
+    // === §4.5 PATHS header + section ===
+
+    #[test]
+    fn paths_header_parses_elephant_num_paths() {
+        // Trace doc §4.5 grounds the Elephant numbers as the leading
+        // two int64s reading 0x00000000_000000F8 (= 248) each.
+        let mut bytes = Vec::with_capacity(16);
+        bytes.extend_from_slice(&248u64.to_le_bytes());
+        bytes.extend_from_slice(&248u64.to_le_bytes());
+        let h = PathsHeader::parse(&bytes).expect("parse header");
+        assert_eq!(h.num_paths, 248);
+        assert_eq!(PathsHeader::SIZE, 16);
+    }
+
+    #[test]
+    fn paths_header_rejects_truncated_buffer() {
+        let err = PathsHeader::parse(&[0u8; 15]).expect_err("short header must fail");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("PATHS") && msg.contains("truncated"), "{msg}");
+    }
+
+    #[test]
+    fn paths_header_rejects_oversized_count() {
+        let mut bytes = Vec::with_capacity(16);
+        let oversized = PATHS_COUNT_CAP + 1;
+        bytes.extend_from_slice(&oversized.to_le_bytes());
+        bytes.extend_from_slice(&oversized.to_le_bytes());
+        let err = PathsHeader::parse(&bytes).expect_err("over-cap must fail");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("PATHS") && msg.contains("cap"), "{msg}");
+    }
+
+    #[test]
+    fn paths_header_rejects_repeat_mismatch() {
+        // The trace doc §4.5 explicitly anchors the repeat-equals-
+        // numPaths invariant; deliberately mis-author the second
+        // int64 and confirm the parser rejects it.
+        let mut bytes = Vec::with_capacity(16);
+        bytes.extend_from_slice(&248u64.to_le_bytes());
+        bytes.extend_from_slice(&247u64.to_le_bytes());
+        let err = PathsHeader::parse(&bytes).expect_err("repeat mismatch must fail");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("PATHS") && msg.contains("repeat"), "{msg}");
+    }
+
+    #[test]
+    fn paths_section_parses_elephant_shape() {
+        // Synthesise the Elephant's section size: 16-byte header +
+        // 532 trailing bytes = 548 bytes total (matching the trace
+        // doc §2 TOC entry). We do NOT interpret the trailing bytes
+        // here — the §4.5 trace doc's single-buffer claim does not
+        // exhaust those 532 bytes and the trailing layout is a
+        // docs gap.
+        let mut section = Vec::with_capacity(548);
+        section.extend_from_slice(&248u64.to_le_bytes());
+        section.extend_from_slice(&248u64.to_le_bytes());
+        section.resize(548, 0x77);
+        assert_eq!(section.len(), 548);
+        let sec = PathsSection::parse(&section).expect("parse section");
+        assert_eq!(sec.header.num_paths, 248);
+        assert_eq!(sec.tail_bytes.len(), 548 - 16);
+        assert_eq!(sec.tail_bytes(), &section[16..]);
+    }
+
+    #[test]
+    fn paths_section_parses_zero_count_minimal() {
+        // Synthetic minimum that still satisfies the repeat
+        // invariant: numPaths = 0 = repeat-count, no trailing bytes.
+        // The section is exactly 16 bytes long.
+        let mut section = Vec::with_capacity(16);
+        section.extend_from_slice(&0u64.to_le_bytes());
+        section.extend_from_slice(&0u64.to_le_bytes());
+        let sec = PathsSection::parse(&section).expect("parse zero-count");
+        assert_eq!(sec.header.num_paths, 0);
+        assert!(sec.tail_bytes.is_empty());
+    }
+
+    #[test]
+    fn paths_section_header_truncation_propagates() {
+        // Section shorter than even the 16-byte header — the
+        // PathsHeader::parse error must propagate through
+        // PathsSection::parse.
+        let err = PathsSection::parse(&[0u8; 8]).expect_err("short section must fail");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("PATHS") && msg.contains("truncated"), "{msg}");
+    }
+
+    #[test]
+    fn paths_section_propagates_repeat_mismatch() {
+        // The repeat-mismatch invariant flows through PathsSection::parse.
+        let mut section = Vec::with_capacity(16);
+        section.extend_from_slice(&5u64.to_le_bytes());
+        section.extend_from_slice(&6u64.to_le_bytes());
+        let err = PathsSection::parse(&section).expect_err("mismatch must fail");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("PATHS") && msg.contains("repeat"), "{msg}");
+    }
+
+    #[test]
+    fn real_fixture_paths_section_parses() {
+        // Cross-validate against the trace doc's §4.5 Elephant facts:
+        // PATHS offset = 0x0cf92b, size = 548. The §4.5 worked
+        // example documents num_paths = 248 and a leading repeat
+        // count that equals num_paths.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/3d/usd/fixtures/SoC-ElephantWithMonochord.usdc");
+        if !fixture.exists() {
+            eprintln!("skip: fixture {fixture:?} not present");
+            return;
+        }
+        let bytes = std::fs::read(&fixture).expect("read fixture");
+        let file = UsdcFile::parse(&bytes).expect("parse Elephant USDC");
+        let entry = file
+            .toc
+            .find(SectionName::Paths)
+            .expect("PATHS section present");
+        // Trace doc §2 TOC: PATHS offset = 0x0cf92b, size = 548.
+        assert_eq!(entry.offset, 0x0cf92b, "trace doc §2 PATHS offset");
+        assert_eq!(entry.size, 548, "trace doc §2 PATHS size");
+        let off = entry.offset as usize;
+        let sz = entry.size as usize;
+        let section = &bytes[off..off + sz];
+        let sec = PathsSection::parse(section).expect("parse PATHS section");
+        assert_eq!(sec.header.num_paths, 248, "trace doc §4.5 numPaths");
+        // tail_bytes carries everything after the 16-byte header.
+        assert_eq!(sec.tail_bytes.len(), 548 - 16);
+        // The bytes are a borrow into the input section.
+        assert_eq!(sec.tail_bytes.as_ptr(), section[16..].as_ptr());
     }
 }

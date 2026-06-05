@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 236 (USDC §4.5 PATHS section leading-prefix framing)
+
+- **`usdc::PathsHeader` / `usdc::PathsSection`** — the §4.5 PATHS
+  section's 16-byte leading prefix. Trace doc §4.5 records the
+  section opens with `int64 numPaths` immediately followed by a
+  second `int64` that repeats the same count (both observed as
+  `0x000000F8` = 248 on the Elephant fixture); the rest of the
+  section holds the namespace path tree as one or more §3a
+  compressed buffers. `PathsHeader::parse` reads the two int64s,
+  enforces the repeat-equals-numPaths invariant the trace doc
+  grounds in the bytes, and applies a defensive cap on `numPaths`
+  (16 Mi — several orders of magnitude above the Elephant's 248)
+  to bound downstream allocation against a hostile or corrupted
+  header. `PathsSection::parse` surfaces the trailing region after
+  the 16-byte prefix as an opaque `tail_bytes` slice through
+  [`PathsSection::tail_bytes`] so a future round can layer the
+  compressed-buffer decomposition on top once the trace doc
+  resolves the buffer-count question (see the docs-gap note
+  below). Sourced exclusively from
+  `docs/3d/usd/usdc-crate-format-trace.md` §4.5 (header layout +
+  Elephant `numPaths = 248`) and §2 (TOC entry `offset =
+  0x0cf92b`, `size = 548`).
+- **8 new unit tests** in `usdc::tests` cover §4.5 header parsing
+  on the Elephant `num_paths = 248` worked example with the
+  matching repeat int64, the short-buffer error path, the
+  oversized-numPaths rejection against the defensive cap, a
+  deliberate repeat-mismatch (numPaths = 248 / repeat = 247) that
+  exercises the trace doc's invariant, the synthesised Elephant-
+  shape section (16-byte header + 532 opaque trailing bytes = 548
+  total), the zero-count minimal section, header-truncation
+  propagation through `PathsSection::parse`, and repeat-mismatch
+  propagation through `PathsSection::parse`.
+- **Real-fixture cross-validation** —
+  `real_fixture_paths_section_parses` reads
+  `docs/3d/usd/fixtures/SoC-ElephantWithMonochord.usdc` through
+  `UsdcFile::parse`, finds the PATHS TOC entry (offset
+  `0x0cf92b`, size `548`), parses the section, and asserts the
+  trace doc's published numbers verbatim — `num_paths = 248`,
+  trailing byte count = `548 - 16 = 532`, plus a borrow-identity
+  check that `tail_bytes` is a sub-slice of the input section.
+  Skips silently when the fixture is absent so CI remains green
+  in submodule-less checkouts.
+
+### Docs gap
+
+- **PATHS section trailing-buffer count is undetermined.** The
+  trace doc §4.5 narrative records "one compressed buffer" after
+  the 16-byte header, but the Elephant fixture's 532 trailing
+  bytes do not match a single `(int64 compressedSize, body)` pair
+  whose `compressedSize` reads `266` at offset `+16` (`24 + 266 =
+  290` consumed, well short of `548`). An empirical scan of the
+  trailing bytes finds two further `(int64 size, body)` framings
+  at the expected boundaries that together close the section,
+  consistent with the three-buffer pattern the trace doc records
+  for §4.6 SPECS (path indices, element-token indices,
+  sibling/child jump offsets — the three parallel arrays
+  referenced in the §4.5 narrative). The framing landing in this
+  round therefore stops at the 16-byte leading prefix; the §3a
+  envelope is NOT applied to `tail_bytes` until the trace doc
+  reconciles the buffer-count claim with the bytes. Recommended
+  trace-doc patch: change §4.5 to record "three §3a compressed
+  buffers" (mirroring §4.6's table form) so a follow-up round
+  can layer `(buffer, header.num_paths)` decompression + §3b
+  decoding on the three arrays.
+
 ### Added — Round 229 (USDC §4.4 FIELDSETS section framing + sentinel-split helper)
 
 - **`usdc::FieldSetsHeader` / `usdc::FieldSetsSection`** — the §4.4
