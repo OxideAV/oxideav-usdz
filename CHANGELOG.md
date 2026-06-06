@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/OxideAV/oxideav-usdz/compare/v0.0.2...v0.0.3) - 2026-06-06
+
+### Other
+
+- Round 242: USDC TOC inter-section non-overlap invariant
+- Round 239: USDC §4.6 SPECS section three-buffer framing parser
+- Round 236: USDC §4.5 PATHS section leading-prefix parser
+- replace possessive vendor references with neutral language
+- Round 229: USDC §4.4 FIELDSETS section framing parser
+- Round 222: USDC §4.3 FIELDS section framing parser
+- Round 217: USDC §4.2 STRINGS section parser
+- Round 212: USDC §3a compressed-buffer framing + §4.1 TOKENS section header
+- Round 206: USDC §3b compressed-integer decoder
+- Round 15: USDC binary-format primitives — bootstrap + Table of Contents
+
 ### Added — Round 242 (USDC TOC inter-section non-overlap invariant)
 
 - **`Toc::parse` now enforces inter-section non-overlap.** Trace
