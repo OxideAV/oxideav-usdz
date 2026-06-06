@@ -200,6 +200,50 @@ fn binary_usdc_real_fixture_reports_trace_doc_facts() {
         "TOC offset from trace doc §1"
     );
 
+    // Trace doc §1+§2 invariant: the six TOC sections chain
+    // end-to-start without overlap (each section's `offset` equals
+    // the previous section's `offset + size`); the chain runs from
+    // the first section's start through to `bootstrap.toc_offset`.
+    // `Toc::parse` runs the inter-section overlap gate, so a
+    // successful parse already witnesses that they don't overlap;
+    // here we also assert the trace doc's stronger "back-to-back,
+    // zero gap" observation across the six TOC-declared sections.
+    //
+    // Note the chain does NOT start at `BOOTSTRAP_SIZE = 88`:
+    // bytes `[88, file.toc.entries[0].offset)` carry the value-blob
+    // region (per the trace doc §3+§4.3 reps' inline-or-offset
+    // model) that the TOC does not cover.
+    let entries = &file.toc.entries;
+    for window in entries.windows(2) {
+        assert_eq!(
+            window[0].offset + window[0].size,
+            window[1].offset,
+            "trace doc §2 records sections chain end-to-start; \
+             {} (offset 0x{:x} size {}) should hand off to {} (offset 0x{:x})",
+            window[0].name,
+            window[0].offset,
+            window[0].size,
+            window[1].name,
+            window[1].offset,
+        );
+    }
+    let last = entries.last().expect("six sections per trace doc §2");
+    assert_eq!(
+        last.offset + last.size,
+        file.bootstrap.toc_offset,
+        "trace doc §1 records the TOC is tail-written immediately \
+         after the last section payload"
+    );
+    // Spot-check the exact offsets from the trace doc table.
+    assert_eq!(
+        entries[0].offset, 0x000c_ebf0,
+        "TOKENS offset @ trace doc §2"
+    );
+    assert_eq!(
+        entries[5].offset, 0x000c_fb4f,
+        "SPECS offset @ trace doc §2"
+    );
+
     // End-to-end through the USDZ decoder — should surface
     // Unsupported with the parsed facts in the message.
     let usdz = common::build_usdz(&[common::UsdzEntry {

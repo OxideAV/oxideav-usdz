@@ -324,6 +324,40 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   module is required, so this oracle runs anywhere Apple USD Tools /
   the USD CLI binary is installed.
 
+## Round 242 scope (USDC TOC inter-section non-overlap invariant)
+
+- **`usdc::Toc::parse` now enforces inter-section non-overlap.**
+  Trace doc §1 records the writer's tail-TOC property (every
+  section payload is appended in one pass and the TOC is written
+  last); §2's worked example on the Elephant fixture lays the six
+  declared `(offset, size)` regions out as a non-overlapping
+  partition of the file's payload area `[BOOTSTRAP_SIZE,
+  bootstrap.toc_offset)`. Before this round `Toc::parse` only
+  validated each entry's bounds individually (start ≥
+  `BOOTSTRAP_SIZE`, end ≤ `bootstrap.toc_offset`, end ≤ file
+  size), so two TOC records could declare overlapping byte ranges
+  and reach the caller. This round adds a final
+  `check_toc_non_overlap` pass that sorts the entries by offset
+  in `O(n log n)` (the section-count cap bounds the sort) and
+  walks adjacent pairs for `next.offset < cur.offset + cur.size`;
+  when an overlap is detected the error message names both
+  records by index + name, both regions' `0x…..0x…` byte ranges,
+  and the shared `0x…..0x…` byte range. Gaps between sections are
+  tolerated — the trace doc records the writer's observed
+  behaviour rather than the reader's constraint, so future
+  writers padding for alignment will still parse — and
+  out-of-declaration-order TOC records validate when their
+  regions don't overlap (the trace doc constrains region
+  disjointness, not record order).
+- Cross-validated against the Elephant fixture under
+  `docs/3d/usd/fixtures/`: the six TOC sections chain end-to-start
+  (each section i+1's offset equals section i's
+  `offset + size`); the last section's end equals
+  `bootstrap.toc_offset`; TOKENS sits at `0x000c_ebf0` and SPECS
+  at `0x000c_fb4f` per trace doc §2. The test asserts
+  the trace doc's stronger zero-gap observation across all six TOC
+  sections rather than relying on the parse's tolerance.
+
 ## Round 239 scope (USDC §4.6 SPECS section three-buffer framing)
 
 - **`usdc::SpecsHeader` / `usdc::SpecsSection`** — the §4.6 SPECS

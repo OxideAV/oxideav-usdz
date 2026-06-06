@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 242 (USDC TOC inter-section non-overlap invariant)
+
+- **`Toc::parse` now enforces inter-section non-overlap.** Trace
+  doc §1 records the writer's "tail-TOC" property — every section
+  payload is appended in one pass and the TOC is written last —
+  and §2's worked example on the Elephant fixture lays the six
+  declared `(offset, size)` regions out as a non-overlapping
+  partition of the file's payload area `[BOOTSTRAP_SIZE,
+  bootstrap.toc_offset)`. Before this round `Toc::parse` only
+  validated each entry's bounds individually (start ≥
+  `BOOTSTRAP_SIZE`, end ≤ `bootstrap.toc_offset`, end ≤
+  file size), so two TOC records could declare overlapping byte
+  ranges and reach the caller. This round adds a final
+  `check_toc_non_overlap` pass that sorts the entries by offset
+  in `O(n log n)` (the section-count cap bounds the sort) and
+  walks adjacent pairs for `next.offset < cur.offset + cur.size`
+  — when an overlap is detected the error message names both
+  records by index + name, both regions' `0x…..0x…` byte ranges,
+  and the shared `0x…..0x…` byte range, so the failure precisely
+  diagnoses the wire violation. Gaps between sections are
+  tolerated — the trace doc records the writer's observed
+  behaviour rather than the reader's constraint, so future
+  writers padding for alignment will still parse — and
+  out-of-declaration-order TOC records validate when their
+  regions don't overlap (the trace doc constrains region
+  disjointness, not record order).
+- **7 new unit tests** in `usdc::tests` cover the new gate:
+  `toc_rejects_two_sections_sharing_same_offset` and
+  `toc_rejects_first_section_running_into_second` confirm
+  both overlap shapes are rejected with messages that name
+  both records; `toc_tolerates_inter_section_gap` and
+  `toc_tolerates_records_listed_out_of_offset_order` lock in
+  the explicit non-rejections; `toc_accepts_trace_doc_six_section_layout`
+  is the regression guard on the trace doc's §2 Elephant-shape
+  worked example with adjacent-pair end-to-start chaining;
+  `toc_overlap_check_noop_on_empty` and
+  `toc_overlap_check_noop_on_single_record` guard the degenerate
+  cases. The integration test `binary_usdc_real_fixture_reports_trace_doc_facts`
+  in `tests/usdc_unsupported.rs` now also asserts the trace doc's
+  end-to-start adjacency invariant against the in-tree Elephant
+  fixture (each section i+1's offset equals section i's
+  `offset + size`; the last section's end equals
+  `bootstrap.toc_offset`), plus spot-checks the trace doc's
+  TOKENS `0x000c_ebf0` and SPECS `0x000c_fb4f` offsets.
+- Sourced exclusively from `docs/3d/usd/usdc-crate-format-trace.md`
+  §1 (tail-TOC + bootstrap header) and §2 (the Elephant section
+  table's non-overlapping `(offset, size)` rows). No external
+  source, openusd.org docs, or web material consulted.
+
 ### Added — Round 239 (USDC §4.6 SPECS section three-buffer framing)
 
 - **`usdc::SpecsHeader` / `usdc::SpecsSection`** — the §4.6 SPECS

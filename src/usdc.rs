@@ -465,6 +465,14 @@ impl Toc {
             }
             entries.push(TocEntry { name, offset, size });
         }
+        // Trace doc §1+§2: the writer appends every section payload
+        // back-to-back in one pass and then writes the TOC last, so
+        // the declared `(offset, size)` regions partition the file's
+        // payload area without overlapping. The individual-bounds
+        // check above already establishes each section lives in
+        // `[BOOTSTRAP_SIZE, bootstrap.toc_offset)`; this final pass
+        // confirms no two declared regions share any byte.
+        check_toc_non_overlap(&entries)?;
         Ok(Self { entries })
     }
 
@@ -473,6 +481,67 @@ impl Toc {
     pub fn find(&self, name: SectionName) -> Option<&TocEntry> {
         self.entries.iter().find(|e| e.section_name() == Some(name))
     }
+}
+
+/// Confirm no two TOC-declared section regions share any byte.
+///
+/// Trace doc §1 records that the writer appends every section
+/// payload back-to-back in one pass and writes the TOC last (the
+/// "tail TOC" property), so the declared `(offset, size)` regions
+/// partition the file's payload area `[BOOTSTRAP_SIZE,
+/// bootstrap.toc_offset)` without overlapping. The trace doc's §2
+/// worked example on the Elephant fixture makes this exhaustively
+/// observable — the six sections' `(offset, size)` rows chain end
+/// to start, the last section's end equals `bootstrap.toc_offset`,
+/// and no two regions share any byte.
+///
+/// A naive byte-loop overlap check would be `O(n²)` in the section
+/// count; the cap (`TOC_SECTION_CAP = 4096`) keeps that bounded but
+/// we still sort indices by `offset` so the scan is `O(n log n)`.
+/// Equal-`offset` entries are caught by the strict-inequality check
+/// in the merged sweep (two records starting at the same byte cannot
+/// both be zero-length and non-overlapping).
+///
+/// The check tolerates **gaps** (one section ending before the
+/// next begins) — the trace doc's Elephant fixture has zero gap
+/// bytes, but the trace doc records the writer's behaviour rather
+/// than the reader's constraint, so leaving room for a future
+/// writer to insert padding bytes between sections (e.g. for an
+/// alignment requirement we have no observed precedent for) keeps
+/// this gate from rejecting files we have no reason to reject.
+/// Detected overlaps name the two TOC records by index and the
+/// shared byte range so the failure diagnoses the precise wire
+/// violation.
+fn check_toc_non_overlap(entries: &[TocEntry]) -> Result<()> {
+    if entries.len() < 2 {
+        return Ok(());
+    }
+    // Sort indices by section offset so adjacent records in the
+    // sorted view share an interface boundary; an overlap shows up
+    // as `next.offset < cur.offset + cur.size`.
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_by_key(|&i| entries[i].offset);
+    for window in order.windows(2) {
+        let lo = window[0];
+        let hi = window[1];
+        let lo_end = entries[lo].offset.saturating_add(entries[lo].size);
+        if entries[hi].offset < lo_end {
+            // The two records share bytes
+            // `[entries[hi].offset, min(lo_end, hi_end))`.
+            let hi_end = entries[hi].offset.saturating_add(entries[hi].size);
+            let shared_end = lo_end.min(hi_end);
+            return Err(invalid(format!(
+                "USDC TOC records {lo} (name '{lo_name}') and {hi} (name '{hi_name}') overlap: \
+                 first occupies 0x{lo_start:x}..0x{lo_end:x}, second occupies 0x{hi_start:x}..0x{hi_end:x}, \
+                 shared bytes 0x{hi_start:x}..0x{shared_end:x}",
+                lo_name = entries[lo].name,
+                hi_name = entries[hi].name,
+                lo_start = entries[lo].offset,
+                hi_start = entries[hi].offset,
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Public convenience — `parse(bytes)` returns both the bootstrap
@@ -2055,6 +2124,196 @@ mod tests {
             assert_eq!(SectionName::from_bytes(v.as_bytes()), Some(v));
         }
         assert_eq!(SectionName::from_bytes(b"OTHER"), None);
+    }
+
+    /// Trace doc §1+§2 invariant: the writer appends every section
+    /// payload back-to-back in one pass and writes the TOC last, so
+    /// the declared `(offset, size)` regions partition the file's
+    /// payload area without overlapping. Build a synthetic file
+    /// whose TOC declares two sections sharing the same byte range
+    /// and confirm `Toc::parse` rejects it before the entries reach
+    /// the caller.
+    #[test]
+    fn toc_rejects_two_sections_sharing_same_offset() {
+        // Two TOKENS-named records both addressing the single 16-byte
+        // payload — the first 8 bytes are TOKENS, the second 8 STRINGS
+        // overlapping bytes 0..8 of TOKENS.
+        let mut bytes = synthetic_usdc(Version::V0_8_0, &[(b"TOKENS", &[0; 16])]);
+        let toc_offset = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
+        // Bump the section count from 1 to 2 and append a STRINGS
+        // record pointing at the same payload offset as TOKENS.
+        bytes[toc_offset..toc_offset + 8].copy_from_slice(&2u64.to_le_bytes());
+        // Append the second TOC record (16-byte padded name + offset + size).
+        let mut second = [0u8; TOC_RECORD_SIZE];
+        second[..7].copy_from_slice(b"STRINGS");
+        // Offset = BOOTSTRAP_SIZE (same as the first record's TOKENS)
+        second[16..24].copy_from_slice(&(BOOTSTRAP_SIZE as u64).to_le_bytes());
+        // Size = 8 (fits inside the 16-byte TOKENS region)
+        second[24..32].copy_from_slice(&8u64.to_le_bytes());
+        // Insert it right before the existing TOC record (between
+        // count and TOKENS) so the records are contiguous, then put
+        // the original TOKENS record after it.
+        let insert_at = toc_offset + 8;
+        bytes.splice(insert_at..insert_at, second.iter().copied());
+        let err = UsdcFile::parse(&bytes).expect_err("overlapping sections must error");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("overlap"), "{msg}");
+        assert!(msg.contains("TOKENS") || msg.contains("STRINGS"), "{msg}");
+    }
+
+    /// Trace doc §1+§2 invariant: when two sections start at
+    /// adjacent offsets but the first one's declared size runs past
+    /// the second's start, the TOC parser surfaces the overlap and
+    /// names both records.
+    #[test]
+    fn toc_rejects_first_section_running_into_second() {
+        // Two sections back-to-back (TOKENS @88 size 16, STRINGS
+        // @104 size 8). Bump TOKENS' declared size to 32 so it
+        // extends 16 bytes past STRINGS' start.
+        let bytes_orig = synthetic_usdc(
+            Version::V0_8_0,
+            &[(b"TOKENS", &[1; 16]), (b"STRINGS", &[2; 8])],
+        );
+        let mut bytes = bytes_orig.clone();
+        let toc_offset = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
+        // First record's size field is at toc_offset + 8 + 24.
+        let size_off = toc_offset + 8 + 24;
+        bytes[size_off..size_off + 8].copy_from_slice(&32u64.to_le_bytes());
+        let err = UsdcFile::parse(&bytes).expect_err("oversized TOKENS must overlap STRINGS");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("overlap"), "{msg}");
+        // Confirm the original (non-overlapping) file parses cleanly
+        // as a control — the overlap is the only thing rejected.
+        let ok = UsdcFile::parse(&bytes_orig).expect("clean back-to-back file should parse");
+        assert_eq!(ok.toc.entries.len(), 2);
+    }
+
+    /// Gaps between sections are tolerated — the trace doc records
+    /// the writer's observed behaviour (zero gap bytes on the
+    /// Elephant fixture), not a reader constraint. A future writer
+    /// might pad for alignment; the overlap check must not reject
+    /// those.
+    #[test]
+    fn toc_tolerates_inter_section_gap() {
+        // Two sections with 8 bytes of gap between them. The
+        // `synthetic_usdc` helper packs payloads back-to-back, so
+        // hand-build the file: TOKENS @88 size 16, gap @104..112,
+        // STRINGS @112 size 8.
+        let mut buf = vec![0u8; BOOTSTRAP_SIZE];
+        buf[0..8].copy_from_slice(MAGIC);
+        buf[8] = 0;
+        buf[9] = 8;
+        buf[10] = 0;
+        // TOKENS payload
+        buf.extend_from_slice(&[1u8; 16]);
+        // Gap of 8 NUL bytes
+        buf.extend_from_slice(&[0u8; 8]);
+        // STRINGS payload
+        buf.extend_from_slice(&[2u8; 8]);
+        let toc_offset = buf.len() as u64;
+        buf[16..24].copy_from_slice(&toc_offset.to_le_bytes());
+        buf.extend_from_slice(&2u64.to_le_bytes());
+        // TOKENS record
+        let mut rec = vec![0u8; TOC_RECORD_SIZE];
+        rec[..6].copy_from_slice(b"TOKENS");
+        rec[16..24].copy_from_slice(&(BOOTSTRAP_SIZE as u64).to_le_bytes());
+        rec[24..32].copy_from_slice(&16u64.to_le_bytes());
+        buf.extend_from_slice(&rec);
+        // STRINGS record (offset = BOOTSTRAP_SIZE + 16 + 8 = 112)
+        let mut rec2 = vec![0u8; TOC_RECORD_SIZE];
+        rec2[..7].copy_from_slice(b"STRINGS");
+        rec2[16..24].copy_from_slice(&((BOOTSTRAP_SIZE + 24) as u64).to_le_bytes());
+        rec2[24..32].copy_from_slice(&8u64.to_le_bytes());
+        buf.extend_from_slice(&rec2);
+        let file = UsdcFile::parse(&buf).expect("gapped sections should parse");
+        assert_eq!(file.toc.entries.len(), 2);
+        assert_eq!(file.toc.entries[0].offset, BOOTSTRAP_SIZE as u64);
+        assert_eq!(file.toc.entries[1].offset, (BOOTSTRAP_SIZE + 24) as u64);
+    }
+
+    /// Out-of-declaration-order TOC records (e.g. STRINGS listed
+    /// before TOKENS even though STRINGS lives later in the file)
+    /// still validate when the regions don't overlap — the trace
+    /// doc constrains region disjointness, not the TOC's record
+    /// order.
+    #[test]
+    fn toc_tolerates_records_listed_out_of_offset_order() {
+        // Build a file with TOKENS @88 size 8, STRINGS @96 size 8,
+        // but list STRINGS first in the TOC.
+        let mut buf = vec![0u8; BOOTSTRAP_SIZE];
+        buf[0..8].copy_from_slice(MAGIC);
+        buf[9] = 8;
+        buf.extend_from_slice(&[1u8; 8]); // TOKENS payload @88..96
+        buf.extend_from_slice(&[2u8; 8]); // STRINGS payload @96..104
+        let toc_offset = buf.len() as u64;
+        buf[16..24].copy_from_slice(&toc_offset.to_le_bytes());
+        buf.extend_from_slice(&2u64.to_le_bytes());
+        // Record 0: STRINGS @96 (out-of-file-order on purpose)
+        let mut rec0 = vec![0u8; TOC_RECORD_SIZE];
+        rec0[..7].copy_from_slice(b"STRINGS");
+        rec0[16..24].copy_from_slice(&((BOOTSTRAP_SIZE + 8) as u64).to_le_bytes());
+        rec0[24..32].copy_from_slice(&8u64.to_le_bytes());
+        buf.extend_from_slice(&rec0);
+        // Record 1: TOKENS @88
+        let mut rec1 = vec![0u8; TOC_RECORD_SIZE];
+        rec1[..6].copy_from_slice(b"TOKENS");
+        rec1[16..24].copy_from_slice(&(BOOTSTRAP_SIZE as u64).to_le_bytes());
+        rec1[24..32].copy_from_slice(&8u64.to_le_bytes());
+        buf.extend_from_slice(&rec1);
+        let file = UsdcFile::parse(&buf).expect("out-of-order TOC records should parse");
+        assert_eq!(file.toc.entries[0].name, "STRINGS");
+        assert_eq!(file.toc.entries[1].name, "TOKENS");
+    }
+
+    /// The synthetic six-section file mirrors the Elephant fixture
+    /// — sections chain end-to-start with zero gap bytes — so
+    /// the overlap check must accept it. This is the regression
+    /// guard for the trace doc's §2 worked example.
+    #[test]
+    fn toc_accepts_trace_doc_six_section_layout() {
+        let bytes = synthetic_usdc(
+            Version::V0_8_0,
+            &[
+                (b"TOKENS", &[1; 1770]),
+                (b"STRINGS", &[2; 8]),
+                (b"FIELDS", &[3; 998]),
+                (b"FIELDSETS", &[4; 611]),
+                (b"PATHS", &[5; 548]),
+                (b"SPECS", &[6; 331]),
+            ],
+        );
+        let file = UsdcFile::parse(&bytes).expect("contiguous six-section file should parse");
+        // Sanity: every consecutive pair satisfies offset+size == next.offset
+        for window in file.toc.entries.windows(2) {
+            assert_eq!(
+                window[0].offset + window[0].size,
+                window[1].offset,
+                "trace doc §2 records contiguous sections — {:?} → {:?}",
+                window[0].name,
+                window[1].name,
+            );
+        }
+    }
+
+    /// Empty TOCs (`sectionCount == 0`) trivially satisfy the
+    /// invariant and must continue to parse. The overlap pass
+    /// degenerates to a no-op when there are fewer than two
+    /// records.
+    #[test]
+    fn toc_overlap_check_noop_on_empty() {
+        let bytes = synthetic_usdc(Version::V0_8_0, &[]);
+        let file = UsdcFile::parse(&bytes).expect("empty TOC should parse");
+        assert!(file.toc.entries.is_empty());
+    }
+
+    /// Single-record TOCs trivially satisfy the invariant — the
+    /// overlap pass needs at least two records to fire.
+    #[test]
+    fn toc_overlap_check_noop_on_single_record() {
+        let bytes = synthetic_usdc(Version::V0_8_0, &[(b"TOKENS", &[0; 32])]);
+        let file = UsdcFile::parse(&bytes).expect("single-record TOC should parse");
+        assert_eq!(file.toc.entries.len(), 1);
+        assert_eq!(file.toc.entries[0].size, 32);
     }
 
     // ----- §3b integer-coding tests -----
