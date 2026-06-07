@@ -89,6 +89,29 @@
 //!   round can layer the buffer decomposition once the trace doc
 //!   resolves the buffer count.
 //!
+//! What this module **adds in round 245**:
+//!
+//! * [`SectionName::ALL_STANDARD`] — the canonical six standard
+//!   section names in trace doc §2's observed declaration order
+//!   (`TOKENS`, `STRINGS`, `FIELDS`, `FIELDSETS`, `PATHS`, `SPECS`).
+//!   The trace doc grounds this ordering in two independent real
+//!   samples ("the six names appear in this same order in the
+//!   teapot too"). Companion [`SectionName::canonical_index`] gives
+//!   each variant its zero-based position in that sequence.
+//! * [`TocEntry::slice_in`] — borrow a TOC entry's payload bytes
+//!   from a full USDC file slice. The `(offset, size)` were
+//!   bounds-checked by [`Toc::parse`] at parse time, so this is a
+//!   clean slice into the original input.
+//! * [`Toc::matches_canonical_order`] — fast-path predicate: does
+//!   the TOC carry the six standard sections in the canonical order
+//!   the trace doc records? When `true`, a reader can address each
+//!   standard section by its canonical index into [`Toc::entries`]
+//!   without re-running [`Toc::find`] per access.
+//! * [`UsdcFile::section_bytes`] — single-call convenience that
+//!   composes [`Toc::find`] + [`TocEntry::slice_in`] so callers can
+//!   pull any standard section's bytes out of a parsed file in one
+//!   step.
+//!
 //! What this module **adds in round 239**:
 //!
 //! * [`SpecsHeader`] / [`SpecsSection`] — the §4.6 SPECS section's
@@ -316,6 +339,26 @@ pub enum SectionName {
 }
 
 impl SectionName {
+    /// The canonical six standard section names in the order trace
+    /// doc §2 records them appearing in every observed sample.
+    ///
+    /// Per the trace doc:
+    ///
+    /// > The six names appear in this same order in the teapot too.
+    ///
+    /// — i.e. both Elephant and teapot real `.usdc` v0.8.0 files
+    /// emit the six standard sections in exactly this ordering. A
+    /// caller iterating standard sections in a known order can use
+    /// this slice rather than spelling each variant out.
+    pub const ALL_STANDARD: [SectionName; 6] = [
+        SectionName::Tokens,
+        SectionName::Strings,
+        SectionName::Fields,
+        SectionName::FieldSets,
+        SectionName::Paths,
+        SectionName::Specs,
+    ];
+
     /// On-disk byte representation of the name (without the
     /// NUL-padding that brings it up to 16 bytes).
     pub const fn as_bytes(self) -> &'static [u8] {
@@ -341,6 +384,24 @@ impl SectionName {
             b"SPECS" => SectionName::Specs,
             _ => return None,
         })
+    }
+
+    /// Position of `self` within [`Self::ALL_STANDARD`].
+    ///
+    /// Returns the zero-based index — `Tokens` → 0, `Strings` → 1,
+    /// `Fields` → 2, `FieldSets` → 3, `Paths` → 4, `Specs` → 5.
+    /// Total ordering on the trace doc's documented section
+    /// ordering, useful for sorting an out-of-order TOC view into
+    /// the canonical sequence.
+    pub const fn canonical_index(self) -> usize {
+        match self {
+            SectionName::Tokens => 0,
+            SectionName::Strings => 1,
+            SectionName::Fields => 2,
+            SectionName::FieldSets => 3,
+            SectionName::Paths => 4,
+            SectionName::Specs => 5,
+        }
     }
 }
 
@@ -370,6 +431,25 @@ impl TocEntry {
     /// `None` for names outside the standard six.
     pub fn section_name(&self) -> Option<SectionName> {
         SectionName::from_bytes(self.name.as_bytes())
+    }
+
+    /// Borrow this entry's payload bytes out of the full USDC file
+    /// slice.
+    ///
+    /// The slice runs from [`Self::offset`] for [`Self::size`] bytes.
+    /// `Toc::parse` already validates the bounds against the file
+    /// length and the TOC offset, so this lookup is a clean borrow
+    /// for any `TocEntry` that came out of [`Toc::parse`].
+    ///
+    /// Returns `None` if `file_bytes` is shorter than the entry's
+    /// recorded range — useful when the entry is held independently
+    /// of the source slice (e.g. after a re-read on a shorter file)
+    /// and a defensive bounds check is preferred over panicking.
+    pub fn slice_in<'a>(&self, file_bytes: &'a [u8]) -> Option<&'a [u8]> {
+        let offset = usize::try_from(self.offset).ok()?;
+        let size = usize::try_from(self.size).ok()?;
+        let end = offset.checked_add(size)?;
+        file_bytes.get(offset..end)
     }
 }
 
@@ -473,6 +553,31 @@ impl Toc {
     pub fn find(&self, name: SectionName) -> Option<&TocEntry> {
         self.entries.iter().find(|e| e.section_name() == Some(name))
     }
+
+    /// Does this TOC carry the trace doc's six standard sections in
+    /// the canonical order [`SectionName::ALL_STANDARD`] specifies?
+    ///
+    /// Returns `true` when the leading six entries — in declaration
+    /// order — classify as `Tokens, Strings, Fields, FieldSets,
+    /// Paths, Specs` (per the trace doc's observed ordering on every
+    /// real sample). Extra entries beyond the first six are
+    /// permitted (the TOC name field is open-ended); a non-standard
+    /// name or a missing standard variant in the first six positions
+    /// returns `false`.
+    ///
+    /// A reader can use this as a fast path: when the canonical
+    /// ordering holds, sections can be addressed by canonical index
+    /// directly into [`Self::entries`] without re-running
+    /// [`Self::find`] per access.
+    pub fn matches_canonical_order(&self) -> bool {
+        if self.entries.len() < SectionName::ALL_STANDARD.len() {
+            return false;
+        }
+        SectionName::ALL_STANDARD
+            .iter()
+            .zip(self.entries.iter())
+            .all(|(want, got)| got.section_name() == Some(*want))
+    }
 }
 
 /// Public convenience — `parse(bytes)` returns both the bootstrap
@@ -492,6 +597,25 @@ impl UsdcFile {
         let bootstrap = Bootstrap::parse(bytes)?;
         let toc = Toc::parse(bytes, &bootstrap)?;
         Ok(Self { bootstrap, toc })
+    }
+
+    /// Borrow the payload bytes of one of the trace doc's six
+    /// standard sections out of `file_bytes`.
+    ///
+    /// Convenience composition of [`Toc::find`] +
+    /// [`TocEntry::slice_in`]. `file_bytes` must be the same buffer
+    /// `Self::parse` was called on — the TOC entry's `offset` and
+    /// `size` were validated against its length at parse time, so
+    /// this lookup returns `Some(slice)` whenever the requested
+    /// section is present in the TOC.
+    ///
+    /// Returns `None` when the requested standard section is
+    /// missing from the TOC (the TOC name field is open-ended, so a
+    /// future writer could in principle ship a file without all six)
+    /// or when `file_bytes` is shorter than the entry's recorded
+    /// range (e.g. a caller passing a truncated re-read of the file).
+    pub fn section_bytes<'a>(&self, name: SectionName, file_bytes: &'a [u8]) -> Option<&'a [u8]> {
+        self.toc.find(name)?.slice_in(file_bytes)
     }
 }
 
@@ -3559,5 +3683,295 @@ mod tests {
         );
         // 8 (count) + 8 + 60 + 8 + 200 + 8 + 39 = 331.
         assert_eq!(16 + 60 + 8 + 200 + 8 + 39, 331);
+    }
+
+    // ----- §2 canonical section ordering + section_bytes -----
+
+    #[test]
+    fn section_name_all_standard_is_trace_doc_order() {
+        // Trace doc §2 records this exact ordering on the Elephant
+        // and confirms the teapot exhibits the same sequence.
+        assert_eq!(
+            SectionName::ALL_STANDARD,
+            [
+                SectionName::Tokens,
+                SectionName::Strings,
+                SectionName::Fields,
+                SectionName::FieldSets,
+                SectionName::Paths,
+                SectionName::Specs,
+            ],
+        );
+        // canonical_index is the inverse of the slice index.
+        for (i, name) in SectionName::ALL_STANDARD.iter().enumerate() {
+            assert_eq!(name.canonical_index(), i);
+        }
+    }
+
+    #[test]
+    fn section_name_round_trip_through_canonical_index() {
+        // Every variant's canonical_index → ALL_STANDARD[index] = variant.
+        for variant in SectionName::ALL_STANDARD {
+            let idx = variant.canonical_index();
+            assert_eq!(SectionName::ALL_STANDARD[idx], variant);
+        }
+    }
+
+    /// Build a minimal USDC file slice with a custom TOC ordering
+    /// so the canonical-order predicate can be exercised on
+    /// synthesised inputs without depending on a real fixture.
+    fn build_usdc_with_section_names(names: &[SectionName]) -> Vec<u8> {
+        // Layout: 88-byte bootstrap (magic + 0.8.0 + toc_offset + 64 zero),
+        // then a 1-byte placeholder per section, then the TOC at
+        // `toc_offset`. Section payloads can be 1 byte each — TOC
+        // bounds checks accept any size as long as it stays before
+        // the TOC and after the bootstrap.
+        let payload_each: usize = 1;
+        let toc_offset = BOOTSTRAP_SIZE + payload_each * names.len();
+        let mut buf = Vec::with_capacity(toc_offset + 8 + names.len() * TOC_RECORD_SIZE);
+        buf.extend_from_slice(MAGIC);
+        // version 0.8.0
+        buf.extend_from_slice(&[0, 8, 0, 0, 0, 0, 0, 0]);
+        // toc_offset
+        buf.extend_from_slice(&(toc_offset as u64).to_le_bytes());
+        // reserved 64 bytes of zero
+        buf.extend_from_slice(&[0u8; 64]);
+        // placeholder section payloads
+        for (i, _) in names.iter().enumerate() {
+            buf.push(0xAA ^ (i as u8));
+        }
+        assert_eq!(buf.len(), toc_offset);
+        // TOC: int64 sectionCount, then `count` 32-byte records.
+        buf.extend_from_slice(&(names.len() as u64).to_le_bytes());
+        for (i, name) in names.iter().enumerate() {
+            let mut rec = [0u8; TOC_RECORD_SIZE];
+            let n = name.as_bytes();
+            rec[..n.len()].copy_from_slice(n);
+            let offset = (BOOTSTRAP_SIZE + i * payload_each) as u64;
+            let size = payload_each as u64;
+            rec[16..24].copy_from_slice(&offset.to_le_bytes());
+            rec[24..32].copy_from_slice(&size.to_le_bytes());
+            buf.extend_from_slice(&rec);
+        }
+        buf
+    }
+
+    #[test]
+    fn toc_matches_canonical_order_on_synthesised_six() {
+        let names = SectionName::ALL_STANDARD.to_vec();
+        let file = build_usdc_with_section_names(&names);
+        let parsed = UsdcFile::parse(&file).expect("parse synthesised USDC");
+        assert!(
+            parsed.toc.matches_canonical_order(),
+            "TOC built with ALL_STANDARD must classify as canonical-ordered"
+        );
+    }
+
+    #[test]
+    fn toc_matches_canonical_order_rejects_shuffled_ordering() {
+        // Same six names but FIELDS / FIELDSETS swapped.
+        let names = vec![
+            SectionName::Tokens,
+            SectionName::Strings,
+            SectionName::FieldSets,
+            SectionName::Fields,
+            SectionName::Paths,
+            SectionName::Specs,
+        ];
+        let file = build_usdc_with_section_names(&names);
+        let parsed = UsdcFile::parse(&file).expect("parse synthesised USDC");
+        assert!(
+            !parsed.toc.matches_canonical_order(),
+            "swapped FIELDS / FIELDSETS must fall off the canonical fast path"
+        );
+    }
+
+    #[test]
+    fn toc_matches_canonical_order_rejects_fewer_than_six() {
+        // Drop the trailing SPECS so the TOC carries only five.
+        let names = vec![
+            SectionName::Tokens,
+            SectionName::Strings,
+            SectionName::Fields,
+            SectionName::FieldSets,
+            SectionName::Paths,
+        ];
+        let file = build_usdc_with_section_names(&names);
+        let parsed = UsdcFile::parse(&file).expect("parse synthesised USDC");
+        assert!(
+            !parsed.toc.matches_canonical_order(),
+            "five-entry TOC cannot satisfy the six-section canonical predicate"
+        );
+    }
+
+    #[test]
+    fn toc_matches_canonical_order_tolerates_trailing_extras() {
+        // The trace doc only commits to the six standard names — the
+        // TOC name field is open-ended. The predicate should accept
+        // the canonical six followed by a non-standard extra.
+        let mut names = SectionName::ALL_STANDARD.to_vec();
+        // Append a synthesised TOC entry whose name is outside the
+        // standard six — we build it by hand because `SectionName`
+        // can't represent it.
+        let payload_each: usize = 1;
+        let toc_offset = BOOTSTRAP_SIZE + payload_each * (names.len() + 1);
+        let mut buf = Vec::with_capacity(toc_offset + 8 + (names.len() + 1) * TOC_RECORD_SIZE);
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&[0, 8, 0, 0, 0, 0, 0, 0]);
+        buf.extend_from_slice(&(toc_offset as u64).to_le_bytes());
+        buf.extend_from_slice(&[0u8; 64]);
+        for i in 0..names.len() + 1 {
+            buf.push(0xAA ^ (i as u8));
+        }
+        // sectionCount = standard six + 1
+        buf.extend_from_slice(&((names.len() + 1) as u64).to_le_bytes());
+        for (i, name) in names.iter().enumerate() {
+            let mut rec = [0u8; TOC_RECORD_SIZE];
+            let n = name.as_bytes();
+            rec[..n.len()].copy_from_slice(n);
+            rec[16..24]
+                .copy_from_slice(&((BOOTSTRAP_SIZE + i * payload_each) as u64).to_le_bytes());
+            rec[24..32].copy_from_slice(&(payload_each as u64).to_le_bytes());
+            buf.extend_from_slice(&rec);
+        }
+        // Trailing non-standard entry — name = "EXTRA"
+        let mut rec = [0u8; TOC_RECORD_SIZE];
+        rec[..5].copy_from_slice(b"EXTRA");
+        rec[16..24]
+            .copy_from_slice(&((BOOTSTRAP_SIZE + names.len() * payload_each) as u64).to_le_bytes());
+        rec[24..32].copy_from_slice(&(payload_each as u64).to_le_bytes());
+        buf.extend_from_slice(&rec);
+        // silence unused after the helper rebuild
+        let _ = &mut names;
+
+        let parsed = UsdcFile::parse(&buf).expect("parse synthesised USDC with extra");
+        assert!(
+            parsed.toc.matches_canonical_order(),
+            "trailing extra entry beyond the canonical six must still satisfy the predicate"
+        );
+        assert_eq!(parsed.toc.entries.len(), 7);
+    }
+
+    #[test]
+    fn toc_entry_slice_in_returns_full_payload() {
+        let names = SectionName::ALL_STANDARD.to_vec();
+        let file = build_usdc_with_section_names(&names);
+        let parsed = UsdcFile::parse(&file).expect("parse synthesised USDC");
+        for (i, _name) in SectionName::ALL_STANDARD.iter().enumerate() {
+            let entry = &parsed.toc.entries[i];
+            let slice = entry.slice_in(&file).expect("slice into source");
+            assert_eq!(slice.len(), 1);
+            // Built with 0xAA ^ i.
+            assert_eq!(slice[0], 0xAA ^ (i as u8));
+        }
+    }
+
+    #[test]
+    fn toc_entry_slice_in_returns_none_for_truncated_buffer() {
+        let names = SectionName::ALL_STANDARD.to_vec();
+        let file = build_usdc_with_section_names(&names);
+        let parsed = UsdcFile::parse(&file).expect("parse synthesised USDC");
+        let entry = &parsed.toc.entries[5];
+        // Truncate `file` to just before the entry's payload end.
+        let truncated_len = entry.offset as usize;
+        let truncated = &file[..truncated_len];
+        assert!(
+            entry.slice_in(truncated).is_none(),
+            "truncated buffer must yield None rather than panic"
+        );
+    }
+
+    #[test]
+    fn usdc_file_section_bytes_round_trips_synthesised_input() {
+        let names = SectionName::ALL_STANDARD.to_vec();
+        let file = build_usdc_with_section_names(&names);
+        let parsed = UsdcFile::parse(&file).expect("parse synthesised USDC");
+        for (i, name) in SectionName::ALL_STANDARD.iter().enumerate() {
+            let slice = parsed
+                .section_bytes(*name, &file)
+                .expect("section_bytes returns Some on a TOC-present section");
+            assert_eq!(slice.len(), 1);
+            assert_eq!(slice[0], 0xAA ^ (i as u8));
+        }
+    }
+
+    #[test]
+    fn usdc_file_section_bytes_returns_none_for_missing_section() {
+        // Drop SPECS so a SPECS lookup falls off.
+        let names = vec![
+            SectionName::Tokens,
+            SectionName::Strings,
+            SectionName::Fields,
+            SectionName::FieldSets,
+            SectionName::Paths,
+        ];
+        let file = build_usdc_with_section_names(&names);
+        let parsed = UsdcFile::parse(&file).expect("parse synthesised USDC");
+        assert!(parsed.section_bytes(SectionName::Specs, &file).is_none());
+        // The five present sections must still resolve.
+        assert!(parsed.section_bytes(SectionName::Tokens, &file).is_some());
+    }
+
+    #[test]
+    fn real_fixture_toc_matches_canonical_order() {
+        // Cross-validate against the trace-doc-published Elephant
+        // facts: trace doc §2 lists the six sections in
+        // `TOKENS, STRINGS, FIELDS, FIELDSETS, PATHS, SPECS` order.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/3d/usd/fixtures/SoC-ElephantWithMonochord.usdc");
+        if !fixture.exists() {
+            eprintln!("skip: fixture {fixture:?} not present");
+            return;
+        }
+        let bytes = std::fs::read(&fixture).expect("read fixture");
+        let file = UsdcFile::parse(&bytes).expect("parse Elephant USDC");
+        assert_eq!(file.toc.entries.len(), 6, "trace doc §2: six TOC entries");
+        assert!(
+            file.toc.matches_canonical_order(),
+            "trace doc §2 grounds the canonical ordering in this fixture"
+        );
+    }
+
+    #[test]
+    fn real_fixture_section_bytes_round_trips_each_standard_section() {
+        // Cross-validate `UsdcFile::section_bytes` against the
+        // trace-doc-published Elephant offsets + sizes from §2:
+        //   TOKENS    @0x0cebf0  size 1770
+        //   STRINGS   @0x0cf2da  size    8
+        //   FIELDS    @0x0cf2e2  size  998
+        //   FIELDSETS @0x0cf6c8  size  611
+        //   PATHS     @0x0cf92b  size  548
+        //   SPECS     @0x0cfb4f  size  331
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/3d/usd/fixtures/SoC-ElephantWithMonochord.usdc");
+        if !fixture.exists() {
+            eprintln!("skip: fixture {fixture:?} not present");
+            return;
+        }
+        let bytes = std::fs::read(&fixture).expect("read fixture");
+        let file = UsdcFile::parse(&bytes).expect("parse Elephant USDC");
+
+        let expected: [(SectionName, usize, usize); 6] = [
+            (SectionName::Tokens, 0x0cebf0, 1770),
+            (SectionName::Strings, 0x0cf2da, 8),
+            (SectionName::Fields, 0x0cf2e2, 998),
+            (SectionName::FieldSets, 0x0cf6c8, 611),
+            (SectionName::Paths, 0x0cf92b, 548),
+            (SectionName::Specs, 0x0cfb4f, 331),
+        ];
+        for (name, offset, size) in expected {
+            let slice = file
+                .section_bytes(name, &bytes)
+                .unwrap_or_else(|| panic!("Elephant fixture has {name}"));
+            assert_eq!(
+                slice.len(),
+                size,
+                "{name} section length on the wire (trace doc §2)"
+            );
+            // The slice borrows from `bytes` at the recorded offset
+            // — verify the pointer identity, not just the contents,
+            // so we know the accessor isn't allocating a copy.
+            assert_eq!(slice.as_ptr(), bytes[offset..].as_ptr());
+        }
     }
 }

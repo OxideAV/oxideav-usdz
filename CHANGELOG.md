@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 245 (USDC TOC canonical-order predicate + section-bytes accessor)
+
+- **`usdc::SectionName::ALL_STANDARD`** — the canonical six standard
+  section names in trace doc §2's observed declaration order
+  (`TOKENS`, `STRINGS`, `FIELDS`, `FIELDSETS`, `PATHS`, `SPECS`).
+  The trace doc grounds this ordering in two independent real
+  samples — quoting §2: "The six names appear in this same order
+  in the teapot too." Companion
+  **`usdc::SectionName::canonical_index`** returns the zero-based
+  position of each variant in that sequence, giving a reader
+  walking the six standard sections by canonical index a typed
+  lookup.
+- **`usdc::TocEntry::slice_in(file_bytes)`** — borrow a TOC entry's
+  payload bytes from a full USDC file slice. The `(offset, size)`
+  pair was bounds-checked by `Toc::parse` against the file length
+  and the TOC offset at parse time, so this lookup returns the
+  clean borrow into the original input. Returns `None` when
+  `file_bytes` is shorter than the entry's recorded range (defensive
+  fallback for callers holding the entry independently of the
+  source slice).
+- **`usdc::Toc::matches_canonical_order`** — fast-path predicate:
+  returns `true` when the TOC's first six entries classify, in
+  declaration order, as the six canonical variants
+  `SectionName::ALL_STANDARD`. Trailing non-standard entries beyond
+  the canonical six are tolerated (the TOC name field is open-ended
+  per the trace doc). When the predicate holds, a reader can address
+  each standard section by its canonical index directly into
+  `Toc::entries` without re-running `Toc::find` per access.
+- **`usdc::UsdcFile::section_bytes(name, file_bytes)`** — single-call
+  convenience that composes `Toc::find` + `TocEntry::slice_in` so
+  callers can pull any standard section's bytes out of a parsed
+  file in one step. Returns `None` when the requested standard
+  section is absent from the TOC or when `file_bytes` is shorter
+  than the entry's range.
+- **11 new unit tests** in `usdc::tests` cover the canonical
+  ordering against `ALL_STANDARD`, the `canonical_index` /
+  `ALL_STANDARD` round-trip on every variant, the
+  `matches_canonical_order` predicate on a synthesised six-section
+  USDC file, the same predicate's rejection of a FIELDS / FIELDSETS
+  swap and of a five-entry truncated TOC, the trailing-extras
+  tolerance with a synthesised `EXTRA`-named seventh entry,
+  `TocEntry::slice_in` borrowing the right payload from each
+  standard entry and returning `None` on a truncated re-read,
+  `UsdcFile::section_bytes` round-tripping each canonical name on
+  the synthesised input, the same accessor returning `None` for an
+  absent SPECS, and two fixture-backed cross-validations against
+  the in-tree Elephant fixture: (a)
+  `Toc::matches_canonical_order` holds on the real file's six TOC
+  entries and (b) `UsdcFile::section_bytes` returns the right
+  pointer-identity slice at each of the trace doc's six published
+  `(offset, size)` pairs (TOKENS @0x0cebf0 size 1770, STRINGS
+  @0x0cf2da size 8, FIELDS @0x0cf2e2 size 998, FIELDSETS @0x0cf6c8
+  size 611, PATHS @0x0cf92b size 548, SPECS @0x0cfb4f size 331).
+  Sourced exclusively from `docs/3d/usd/usdc-crate-format-trace.md`
+  §2 (TOC layout, canonical ordering of the six standard sections
+  in both real samples, and the per-section offsets + sizes).
+
 ### Added — Round 239 (USDC §4.6 SPECS section three-buffer framing)
 
 - **`usdc::SpecsHeader` / `usdc::SpecsSection`** — the §4.6 SPECS

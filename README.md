@@ -324,6 +324,44 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   module is required, so this oracle runs anywhere Apple USD Tools /
   the USD CLI binary is installed.
 
+## Round 245 scope (USDC TOC canonical-order predicate + section-bytes accessor)
+
+- **`usdc::SectionName::ALL_STANDARD`** — the canonical six
+  standard section names in trace doc §2's observed declaration
+  order (`TOKENS`, `STRINGS`, `FIELDS`, `FIELDSETS`, `PATHS`,
+  `SPECS`). Trace doc §2 grounds this ordering in two
+  independent real samples — quoting it directly: "The six names
+  appear in this same order in the teapot too."
+  `SectionName::canonical_index` gives each variant its zero-based
+  position in the sequence so a typed walk has a typed lookup.
+- **`usdc::TocEntry::slice_in(file_bytes)`** — borrow a TOC
+  entry's payload bytes from a full USDC file slice. The
+  `(offset, size)` pair was bounds-checked by `Toc::parse` at
+  parse time, so the lookup is a clean borrow into the original
+  input. Returns `None` when `file_bytes` is shorter than the
+  entry's recorded range as a defensive fallback for callers that
+  hold the entry independently of the source slice.
+- **`usdc::Toc::matches_canonical_order`** — fast-path predicate
+  that returns `true` when the TOC's first six entries classify, in
+  declaration order, as `SectionName::ALL_STANDARD`. Trailing
+  non-standard entries beyond the canonical six are tolerated (the
+  TOC name field is open-ended per the trace doc). A reader for
+  which the predicate holds can address each standard section by
+  its canonical index directly into `Toc::entries` instead of
+  re-running `Toc::find` on every access.
+- **`usdc::UsdcFile::section_bytes(name, file_bytes)`** — single-call
+  convenience that composes `Toc::find` + `TocEntry::slice_in` so
+  callers pull any standard section's bytes out of a parsed file in
+  one step.
+- Cross-validated against the in-tree Elephant fixture under
+  `docs/3d/usd/fixtures/`: the six TOC entries classify in the
+  canonical order; `UsdcFile::section_bytes` returns the
+  pointer-identity slice at each of the trace doc §2 published
+  offsets + sizes — `TOKENS @0x0cebf0` size `1770`,
+  `STRINGS @0x0cf2da` size `8`, `FIELDS @0x0cf2e2` size `998`,
+  `FIELDSETS @0x0cf6c8` size `611`, `PATHS @0x0cf92b` size `548`,
+  `SPECS @0x0cfb4f` size `331`.
+
 ## Round 239 scope (USDC §4.6 SPECS section three-buffer framing)
 
 - **`usdc::SpecsHeader` / `usdc::SpecsSection`** — the §4.6 SPECS

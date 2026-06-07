@@ -323,6 +323,35 @@
 //!   empty set, and emits empty inner sets between consecutive
 //!   sentinels.
 //!
+//! Round 245 — USDC TOC canonical-order predicate + section-bytes accessor:
+//!
+//! * [`usdc::SectionName::ALL_STANDARD`] — the canonical six standard
+//!   section names in trace doc §2's observed declaration order
+//!   (`TOKENS`, `STRINGS`, `FIELDS`, `FIELDSETS`, `PATHS`, `SPECS`).
+//!   Companion [`usdc::SectionName::canonical_index`] gives each
+//!   variant its zero-based position in that sequence so a reader
+//!   walking standard sections by canonical index has a typed
+//!   lookup.
+//! * [`usdc::TocEntry::slice_in`] — borrow a TOC entry's payload
+//!   bytes from a full USDC file slice. The `(offset, size)` are
+//!   bounds-checked by [`usdc::Toc::parse`] at parse time, so this
+//!   is a clean borrow into the original input.
+//! * [`usdc::Toc::matches_canonical_order`] — fast-path predicate:
+//!   does the TOC carry the six standard sections in the canonical
+//!   order the trace doc records? When `true`, a reader can address
+//!   each standard section by its canonical index into
+//!   [`usdc::Toc::entries`] without re-running
+//!   [`usdc::Toc::find`] per access. Trailing non-standard entries
+//!   beyond the canonical six are tolerated.
+//! * [`usdc::UsdcFile::section_bytes`] — single-call convenience
+//!   that composes [`usdc::Toc::find`] + [`usdc::TocEntry::slice_in`]
+//!   so callers can pull any standard section's bytes out of a
+//!   parsed file in one step. Cross-validated against the Elephant
+//!   fixture's six TOC entries at the trace-doc-published offsets +
+//!   sizes (TOKENS @0x0cebf0 size 1770, STRINGS @0x0cf2da size 8,
+//!   FIELDS @0x0cf2e2 size 998, FIELDSETS @0x0cf6c8 size 611,
+//!   PATHS @0x0cf92b size 548, SPECS @0x0cfb4f size 331).
+//!
 //! Round 239 — USDC §4.6 SPECS section three-buffer framing parser:
 //!
 //! * [`usdc::SpecsHeader`] / [`usdc::SpecsSection`] — parse the
