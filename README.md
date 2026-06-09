@@ -324,6 +324,40 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   module is required, so this oracle runs anywhere Apple USD Tools /
   the USD CLI binary is installed.
 
+## Round 265 scope (USDC TOC standard-section table accessors)
+
+- **`usdc::Toc::standard_section_table`** — one-pass classifier
+  projecting `Toc::entries` onto a fixed-size
+  `[Option<&TocEntry>; 6]` indexed by
+  `SectionName::canonical_index`. Each slot at `i` holds
+  `Some(entry)` for the first TOC entry whose name classifies as
+  the standard section at canonical index `i`, or `None` when no
+  such entry is present. Trailing entries with non-standard names
+  (per trace doc §2 the TOC name field is open-ended) are
+  silently ignored; duplicates of the same standard name keep
+  the first occurrence — same contract as `Toc::find`.
+- **`usdc::UsdcFile::standard_section_table(file_bytes)`** — the
+  bytes-borrowing companion: composes the TOC's
+  `standard_section_table` with `TocEntry::slice_in` to borrow
+  each present standard section's payload bytes out of
+  `file_bytes` in a single walk of the TOC. A slot is `None` if
+  the standard section is absent or if `file_bytes` is shorter
+  than the entry's recorded range (the same defensive fallback
+  `slice_in` provides).
+- **Why a bulk accessor in addition to Round 245's per-name
+  ones.** `matches_canonical_order` answers "is the TOC
+  well-ordered?"; the new accessor answers "for each standard
+  section, where is its entry?" — useful when the predicate
+  doesn't hold (out-of-order TOC, hand-authored entries) and the
+  reader still needs every section located in one walk instead
+  of six separate `Toc::find` calls.
+- Cross-validated against the in-tree Elephant fixture under
+  `docs/3d/usd/fixtures/`: the bulk accessor and the per-name
+  `section_bytes` accessor return pointer-identical slices with
+  matching lengths for every one of the six standard sections,
+  so the new bulk accessor is observationally a one-pass batched
+  form of the per-name accessor on real bytes.
+
 ## Round 245 scope (USDC TOC canonical-order predicate + section-bytes accessor)
 
 - **`usdc::SectionName::ALL_STANDARD`** — the canonical six

@@ -89,6 +89,23 @@
 //!   round can layer the buffer decomposition once the trace doc
 //!   resolves the buffer count.
 //!
+//! What this module **adds in round 265**:
+//!
+//! * [`Toc::standard_section_table`] — one-pass classifier
+//!   projecting [`Toc::entries`] onto a fixed-size
+//!   `[Option<&TocEntry>; 6]` indexed by
+//!   [`SectionName::canonical_index`]. The complement to
+//!   [`Toc::matches_canonical_order`]: the predicate answers
+//!   "is the TOC well-ordered?", this accessor answers
+//!   "for each standard section, where is its entry?" — useful
+//!   when the canonical fast path doesn't hold and the reader
+//!   still needs every standard section located.
+//! * [`UsdcFile::standard_section_table`] — single-call
+//!   convenience that composes
+//!   [`Toc::standard_section_table`] with [`TocEntry::slice_in`]
+//!   to borrow each present standard section's payload bytes
+//!   in one walk of [`Toc::entries`].
+//!
 //! What this module **adds in round 245**:
 //!
 //! * [`SectionName::ALL_STANDARD`] — the canonical six standard
@@ -578,6 +595,45 @@ impl Toc {
             .zip(self.entries.iter())
             .all(|(want, got)| got.section_name() == Some(*want))
     }
+
+    /// Classify every TOC entry in one pass and project the result
+    /// onto a fixed-size `[Option<&TocEntry>; 6]` indexed by
+    /// [`SectionName::canonical_index`].
+    ///
+    /// Each slot at `i = name.canonical_index()` holds:
+    ///
+    /// * `Some(entry)` — the first TOC entry whose name classifies
+    ///   as the `SectionName` at canonical index `i`.
+    /// * `None` — no TOC entry of that name is present.
+    ///
+    /// Trailing TOC entries with non-standard names (per the trace
+    /// doc §2 the TOC name field is open-ended) are silently
+    /// ignored; duplicates of the same standard name keep the
+    /// **first** occurrence, matching [`Self::find`]'s contract.
+    /// Ordering of the entries within `entries` is irrelevant —
+    /// this is a classifier, not a positional view, so callers can
+    /// use it even when [`Self::matches_canonical_order`] is
+    /// `false`.
+    ///
+    /// The complement to [`Self::matches_canonical_order`]: where
+    /// the predicate answers "is the TOC well-ordered?", this
+    /// accessor answers "for each standard section, where is its
+    /// entry?" — useful when a future writer reorders entries
+    /// (the trace doc commits to the ordering on observed samples
+    /// only) and a reader still needs to find each section by
+    /// name.
+    pub fn standard_section_table(&self) -> [Option<&TocEntry>; 6] {
+        let mut table: [Option<&TocEntry>; 6] = [None; 6];
+        for entry in &self.entries {
+            if let Some(name) = entry.section_name() {
+                let slot = &mut table[name.canonical_index()];
+                if slot.is_none() {
+                    *slot = Some(entry);
+                }
+            }
+        }
+        table
+    }
 }
 
 /// Public convenience — `parse(bytes)` returns both the bootstrap
@@ -616,6 +672,39 @@ impl UsdcFile {
     /// range (e.g. a caller passing a truncated re-read of the file).
     pub fn section_bytes<'a>(&self, name: SectionName, file_bytes: &'a [u8]) -> Option<&'a [u8]> {
         self.toc.find(name)?.slice_in(file_bytes)
+    }
+
+    /// One-pass classification of every standard section's payload
+    /// bytes out of `file_bytes`.
+    ///
+    /// Returns a fixed-size array indexed by
+    /// [`SectionName::canonical_index`]: slot `i` is
+    /// `Some(&file_bytes[entry.offset..entry.offset+entry.size])`
+    /// when the corresponding standard section is present in the
+    /// TOC, or `None` when it is absent.
+    ///
+    /// Composes [`Toc::standard_section_table`] with
+    /// [`TocEntry::slice_in`] in a single pass — equivalent to
+    /// calling [`Self::section_bytes`] six times, but with one
+    /// walk over [`Toc::entries`] instead of six. `file_bytes` must
+    /// be the same buffer [`Self::parse`] was called on; each TOC
+    /// entry's `(offset, size)` was bounds-checked against its
+    /// length at parse time, so a present standard section always
+    /// yields a clean slice.
+    ///
+    /// A slot is `None` if the standard section is absent from the
+    /// TOC OR if `file_bytes` is shorter than the entry's recorded
+    /// range (the same `slice_in` truncation fallback the per-name
+    /// accessor offers).
+    pub fn standard_section_table<'a>(&self, file_bytes: &'a [u8]) -> [Option<&'a [u8]>; 6] {
+        let entries = self.toc.standard_section_table();
+        let mut out: [Option<&'a [u8]>; 6] = [None; 6];
+        for (slot, entry) in out.iter_mut().zip(entries.iter()) {
+            if let Some(entry) = entry {
+                *slot = entry.slice_in(file_bytes);
+            }
+        }
+        out
     }
 }
 
@@ -3972,6 +4061,201 @@ mod tests {
             // — verify the pointer identity, not just the contents,
             // so we know the accessor isn't allocating a copy.
             assert_eq!(slice.as_ptr(), bytes[offset..].as_ptr());
+        }
+    }
+
+    // ----- round 265: standard_section_table -----
+
+    #[test]
+    fn toc_standard_section_table_fills_every_slot_on_canonical_six() {
+        let names = SectionName::ALL_STANDARD.to_vec();
+        let file = build_usdc_with_section_names(&names);
+        let parsed = UsdcFile::parse(&file).expect("parse synthesised USDC");
+        let table = parsed.toc.standard_section_table();
+        for (i, name) in SectionName::ALL_STANDARD.iter().enumerate() {
+            let entry = table[i].unwrap_or_else(|| panic!("slot {i} ({name}) must be Some"));
+            assert_eq!(
+                entry.section_name(),
+                Some(*name),
+                "slot {i} classifies as {name}"
+            );
+            // Each entry must be the original from `Toc::entries` — pointer
+            // identity, not just value equality, witnesses the no-clone
+            // borrow.
+            assert!(std::ptr::eq(entry, &parsed.toc.entries[i]));
+        }
+    }
+
+    #[test]
+    fn toc_standard_section_table_skips_unknown_names() {
+        // Build a TOC where two slots are non-standard names and four are
+        // standard but out of canonical order.
+        let payload_each: usize = 1;
+        let total_entries = 6;
+        let toc_offset = BOOTSTRAP_SIZE + payload_each * total_entries;
+        let mut buf = Vec::with_capacity(toc_offset + 8 + total_entries * TOC_RECORD_SIZE);
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&[0, 8, 0, 0, 0, 0, 0, 0]);
+        buf.extend_from_slice(&(toc_offset as u64).to_le_bytes());
+        buf.extend_from_slice(&[0u8; 64]);
+        for i in 0..total_entries {
+            buf.push(0xAA ^ (i as u8));
+        }
+        // sectionCount
+        buf.extend_from_slice(&(total_entries as u64).to_le_bytes());
+        // Out-of-order standard names interleaved with non-standard ones.
+        let layout: [&[u8]; 6] = [
+            b"SPECS",      // canonical_index 5
+            b"NONSENSE",   // non-standard, skipped
+            b"TOKENS",     // canonical_index 0
+            b"PATHS",      // canonical_index 4
+            b"OTHER_NAME", // non-standard, skipped
+            b"FIELDS",     // canonical_index 2
+        ];
+        for (i, n) in layout.iter().enumerate() {
+            let mut rec = [0u8; TOC_RECORD_SIZE];
+            let len = n.len().min(16);
+            rec[..len].copy_from_slice(&n[..len]);
+            rec[16..24]
+                .copy_from_slice(&((BOOTSTRAP_SIZE + i * payload_each) as u64).to_le_bytes());
+            rec[24..32].copy_from_slice(&(payload_each as u64).to_le_bytes());
+            buf.extend_from_slice(&rec);
+        }
+        let parsed = UsdcFile::parse(&buf).expect("parse synthesised USDC");
+        let table = parsed.toc.standard_section_table();
+        // SPECS, TOKENS, PATHS, FIELDS classified; STRINGS and FIELDSETS
+        // absent.
+        assert!(table[SectionName::Tokens.canonical_index()].is_some());
+        assert!(table[SectionName::Strings.canonical_index()].is_none());
+        assert!(table[SectionName::Fields.canonical_index()].is_some());
+        assert!(table[SectionName::FieldSets.canonical_index()].is_none());
+        assert!(table[SectionName::Paths.canonical_index()].is_some());
+        assert!(table[SectionName::Specs.canonical_index()].is_some());
+        // The classifier ignored the two non-standard names entirely.
+    }
+
+    #[test]
+    fn toc_standard_section_table_keeps_first_duplicate() {
+        // If a malformed TOC declares the same standard name twice, the
+        // classifier keeps the first — same contract as `Toc::find`.
+        let payload_each: usize = 1;
+        let total_entries = 2;
+        let toc_offset = BOOTSTRAP_SIZE + payload_each * total_entries;
+        let mut buf = Vec::with_capacity(toc_offset + 8 + total_entries * TOC_RECORD_SIZE);
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&[0, 8, 0, 0, 0, 0, 0, 0]);
+        buf.extend_from_slice(&(toc_offset as u64).to_le_bytes());
+        buf.extend_from_slice(&[0u8; 64]);
+        for i in 0..total_entries {
+            buf.push(0xAA ^ (i as u8));
+        }
+        buf.extend_from_slice(&(total_entries as u64).to_le_bytes());
+        for i in 0..total_entries {
+            let mut rec = [0u8; TOC_RECORD_SIZE];
+            rec[..6].copy_from_slice(b"TOKENS");
+            rec[16..24]
+                .copy_from_slice(&((BOOTSTRAP_SIZE + i * payload_each) as u64).to_le_bytes());
+            rec[24..32].copy_from_slice(&(payload_each as u64).to_le_bytes());
+            buf.extend_from_slice(&rec);
+        }
+        let parsed = UsdcFile::parse(&buf).expect("parse synthesised USDC");
+        let table = parsed.toc.standard_section_table();
+        let entry =
+            table[SectionName::Tokens.canonical_index()].expect("first TOKENS must be classified");
+        assert!(std::ptr::eq(entry, &parsed.toc.entries[0]));
+    }
+
+    #[test]
+    fn toc_standard_section_table_all_none_on_empty_toc() {
+        let file = build_usdc_with_section_names(&[]);
+        let parsed = UsdcFile::parse(&file).expect("parse synthesised empty-TOC USDC");
+        let table = parsed.toc.standard_section_table();
+        for slot in table.iter() {
+            assert!(slot.is_none());
+        }
+    }
+
+    #[test]
+    fn usdc_file_standard_section_table_borrows_every_payload() {
+        let names = SectionName::ALL_STANDARD.to_vec();
+        let file = build_usdc_with_section_names(&names);
+        let parsed = UsdcFile::parse(&file).expect("parse synthesised USDC");
+        let table = parsed.standard_section_table(&file);
+        for (i, _name) in SectionName::ALL_STANDARD.iter().enumerate() {
+            let slice = table[i].expect("slot must borrow Some");
+            assert_eq!(slice.len(), 1);
+            assert_eq!(slice[0], 0xAA ^ (i as u8));
+            // The slice borrows from `file` at the entry's recorded
+            // offset — pointer identity witnesses the no-clone borrow.
+            let entry = &parsed.toc.entries[i];
+            assert_eq!(slice.as_ptr(), file[entry.offset as usize..].as_ptr());
+        }
+    }
+
+    #[test]
+    fn usdc_file_standard_section_table_returns_none_for_missing_sections() {
+        // Drop SPECS and STRINGS.
+        let names = vec![
+            SectionName::Tokens,
+            SectionName::Fields,
+            SectionName::FieldSets,
+            SectionName::Paths,
+        ];
+        let file = build_usdc_with_section_names(&names);
+        let parsed = UsdcFile::parse(&file).expect("parse synthesised USDC");
+        let table = parsed.standard_section_table(&file);
+        assert!(table[SectionName::Tokens.canonical_index()].is_some());
+        assert!(table[SectionName::Strings.canonical_index()].is_none());
+        assert!(table[SectionName::Fields.canonical_index()].is_some());
+        assert!(table[SectionName::FieldSets.canonical_index()].is_some());
+        assert!(table[SectionName::Paths.canonical_index()].is_some());
+        assert!(table[SectionName::Specs.canonical_index()].is_none());
+    }
+
+    #[test]
+    fn usdc_file_standard_section_table_truncated_source_yields_none_for_overruns() {
+        // The TOC entries' (offset, size) check against the original
+        // file at parse time, but a caller may pass a shorter slice
+        // by mistake to the table accessor — `slice_in` falls back to
+        // `None` for the entries the truncated slice can't fully
+        // cover. Sections fully inside the truncated prefix still
+        // resolve.
+        let names = SectionName::ALL_STANDARD.to_vec();
+        let file = build_usdc_with_section_names(&names);
+        let parsed = UsdcFile::parse(&file).expect("parse synthesised USDC");
+        // Truncate just before the last (SPECS) section's payload.
+        let specs_entry = &parsed.toc.entries[SectionName::Specs.canonical_index()];
+        let truncated = &file[..specs_entry.offset as usize];
+        let table = parsed.standard_section_table(truncated);
+        // Earlier sections still resolve (they fit in the truncated
+        // prefix). SPECS is None.
+        assert!(table[SectionName::Tokens.canonical_index()].is_some());
+        assert!(table[SectionName::Specs.canonical_index()].is_none());
+    }
+
+    #[test]
+    fn real_fixture_standard_section_table_matches_section_bytes() {
+        // Cross-validate the one-pass classifier against six
+        // independent `section_bytes` calls on the in-tree Elephant
+        // fixture — every slot must agree on pointer identity AND on
+        // length, so the bulk accessor and the per-name accessor are
+        // observationally identical on real bytes.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/3d/usd/fixtures/SoC-ElephantWithMonochord.usdc");
+        if !fixture.exists() {
+            eprintln!("skip: fixture {fixture:?} not present");
+            return;
+        }
+        let bytes = std::fs::read(&fixture).expect("read fixture");
+        let file = UsdcFile::parse(&bytes).expect("parse Elephant USDC");
+        let table = file.standard_section_table(&bytes);
+        for name in SectionName::ALL_STANDARD {
+            let single = file
+                .section_bytes(name, &bytes)
+                .expect("section_bytes returns Some on canonical fixture");
+            let bulk = table[name.canonical_index()].expect("bulk table slot Some on fixture");
+            assert_eq!(single.as_ptr(), bulk.as_ptr());
+            assert_eq!(single.len(), bulk.len());
         }
     }
 }

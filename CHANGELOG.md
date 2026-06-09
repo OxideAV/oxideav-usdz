@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 265 (USDC TOC standard-section table accessors)
+
+- **`usdc::Toc::standard_section_table`** — one-pass classifier
+  projecting `Toc::entries` onto a fixed-size
+  `[Option<&TocEntry>; 6]` indexed by
+  `SectionName::canonical_index`. Each slot at `i =
+  name.canonical_index()` holds `Some(entry)` when the TOC
+  carries a section of that name (first occurrence wins, matching
+  `Toc::find`'s contract) or `None` when absent. Trailing entries
+  with non-standard names (per trace doc §2 the TOC name field is
+  open-ended) are silently ignored.
+- **`usdc::UsdcFile::standard_section_table(file_bytes)`** — the
+  bytes-borrowing companion: composes the TOC's
+  `standard_section_table` with `TocEntry::slice_in` in a single
+  pass, returning `[Option<&[u8]>; 6]` borrowing each present
+  standard section's payload bytes out of `file_bytes`. A slot is
+  `None` if the standard section is absent from the TOC, or if
+  `file_bytes` is shorter than the entry's recorded range (the
+  same defensive fallback `slice_in` provides on its own).
+- **Why a bulk accessor in addition to Round 245's per-name
+  ones.** `Toc::matches_canonical_order` answers "is the TOC
+  well-ordered?"; the new `standard_section_table` answers "for
+  each standard section, where is its entry?" — useful when the
+  predicate doesn't hold (a future writer reordering entries, or
+  a hand-authored file with non-standard names interleaved) and
+  the reader still needs every standard section located in one
+  walk of the TOC instead of six separate `Toc::find` calls.
+- **7 new unit tests** in `usdc::tests` cover the canonical-six
+  filled-every-slot case (with pointer-identity witnesses for the
+  zero-clone borrow), the skip-unknown-names path on a TOC mixing
+  out-of-order standard names with non-standard ones,
+  duplicate-name first-wins semantics, the all-`None`
+  empty-TOC case, the `UsdcFile` bytes accessor borrowing every
+  payload (again pointer-identity-verified), the missing-sections
+  partial-`None` projection, the truncated-source-yields-`None`
+  defensive fallback for entries the shorter slice can't cover,
+  and a fixture-backed cross-validation against the in-tree
+  Elephant fixture confirming the bulk accessor and the per-name
+  `section_bytes` are observationally identical on real bytes
+  (pointer identity + length parity for all six standard
+  sections). Sourced exclusively from
+  `docs/3d/usd/usdc-crate-format-trace.md` §2 (TOC layout, six
+  standard section names, canonical ordering, and Elephant
+  per-section offsets + sizes).
+
 ### Added — Round 245 (USDC TOC canonical-order predicate + section-bytes accessor)
 
 - **`usdc::SectionName::ALL_STANDARD`** — the canonical six standard
