@@ -74,20 +74,21 @@
 //! What this module **adds in round 236**:
 //!
 //! * [`PathsHeader`] / [`PathsSection`] — the §4.5 PATHS section's
-//!   16-byte leading prefix: `int64 numPaths` followed by a second
-//!   `int64` that the trace doc grounds as a repeat of `numPaths`
-//!   (both observed at `0x000000F8` = 248 on the Elephant fixture).
-//!   `PathsHeader::parse` reads the two int64s and enforces the
-//!   repeat-equals-numPaths invariant; `PathsSection::parse`
-//!   surfaces the trailing bytes after the prefix as an opaque
-//!   `tail_bytes` slice. The trailing region holds the
-//!   compressed-buffer payload(s) carrying the path-tree (parallel
-//!   path-token / element-token / sibling+child-jump arrays per the
-//!   trace doc) — but the trace doc's "single buffer" claim does
-//!   not exhaust the Elephant's 524 trailing bytes, so the §3a
-//!   envelope is deliberately NOT applied to the tail yet. A future
-//!   round can layer the buffer decomposition once the trace doc
-//!   resolves the buffer count.
+//!   16-byte leading prefix (`int64 numPaths` + a second `int64`
+//!   the trace doc grounds as a repeat of `numPaths`, both observed
+//!   at `0x000000F8` = 248 on the Elephant fixture) plus the
+//!   **three** `(int64 compressedSize, §3a buffer)` triples that
+//!   follow. The three buffers carry, in order, the path-token
+//!   indices, element-token indices, and sibling/child jump offsets
+//!   of the namespace path tree (trace doc §4.5). `PathsHeader::parse`
+//!   reads the two int64s and enforces the repeat-equals-numPaths
+//!   invariant; `PathsSection::parse` splits the three buffers and
+//!   enforces `16 + 8 + csize₁ + 8 + csize₂ + 8 + csize₃ ==
+//!   section_size` exactly. `PathsSection::path_tokens_buffer` /
+//!   `element_tokens_buffer` / `jumps_buffer` forward each bounded
+//!   buffer slice to `CompressedBuffer::parse` ahead of the LZ4
+//!   block decoder. Per-element tree-walk reconstruction (the §3b
+//!   common-value fast path) is a separate follow-up.
 //!
 //! What this module **adds in round 265**:
 //!
@@ -1749,16 +1750,13 @@ pub fn split_field_sets(values: &[i32]) -> Vec<Vec<i32>> {
 /// matching the trace doc's §4.5 worked example.
 ///
 /// This is the **leading prefix only.** The trailing bytes (the
-/// section size minus 16) hold one or more §3a compressed buffers
-/// whose precise layout — the trace doc §4.5 hints at parallel
-/// arrays of path-token indices + element-token indices +
-/// sibling/child jump offsets, but its single-buffer claim does not
-/// exhaust the Elephant fixture's 524 remaining bytes — is left as a
-/// docs gap rather than guessed at. Callers receive the trailing
-/// region as an opaque slice via [`PathsSection::tail_bytes`] so a
-/// future round can layer the buffer decomposition on top once the
-/// trace doc is refined; the framing primitive landing here lets the
-/// `num_paths` + repeat consistency check run on real files today.
+/// section size minus 16) hold **three** §3a compressed buffers,
+/// each prefixed by its own `int64 compressedSize`, carrying the
+/// parallel arrays of the namespace path tree (per trace doc §4.5:
+/// path-token indices, element-token indices, and sibling/child
+/// "jump" offsets). The three `(compressedSize, buffer)` triples are
+/// surfaced by [`PathsSection`] below, mirroring the §4.3 FIELDS and
+/// §4.6 SPECS multi-buffer framing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PathsHeader {
     /// Number of paths the namespace tree carries. Both Elephant and
@@ -1816,43 +1814,169 @@ impl PathsHeader {
 }
 
 /// A reference to a `PATHS` section's bytes split into the parsed
-/// 16-byte header plus an opaque trailing slice carrying the
-/// compressed-buffer region whose decomposition is a docs gap.
+/// 16-byte header plus the three `(compressed_size, buffer_bytes)`
+/// triples without yet decoding the LZ4 wrapper around any of them.
 ///
-/// Use [`PathsSection::tail_bytes`] to obtain the trailing slice.
-/// The trailing slice is exactly `section.len() - PathsHeader::SIZE`
-/// bytes long; the §3a [`CompressedBuffer::parse`] envelope cannot
-/// safely be applied to it until the buffer-count question is
-/// resolved.
+/// Per trace doc §4.5 the section is exactly
+/// `header(16) + 8 + csize₁ + 8 + csize₂ + 8 + csize₃` bytes — three
+/// §3a compressed buffers carrying the parallel arrays of the
+/// namespace path tree. Use [`PathsSection::path_tokens_buffer`] /
+/// [`PathsSection::element_tokens_buffer`] /
+/// [`PathsSection::jumps_buffer`] to walk the §3a framing of each
+/// buffer. The §3b integer decoder (for the decompressed bytes) is
+/// exposed separately as [`decode_int_array`]; the trace doc records
+/// the §4.5 buffers go through the common-value fast path, so naive
+/// `decode_int_array` recovers the run structure but not the literal
+/// per-element semantics (the tree-walk reconstruction is a separate
+/// follow-up).
 #[derive(Debug, Clone)]
 pub struct PathsSection<'a> {
     /// Parsed 16-byte header (numPaths plus enforced repeat).
     pub header: PathsHeader,
-    /// Trailing bytes of the section (everything after the 16-byte
-    /// header). Holds one or more §3a compressed buffers whose
-    /// precise count + per-buffer semantics the trace doc does not
-    /// yet bottom out for §4.5.
-    pub tail_bytes: &'a [u8],
+    /// `compressedSize` of the first §3a buffer (the path-token
+    /// indices buffer).
+    pub path_tokens_compressed_size: u64,
+    /// Raw bytes of the first §3a buffer — exactly
+    /// `path_tokens_compressed_size` long, ready for
+    /// [`CompressedBuffer::parse`].
+    pub path_tokens_buffer_bytes: &'a [u8],
+    /// `compressedSize` of the second §3a buffer (the element-token
+    /// indices buffer).
+    pub element_tokens_compressed_size: u64,
+    /// Raw bytes of the second §3a buffer — exactly
+    /// `element_tokens_compressed_size` long, ready for
+    /// [`CompressedBuffer::parse`].
+    pub element_tokens_buffer_bytes: &'a [u8],
+    /// `compressedSize` of the third §3a buffer (the sibling/child
+    /// "jump" offsets buffer encoding the tree walk).
+    pub jumps_compressed_size: u64,
+    /// Raw bytes of the third §3a buffer — exactly
+    /// `jumps_compressed_size` long, ready for
+    /// [`CompressedBuffer::parse`].
+    pub jumps_buffer_bytes: &'a [u8],
 }
+
+/// Defensive upper bound on any of the three PATHS buffers' declared
+/// `compressedSize`. The Elephant fixture's three buffers are 266,
+/// 145 and 97 bytes; the cap is several orders of magnitude above
+/// that to leave room for real asset files while still rejecting an
+/// obviously corrupt header before allocation.
+const PATHS_BUFFER_SIZE_CAP: u64 = 256 * 1024 * 1024; // 256 MiB
 
 impl<'a> PathsSection<'a> {
     /// Parse a complete `PATHS` section image. `section` is the
     /// payload bytes addressed by the TOC's `(offset, size)` pair
     /// for the section.
     ///
-    /// Errors propagate from [`PathsHeader::parse`].
+    /// Errors:
+    ///
+    /// * [`Error::InvalidData`](crate::Error) propagated from
+    ///   [`PathsHeader::parse`] (short header, over-cap numPaths,
+    ///   repeat mismatch),
+    /// * [`Error::InvalidData`] if any of the three `compressedSize`
+    ///   prefixes is truncated, oversize-cap-rejected, or refers to
+    ///   bytes past the section end,
+    /// * [`Error::InvalidData`] if the section has trailing bytes
+    ///   beyond the declared three-buffer layout (the section is
+    ///   exactly `16 + 8 + csize₁ + 8 + csize₂ + 8 + csize₃` bytes
+    ///   per the trace doc).
     pub fn parse(section: &'a [u8]) -> Result<Self> {
         let header = PathsHeader::parse(section)?;
-        let tail_bytes = &section[PathsHeader::SIZE..];
-        Ok(Self { header, tail_bytes })
+        let mut cursor = &section[PathsHeader::SIZE..];
+        let mut consumed = PathsHeader::SIZE;
+        let (pt_csz, pt_bytes, after_pt) =
+            read_paths_buffer(cursor, "path-tokens", section.len() - consumed)?;
+        cursor = after_pt;
+        consumed += 8 + pt_bytes.len();
+        let (et_csz, et_bytes, after_et) =
+            read_paths_buffer(cursor, "element-tokens", section.len() - consumed)?;
+        cursor = after_et;
+        consumed += 8 + et_bytes.len();
+        let (jp_csz, jp_bytes, after_jp) =
+            read_paths_buffer(cursor, "jumps", section.len() - consumed)?;
+        cursor = after_jp;
+        consumed += 8 + jp_bytes.len();
+        if !cursor.is_empty() {
+            return Err(invalid(format!(
+                "USDC §4.5 PATHS section: {} trailing bytes after the three-buffer layout (header(16) + three (csize prefix(8) + csize) triples must equal section size)",
+                cursor.len()
+            )));
+        }
+        debug_assert_eq!(consumed, section.len());
+        Ok(Self {
+            header,
+            path_tokens_compressed_size: pt_csz,
+            path_tokens_buffer_bytes: pt_bytes,
+            element_tokens_compressed_size: et_csz,
+            element_tokens_buffer_bytes: et_bytes,
+            jumps_compressed_size: jp_csz,
+            jumps_buffer_bytes: jp_bytes,
+        })
     }
 
-    /// The trailing bytes after the 16-byte header. Opaque until the
-    /// compressed-buffer layout for §4.5 is grounded in the trace
-    /// doc — see the module docs for the docs gap.
-    pub fn tail_bytes(&self) -> &'a [u8] {
-        self.tail_bytes
+    /// Forward to [`CompressedBuffer::parse`] on the first buffer
+    /// (the path-token indices buffer): one token-pool index per path
+    /// element naming the path component.
+    pub fn path_tokens_buffer(&self) -> Result<CompressedBuffer<'a>> {
+        CompressedBuffer::parse(self.path_tokens_buffer_bytes)
     }
+
+    /// Forward to [`CompressedBuffer::parse`] on the second buffer
+    /// (the element-token indices buffer).
+    pub fn element_tokens_buffer(&self) -> Result<CompressedBuffer<'a>> {
+        CompressedBuffer::parse(self.element_tokens_buffer_bytes)
+    }
+
+    /// Forward to [`CompressedBuffer::parse`] on the third buffer
+    /// (the sibling/child "jump" offsets buffer that drives the
+    /// tree-walk reconstruction of the namespace).
+    pub fn jumps_buffer(&self) -> Result<CompressedBuffer<'a>> {
+        CompressedBuffer::parse(self.jumps_buffer_bytes)
+    }
+}
+
+/// Helper used by [`PathsSection::parse`] to read one
+/// `(int64 compressedSize, bytes)` pair out of a slice. `label` is
+/// the buffer name used in error messages ("path-tokens",
+/// "element-tokens", or "jumps"). `remaining` is the number of
+/// section bytes still belonging to the PATHS section after the
+/// current cursor — used to bound the declared `compressedSize`
+/// against the section's footprint independently of the slice length.
+fn read_paths_buffer<'a>(
+    bytes: &'a [u8],
+    label: &str,
+    remaining: usize,
+) -> Result<(u64, &'a [u8], &'a [u8])> {
+    if bytes.len() < 8 {
+        return Err(invalid(format!(
+            "USDC §4.5 PATHS {label} buffer: compressedSize prefix truncated (need 8 bytes, only {} remain)",
+            bytes.len()
+        )));
+    }
+    let csz = read_u64_le(&bytes[0..8]);
+    if csz > PATHS_BUFFER_SIZE_CAP {
+        return Err(invalid(format!(
+            "USDC §4.5 PATHS {label} buffer compressedSize {csz} exceeds defensive cap {PATHS_BUFFER_SIZE_CAP}",
+        )));
+    }
+    let csz_usize = usize::try_from(csz).map_err(|_| {
+        invalid(format!(
+            "USDC §4.5 PATHS {label} buffer compressedSize {csz} does not fit in usize",
+        ))
+    })?;
+    let need = 8usize.checked_add(csz_usize).ok_or_else(|| {
+        invalid(format!(
+            "USDC §4.5 PATHS {label} buffer: 8 + compressedSize {csz} overflows usize",
+        ))
+    })?;
+    if remaining < need {
+        return Err(invalid(format!(
+            "USDC §4.5 PATHS {label} buffer: prefix + compressedSize {csz} need {need} bytes, only {remaining} remain in section",
+        )));
+    }
+    let body = &bytes[8..8 + csz_usize];
+    let tail = &bytes[8 + csz_usize..];
+    Ok((csz, body, tail))
 }
 
 /// The 8-byte header at the start of the §4.6 SPECS section.
@@ -3484,36 +3608,65 @@ mod tests {
         assert!(msg.contains("PATHS") && msg.contains("repeat"), "{msg}");
     }
 
+    /// Build a §4.5 PATHS section image with the three buffers
+    /// carrying the supplied raw payload bytes. The wire layout is
+    /// `int64 numPaths + int64 repeat + 3 × (int64 compressedSize +
+    /// bytes)`.
+    fn synth_paths_section(
+        num_paths: u64,
+        path_tokens: &[u8],
+        element_tokens: &[u8],
+        jumps: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&num_paths.to_le_bytes());
+        out.extend_from_slice(&num_paths.to_le_bytes());
+        out.extend_from_slice(&(path_tokens.len() as u64).to_le_bytes());
+        out.extend_from_slice(path_tokens);
+        out.extend_from_slice(&(element_tokens.len() as u64).to_le_bytes());
+        out.extend_from_slice(element_tokens);
+        out.extend_from_slice(&(jumps.len() as u64).to_le_bytes());
+        out.extend_from_slice(jumps);
+        out
+    }
+
     #[test]
     fn paths_section_parses_elephant_shape() {
-        // Synthesise the Elephant's section size: 16-byte header +
-        // 532 trailing bytes = 548 bytes total (matching the trace
-        // doc §2 TOC entry). We do NOT interpret the trailing bytes
-        // here — the §4.5 trace doc's single-buffer claim does not
-        // exhaust those 532 bytes and the trailing layout is a
-        // docs gap.
-        let mut section = Vec::with_capacity(548);
-        section.extend_from_slice(&248u64.to_le_bytes());
-        section.extend_from_slice(&248u64.to_le_bytes());
-        section.resize(548, 0x77);
+        // Trace doc §4.5 Elephant numbers: numPaths = 248, three
+        // buffer csizes 266 / 145 / 97. The synthetic section sets
+        // the three buffer payload sizes to those exact widths so the
+        // `16 + 3*(8 + csize) == section size` arithmetic
+        // (= 16 + 8 + 266 + 8 + 145 + 8 + 97 = 548) is exercised
+        // end-to-end against the trace doc's §2 TOC entry size.
+        let path_tokens = vec![0x10u8; 266];
+        let element_tokens = vec![0x20u8; 145];
+        let jumps = vec![0x30u8; 97];
+        let section = synth_paths_section(248, &path_tokens, &element_tokens, &jumps);
         assert_eq!(section.len(), 548);
         let sec = PathsSection::parse(&section).expect("parse section");
         assert_eq!(sec.header.num_paths, 248);
-        assert_eq!(sec.tail_bytes.len(), 548 - 16);
-        assert_eq!(sec.tail_bytes(), &section[16..]);
+        assert_eq!(sec.path_tokens_compressed_size, 266);
+        assert_eq!(sec.element_tokens_compressed_size, 145);
+        assert_eq!(sec.jumps_compressed_size, 97);
+        assert_eq!(sec.path_tokens_buffer_bytes, &path_tokens[..]);
+        assert_eq!(sec.element_tokens_buffer_bytes, &element_tokens[..]);
+        assert_eq!(sec.jumps_buffer_bytes, &jumps[..]);
     }
 
     #[test]
     fn paths_section_parses_zero_count_minimal() {
-        // Synthetic minimum that still satisfies the repeat
-        // invariant: numPaths = 0 = repeat-count, no trailing bytes.
-        // The section is exactly 16 bytes long.
-        let mut section = Vec::with_capacity(16);
-        section.extend_from_slice(&0u64.to_le_bytes());
-        section.extend_from_slice(&0u64.to_le_bytes());
+        // numPaths = 0 = repeat-count, three zero-length buffers.
+        // The section is exactly 16 + 3*8 bytes long.
+        let section = synth_paths_section(0, &[], &[], &[]);
+        assert_eq!(section.len(), 16 + 3 * 8);
         let sec = PathsSection::parse(&section).expect("parse zero-count");
         assert_eq!(sec.header.num_paths, 0);
-        assert!(sec.tail_bytes.is_empty());
+        assert_eq!(sec.path_tokens_compressed_size, 0);
+        assert_eq!(sec.element_tokens_compressed_size, 0);
+        assert_eq!(sec.jumps_compressed_size, 0);
+        assert!(sec.path_tokens_buffer_bytes.is_empty());
+        assert!(sec.element_tokens_buffer_bytes.is_empty());
+        assert!(sec.jumps_buffer_bytes.is_empty());
     }
 
     #[test]
@@ -3538,11 +3691,59 @@ mod tests {
     }
 
     #[test]
+    fn paths_section_rejects_truncated_second_csize_prefix() {
+        // count header (16 B) + first buffer (csize+bytes), then only
+        // 4 bytes of the second buffer's csize prefix.
+        let mut section = Vec::new();
+        section.extend_from_slice(&5u64.to_le_bytes()); // numPaths
+        section.extend_from_slice(&5u64.to_le_bytes()); // repeat
+        section.extend_from_slice(&3u64.to_le_bytes()); // csize1 = 3
+        section.extend_from_slice(&[0xAA, 0xBB, 0xCC]); // 3 bytes of buf1
+        section.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // half of csize2
+        let err = PathsSection::parse(&section).expect_err("short csize2 prefix");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("element-tokens") && msg.contains("compressedSize prefix"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn paths_section_rejects_oversized_third_buffer() {
+        // header + (csize1, buf1) + (csize2, buf2) + (csize3=100, but
+        // only 4 buf3 bytes present).
+        let mut section = Vec::new();
+        section.extend_from_slice(&5u64.to_le_bytes()); // numPaths
+        section.extend_from_slice(&5u64.to_le_bytes()); // repeat
+        section.extend_from_slice(&2u64.to_le_bytes());
+        section.extend_from_slice(&[0xAA, 0xBB]);
+        section.extend_from_slice(&2u64.to_le_bytes());
+        section.extend_from_slice(&[0xCC, 0xDD]);
+        section.extend_from_slice(&100u64.to_le_bytes()); // csize3 = 100
+        section.extend_from_slice(&[0xEE, 0xFF, 0x11, 0x22]); // only 4 bytes
+        let err = PathsSection::parse(&section).expect_err("third buffer overrun");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("jumps") && msg.contains("remain in section"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn paths_section_rejects_trailing_bytes() {
+        // Append a stray byte beyond the declared three-buffer layout.
+        let mut section = synth_paths_section(1, &[0xAA], &[0xBB], &[0xCC]);
+        section.push(0x99);
+        let err = PathsSection::parse(&section).expect_err("trailing byte must fail");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("PATHS") && msg.contains("trailing"), "{msg}");
+    }
+
+    #[test]
     fn real_fixture_paths_section_parses() {
         // Cross-validate against the trace doc's §4.5 Elephant facts:
-        // PATHS offset = 0x0cf92b, size = 548. The §4.5 worked
-        // example documents num_paths = 248 and a leading repeat
-        // count that equals num_paths.
+        // PATHS offset = 0x0cf92b, size = 548, numPaths = 248, three
+        // buffers of compressedSize 266 / 145 / 97.
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../docs/3d/usd/fixtures/SoC-ElephantWithMonochord.usdc");
         if !fixture.exists() {
@@ -3563,10 +3764,30 @@ mod tests {
         let section = &bytes[off..off + sz];
         let sec = PathsSection::parse(section).expect("parse PATHS section");
         assert_eq!(sec.header.num_paths, 248, "trace doc §4.5 numPaths");
-        // tail_bytes carries everything after the 16-byte header.
-        assert_eq!(sec.tail_bytes.len(), 548 - 16);
-        // The bytes are a borrow into the input section.
-        assert_eq!(sec.tail_bytes.as_ptr(), section[16..].as_ptr());
+        // Trace doc §4.5 worked example: csizes 266 / 145 / 97.
+        assert_eq!(sec.path_tokens_compressed_size, 266, "buffer 1 csize");
+        assert_eq!(sec.element_tokens_compressed_size, 145, "buffer 2 csize");
+        assert_eq!(sec.jumps_compressed_size, 97, "buffer 3 csize");
+        // The three buffers consume exactly the section footprint:
+        // 16 + 8 + 266 + 8 + 145 + 8 + 97 = 548.
+        assert_eq!(
+            16 + 8
+                + sec.path_tokens_buffer_bytes.len()
+                + 8
+                + sec.element_tokens_buffer_bytes.len()
+                + 8
+                + sec.jumps_buffer_bytes.len(),
+            548
+        );
+        // Each buffer slice borrows into the input section.
+        assert_eq!(
+            sec.path_tokens_buffer_bytes.as_ptr(),
+            section[24..].as_ptr()
+        );
+        // Each §3a buffer is walkable as a compressed-buffer envelope.
+        sec.path_tokens_buffer().expect("buf1 §3a envelope");
+        sec.element_tokens_buffer().expect("buf2 §3a envelope");
+        sec.jumps_buffer().expect("buf3 §3a envelope");
     }
 
     // ----- §4.6 SPECS section framing tests -----

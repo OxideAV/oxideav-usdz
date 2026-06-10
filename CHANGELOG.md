@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 273 (USDC §4.5 PATHS three-buffer framing)
+
+- **`usdc::PathsSection` now splits the three §3a compressed
+  buffers.** Round 236 landed the §4.5 PATHS section's 16-byte
+  leading prefix (`int64 numPaths` + repeated count) but surfaced
+  the trailing region as a single opaque `tail_bytes` slice,
+  because the trace doc's then-stated single-buffer count did not
+  exhaust the Elephant fixture's 532 trailing bytes. The docs
+  collaborator has since corrected §4.5 to record **three**
+  `(int64 compressedSize, §3a buffer)` triples — the parallel
+  arrays of the namespace path tree: path-token indices,
+  element-token indices, and sibling/child "jump" offsets.
+  `PathsSection::parse` now reads all three, enforcing
+  `16 + 8 + csize₁ + 8 + csize₂ + 8 + csize₃ == section_size`
+  exactly — trailing bytes the trace doesn't authorise are an
+  `Error::InvalidData`. The opaque `tail_bytes` field is replaced
+  by `path_tokens_buffer_bytes` / `element_tokens_buffer_bytes` /
+  `jumps_buffer_bytes` (plus their `*_compressed_size` companions)
+  and the `path_tokens_buffer` / `element_tokens_buffer` /
+  `jumps_buffer` accessors forwarding each bounded slice to
+  `CompressedBuffer::parse`, mirroring the §4.3 FIELDS and §4.6
+  SPECS multi-buffer framing. Defensive caps on the buffer sizes
+  (256 MiB) cut off a hostile or corrupted prefix before
+  allocation.
+- Cross-validated against the Elephant fixture under
+  `docs/3d/usd/fixtures/`: the TOC's PATHS entry sits at
+  `offset = 0x0cf92b` with `size = 548`, the header parses to
+  `num_paths = 248`, the three buffer prefixes carry
+  `csize₁ = 266`, `csize₂ = 145`, `csize₃ = 97`, and the total
+  footprint `16 + 8 + 266 + 8 + 145 + 8 + 97 = 548` matches the
+  section size on the wire; each buffer is walkable as a §3a
+  `CompressedBuffer` envelope.
+- The §3b per-element tree-walk reconstruction (the buffers go
+  through the common-value fast path) remains a separate
+  follow-up; this round lands the framing only.
+
 ### Added — Round 265 (USDC TOC standard-section table accessors)
 
 - **`usdc::Toc::standard_section_table`** — one-pass classifier

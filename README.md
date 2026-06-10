@@ -324,6 +324,36 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   module is required, so this oracle runs anywhere Apple USD Tools /
   the USD CLI binary is installed.
 
+## Round 273 scope (USDC §4.5 PATHS three-buffer framing)
+
+- **`usdc::PathsSection` splits the three §3a compressed buffers.**
+  The docs collaborator corrected trace doc §4.5 to record that the
+  PATHS section's trailing region (after the 16-byte
+  `numPaths`+repeat prefix) carries **three** `(int64
+  compressedSize, §3a buffer)` triples — the parallel arrays of the
+  namespace path tree: path-token indices, element-token indices,
+  and sibling/child "jump" offsets. Round 236's opaque `tail_bytes`
+  slice (a deliberate hold because the prior single-buffer claim
+  didn't exhaust the Elephant's 532 trailing bytes) is replaced by
+  `path_tokens_buffer_bytes` / `element_tokens_buffer_bytes` /
+  `jumps_buffer_bytes` (+ `*_compressed_size` companions) and the
+  matching `path_tokens_buffer` / `element_tokens_buffer` /
+  `jumps_buffer` accessors forwarding each bounded slice to
+  `CompressedBuffer::parse`, mirroring the §4.3 FIELDS and §4.6
+  SPECS multi-buffer framing. `PathsSection::parse` enforces
+  `16 + 8 + csize₁ + 8 + csize₂ + 8 + csize₃ == section_size`
+  exactly; trailing bytes the trace doesn't authorise are an
+  `Error::InvalidData`. Defensive caps (256 MiB per buffer) stop a
+  hostile prefix before allocation.
+- Cross-validated against the Elephant fixture under
+  `docs/3d/usd/fixtures/`: PATHS at `offset = 0x0cf92b`,
+  `size = 548`, `num_paths = 248`, three buffers of
+  `csize 266 / 145 / 97`, total footprint
+  `16 + 8 + 266 + 8 + 145 + 8 + 97 = 548`; each buffer walks as a
+  §3a `CompressedBuffer` envelope. Per-element tree-walk
+  reconstruction (the §3b common-value fast path) is a separate
+  follow-up — this round lands the framing only.
+
 ## Round 265 scope (USDC TOC standard-section table accessors)
 
 - **`usdc::Toc::standard_section_table`** — one-pass classifier
@@ -444,18 +474,13 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   repeat-equals-numPaths invariant the trace doc grounds in the
   bytes, and applies a defensive cap on `numPaths` (16 Mi) to
   bound downstream allocation against a hostile header.
-  `PathsSection::parse` surfaces the trailing bytes after the
-  prefix as an opaque `tail_bytes` slice so a future round can
-  layer the compressed-buffer decomposition once the trace doc
-  resolves whether §4.5 carries one §3a buffer or three (the
-  Elephant's 532 trailing bytes do not match the trace's stated
-  single-buffer count — see `CHANGELOG.md` for the open docs
-  question).
+  (Round 273 superseded the original opaque-`tail_bytes` hold once
+  the trace doc resolved §4.5 to three §3a buffers — see the
+  Round 273 scope above for the full three-buffer split.)
 - Cross-validated against the Elephant fixture under
   `docs/3d/usd/fixtures/`: the TOC's PATHS entry sits at
   `offset = 0x0cf92b` with `size = 548`, the section parses to
-  exactly the trace doc's `num_paths = 248`, and the trailing
-  opaque region is `548 − 16 = 532` bytes long.
+  exactly the trace doc's `num_paths = 248`.
 
 ## Round 229 scope (USDC §4.4 FIELDSETS section framing)
 
@@ -644,15 +669,14 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   trace of the public LZ4 block format lands, the chunk-payload
   decoder slots in here without changing the framing surface.
 - **`.usdc` section-payload semantics.** Rounds 212 / 217 / 222 /
-  229 land the TOKENS string-atom pool header (§4.1), the STRINGS
-  index table (§4.2), the FIELDS two-buffer framing (§4.3), and
-  the FIELDSETS single-buffer framing (§4.4). The remaining
-  per-section decoders — PATHS namespace-tree (§4.5; the trace
-  doc's caveat notes a recursive child/sibling jump encoding
-  rather than three flat §3b arrays) and SPECS three-buffer
-  spec table (§4.6) — stack on top of §3a + §3b without
-  re-parsing the bootstrap. The trace doc §4 records the
-  per-section header shape for each.
+  229 / 236 / 239 / 273 land the outer framing of all six
+  standard sections — TOKENS (§4.1), STRINGS (§4.2), the FIELDS
+  two-buffer framing (§4.3), the FIELDSETS single-buffer framing
+  (§4.4), the PATHS three-buffer framing (§4.5), and the SPECS
+  three-buffer spec table (§4.6). What remains is the per-element
+  *content* decode (below): the LZ4 block decompression and the
+  §3b common-value semantic recovery that turn each section's
+  bounded buffers into materialised values.
 - **§3b "common value" fast path.** Round 229's §4.4 framing
   exposes the buffer but the trace doc records that FIELDSETS
   (and PATHS) use a common-value compression step on top of
