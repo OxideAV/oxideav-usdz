@@ -154,12 +154,53 @@
 //!   buffer's `i32`s eventually resolve into is its own
 //!   fact-table extraction and stays deferred.
 //!
+//! What this module **adds in round 282**:
+//!
+//! * [`CompressedBuffer::decompress`] /
+//!   [`CompressedBuffer::decompress_exact`] — the missing LZ4
+//!   *block* layer of the §3a wrapper, delegated to `compcol`
+//!   (the workspace-wide compression collection). Every chunk is
+//!   block-decoded and the outputs concatenated in declaration
+//!   order, under a caller-supplied output bound (§3a stores no
+//!   uncompressed size of its own; the surrounding section headers
+//!   carry or imply it) so a hostile buffer can't balloon into a
+//!   decompression bomb.
+//! * The §3b **common-delta preamble** — the trace doc's
+//!   "common value" fast path (§4.4/§4.5 caveats), pinned down
+//!   empirically against the committed Elephant fixture:
+//!   [`decode_int_array`] now reads a leading `int32` common delta
+//!   and code `0` means *previous + common delta* (the trace's
+//!   documented form is the `commonDelta = 0` special case). All
+//!   eight int-coded fixture buffers decode **exactly** (zero
+//!   leftover bytes) under this model and yield semantically
+//!   coherent indices; see [`decode_int_array`]'s
+//!   empirical-grounding note for the invariants checked.
+//! * [`int_coded_max_len`] — the §3b arithmetic bound (preamble +
+//!   `ceil(N/4)` control bytes + at most 4 payload bytes per
+//!   element) used as the decompress budget for int-coded buffers.
+//! * End-to-end typed decoders chaining §3a → LZ4 → §3b:
+//!   [`TokensSection::decode`] (→ `Vec<String>`, the §4.1 token
+//!   pool), [`FieldsSection::decode_name_indices`] (→ `Vec<i32>`
+//!   token indices) and [`FieldsSection::decode_reps`]
+//!   (→ `Vec<u64>` packed value-rep words),
+//!   [`FieldSetsSection::decode_flat_indices`] /
+//!   [`FieldSetsSection::decode_field_sets`] (→ the §4.4
+//!   sentinel-separated field-index runs, now with literal
+//!   indices), [`SpecsSection::decode_path_indices`] /
+//!   [`SpecsSection::decode_fieldset_indices`] /
+//!   [`SpecsSection::decode_spec_types`] (→ the three `Vec<i32>`
+//!   join columns of the §4.6 spec table), and the three PATHS
+//!   raw-stream decoders ([`PathsSection::decode_path_token_ints`]
+//!   et al. — exact streams, semantics still deferred).
+//!
 //! What this module does **not** do (deferred to a follow-up round):
 //!
-//! * LZ4 block decompression of section payloads,
-//! * the FIELDSETS / PATHS payload semantics,
+//! * the PATHS per-element semantics (the tree-walk reconstruction
+//!   that turns the three exact integer streams into the `SdfPath`
+//!   namespace — the raw values don't directly index the token
+//!   pool, so the mapping needs trace coverage),
 //! * the SPECS spec-type enumeration (a separate fact-table
-//!   extraction layered on top of the §4.6 framing landing here),
+//!   extraction layered on top of the §4.6 framing),
 //! * the FIELDS value-rep type-code enumeration (a separate
 //!   fact-table extraction — see the gap tracker's Round B).
 //!
@@ -723,11 +764,12 @@ fn read_i32_le(bytes: &[u8]) -> i32 {
 
 /// One chunk inside a parsed §3a "compressed buffer".
 ///
-/// Each chunk's bytes are an opaque LZ4 *block* payload — this
-/// crate's [`CompressedBuffer::parse`] only decomposes the outer
-/// framing (chunk count + per-chunk length prefixes); the LZ4 block
-/// format itself is described by a public spec that is not staged
-/// under `docs/` so the actual decompression is left to the caller.
+/// Each chunk's bytes are an LZ4 *block* payload —
+/// [`CompressedBuffer::parse`] decomposes the outer framing (chunk
+/// count + per-chunk length prefixes) and
+/// [`CompressedBuffer::decompress`] peels the block layer itself
+/// (delegated to `compcol`, the workspace-wide compression
+/// collection; the LZ4 block format is a public, non-USD spec).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompressedChunk<'a> {
     /// Raw LZ4 *block* bytes for this chunk. Layout is per the public
@@ -835,6 +877,84 @@ impl<'a> CompressedBuffer<'a> {
             _ => None,
         }
     }
+
+    /// Decompress every chunk through the LZ4 *block* decoder and
+    /// concatenate the outputs in declaration order.
+    ///
+    /// The §3a wrapper stores no per-buffer uncompressed size of
+    /// its own — the surrounding section header either records it
+    /// (§4.1 TOKENS' `uncompressedSize`, §4.3 FIELDS' implicit
+    /// `numFields × 8` reps array) or bounds it arithmetically
+    /// (§3b int-coded streams, see [`int_coded_max_len`]) — so the
+    /// caller passes `max_decoded_len`, the largest output it is
+    /// prepared to accept. A buffer that would decode past the
+    /// bound fails with [`Error::InvalidData`](crate::Error)
+    /// instead of allocating: LZ4 match-copies can expand a tiny
+    /// input by a factor of ~255, so an unbounded decode is a
+    /// decompression-bomb hazard.
+    ///
+    /// The LZ4 block layer is delegated to `compcol` (the
+    /// workspace-wide compression collection); this module supplies
+    /// the §3a chunk framing and the output bound.
+    pub fn decompress(&self, max_decoded_len: usize) -> Result<Vec<u8>> {
+        let mut out: Vec<u8> = Vec::new();
+        let mut scratch: Vec<u8> = Vec::new();
+        let total = self.chunks.len();
+        for (i, chunk) in self.chunks.iter().enumerate() {
+            // `decode_block` never lets `scratch` outgrow the budget,
+            // so `out.len() <= max_decoded_len` holds on every pass.
+            let budget = max_decoded_len - out.len();
+            compcol::lz4::block::decode_block(chunk.bytes, &mut scratch, budget).map_err(|e| {
+                invalid(format!(
+                    "USDC §3a compressed buffer: LZ4 block decode of chunk {i}/{total} failed ({e}); decoded output is bounded at {max_decoded_len} bytes"
+                ))
+            })?;
+            out.extend_from_slice(&scratch);
+        }
+        Ok(out)
+    }
+
+    /// [`Self::decompress`] plus an exact-length check: the decoded
+    /// output must be `expected_len` bytes, no more, no fewer. Use
+    /// this when the section header records the uncompressed size
+    /// (§4.1 TOKENS) or fully determines it (§4.3 FIELDS reps =
+    /// `numFields × 8`).
+    pub fn decompress_exact(&self, expected_len: usize) -> Result<Vec<u8>> {
+        let out = self.decompress(expected_len)?;
+        if out.len() != expected_len {
+            return Err(invalid(format!(
+                "USDC §3a compressed buffer: decompressed to {} bytes, the section header records {expected_len}",
+                out.len()
+            )));
+        }
+        Ok(out)
+    }
+}
+
+/// Trailing slack added to [`int_coded_max_len`]'s arithmetic bound.
+///
+/// All eight int-coded buffers of the committed Elephant fixture
+/// decompress to **exactly** the bytes [`decode_int_array`]
+/// consumes, so the slack is purely defensive headroom for writer
+/// padding variations; it doesn't meaningfully weaken the
+/// decompression-bomb guard.
+const INT_CODED_TRAILING_SLACK: usize = 16;
+
+/// Upper bound on the decompressed byte length of a §3b int-coded
+/// stream carrying `count` elements: the 4-byte common-delta
+/// preamble, plus `ceil(count/4)` control bytes, plus at most 4
+/// payload bytes per element (the code-3 `int32` case), plus
+/// [`INT_CODED_TRAILING_SLACK`].
+///
+/// Used as the [`CompressedBuffer::decompress`] budget when the
+/// decompressed form is a §3b stream (FIELDS name indices, the
+/// FIELDSETS array, the three PATHS arrays, the three SPECS join
+/// columns).
+pub fn int_coded_max_len(count: usize) -> usize {
+    4usize
+        .saturating_add(count.div_ceil(4))
+        .saturating_add(count.saturating_mul(4))
+        .saturating_add(INT_CODED_TRAILING_SLACK)
 }
 
 /// The 24-byte header at the start of the §4.1 TOKENS section.
@@ -952,6 +1072,25 @@ impl<'a> TokensSection<'a> {
     pub fn buffer(&self) -> Result<CompressedBuffer<'a>> {
         CompressedBuffer::parse(self.buffer_bytes)
     }
+
+    /// End-to-end §4.1 decode: peel the §3a framing, LZ4-decompress
+    /// to exactly `header.uncompressed_size` bytes, and NUL-split
+    /// into the `header.num_tokens` UTF-8 token strings.
+    ///
+    /// On the Elephant fixture this yields the 192-entry string-atom
+    /// pool the trace doc's §4.1 worked example excerpts
+    /// (`defaultPrim`, `SoC_ElephantWithMonochord`, …,
+    /// `timeSamples`).
+    pub fn decode(&self) -> Result<Vec<String>> {
+        let want = usize::try_from(self.header.uncompressed_size).map_err(|_| {
+            invalid(format!(
+                "USDC §4.1 TOKENS uncompressedSize {} does not fit in usize",
+                self.header.uncompressed_size
+            ))
+        })?;
+        let blob = self.buffer()?.decompress_exact(want)?;
+        split_tokens_blob(&blob, &self.header)
+    }
 }
 
 /// Split a *decompressed* TOKENS blob (NUL-separated UTF-8 strings,
@@ -1044,28 +1183,63 @@ pub fn split_tokens_blob(blob: &[u8], header: &TokensHeader) -> Result<Vec<Strin
     Ok(tokens)
 }
 
-/// Decode the §3b "compressed integer" stream: a 2-bit-per-element
-/// control stream followed by variable-width payload bytes.
+/// Decode the §3b "compressed integer" stream: a 4-byte
+/// **common-delta preamble**, then a 2-bit-per-element control
+/// stream, then variable-width payload bytes.
 ///
 /// `buf` is the already-decompressed bytes of an §3b integer buffer
 /// (one would normally arrive at this slice by first peeling the §3a
 /// LZ4 wrapper that wraps the compressed buffer on disk). `count` is
 /// the expected element count, carried in the section header.
 ///
-/// Per the trace doc:
+/// Stream layout:
 ///
-/// 1. A **control stream** of `ceil(N/4)` bytes — 2 bits per integer,
+/// 1. A leading `int32` LE **common delta** — the trace doc's §3b
+///    "common value" fast path, pinned down empirically against the
+///    committed Elephant fixture (see below).
+/// 2. A **control stream** of `ceil(N/4)` bytes — 2 bits per integer,
 ///    **LSB-first** within each byte — encodes one of four operations
 ///    per element:
-///    * `0` → repeat previous value (delta 0), 0 payload bytes
+///    * `0` → previous value **+ the common delta**, 0 payload bytes
 ///    * `1` → `int8` signed delta from previous, 1 payload byte
 ///    * `2` → `int16` signed delta from previous, 2 payload bytes
-///    * `3` → `int32` **value** (absolute, not a delta), 4 payload bytes
-/// 2. The variable-width **payload bytes**, in array order.
+///    * `3` → `int32` **value** (absolute, not a delta, per the
+///      trace doc), 4 payload bytes
+/// 3. The variable-width **payload bytes**, in array order.
 ///
 /// The "previous" value starts at zero for the first element (a
-/// leading code `0` therefore produces `0`; a leading code `1` of
-/// payload byte `0x05` produces `5`).
+/// leading code `0` therefore produces the common delta itself; a
+/// leading code `1` of payload byte `0x05` produces `5`).
+///
+/// ## Empirical grounding of the preamble
+///
+/// The trace doc's §3b prose describes the control stream + payload
+/// but flags a "common value" fast path it had not yet recovered
+/// (§4.4/§4.5 caveats). Decoding all eight int-coded buffers of the
+/// committed Elephant fixture (FIELDS names, FIELDSETS, the three
+/// PATHS arrays, the three SPECS arrays) with the 4-byte
+/// common-delta preamble described above consumes every buffer
+/// **exactly** — zero leftover payload bytes in all eight — and
+/// yields semantically coherent values everywhere the trace doc
+/// gives the arrays meaning:
+///
+/// * SPECS path indices come out as an exact permutation of
+///   `0..248` (`numPaths` = 248, one spec row per path);
+/// * FIELDS name indices come out in `1..=191` (all valid TOKENS
+///   indices) and resolve to the expected root-layer field names
+///   (`defaultPrim`, `endTimeCode`, `framesPerSecond`,
+///   `metersPerUnit`, …);
+/// * FIELDSETS values come out as field indices in `0..157`
+///   separated by the documented `-1` sentinels;
+/// * SPECS field-set indices come out in `0..571` (within the
+///   576-entry FIELDSETS array) and spec types in `1..=8`.
+///
+/// The preamble-less §3b reading (treating the first 4 bytes as
+/// control) produces out-of-range/negative indices on the same
+/// buffers, so the preamble form is the on-disk reality; the
+/// trace doc's documented form is its `commonDelta = 0` special
+/// case. Code `3` is not exercised by any fixture buffer, so its
+/// absolute-value semantics rest on the trace doc alone.
 ///
 /// Returns the reconstructed sequence as `i32`s (the on-disk
 /// representation: token indices, jump offsets, and field indices
@@ -1073,21 +1247,30 @@ pub fn split_tokens_blob(blob: &[u8], header: &TokensHeader) -> Result<Vec<Strin
 ///
 /// Errors:
 ///
-/// * `Error::InvalidData` if the control stream is shorter than
-///   `ceil(count/4)` bytes, or if the payload runs short for the
-///   widths the control stream declared.
+/// * `Error::InvalidData` if the buffer is shorter than the 4-byte
+///   preamble plus the `ceil(count/4)`-byte control stream, or if
+///   the payload runs short for the widths the control stream
+///   declared.
 pub fn decode_int_array(buf: &[u8], count: usize) -> Result<Vec<i32>> {
     if count == 0 {
         return Ok(Vec::new());
     }
-    let control_bytes = count.div_ceil(4);
-    if buf.len() < control_bytes {
+    if buf.len() < 4 {
         return Err(invalid(format!(
-            "USDC int-coded array: control stream needs {control_bytes} bytes ({count} elements at 2 bits each), buffer is only {} bytes",
+            "USDC int-coded array: 4-byte common-delta preamble truncated (buffer is only {} bytes)",
             buf.len()
         )));
     }
-    let (control, mut payload) = buf.split_at(control_bytes);
+    let common_delta = i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let body = &buf[4..];
+    let control_bytes = count.div_ceil(4);
+    if body.len() < control_bytes {
+        return Err(invalid(format!(
+            "USDC int-coded array: control stream needs {control_bytes} bytes ({count} elements at 2 bits each), only {} remain after the common-delta preamble",
+            body.len()
+        )));
+    }
+    let (control, mut payload) = body.split_at(control_bytes);
     let mut out: Vec<i32> = Vec::with_capacity(count);
     let mut prev: i32 = 0;
     for i in 0..count {
@@ -1096,7 +1279,7 @@ pub fn decode_int_array(buf: &[u8], count: usize) -> Result<Vec<i32>> {
         // = 1 takes bits 2-3, = 2 takes bits 4-5, = 3 takes bits 6-7.
         let code = (byte >> ((i % 4) * 2)) & 0b11;
         let value = match code {
-            0 => prev,
+            0 => prev.wrapping_add(common_delta),
             1 => {
                 if payload.is_empty() {
                     return Err(invalid(format!(
@@ -1137,27 +1320,41 @@ pub fn decode_int_array(buf: &[u8], count: usize) -> Result<Vec<i32>> {
     Ok(out)
 }
 
-/// Encode `values` as a §3b "compressed integer" stream. The inverse
-/// of [`decode_int_array`]; used internally by tests to synthesise
+/// Encode `values` as a §3b "compressed integer" stream (including
+/// the 4-byte common-delta preamble). The inverse of
+/// [`decode_int_array`]; used internally by tests to synthesise
 /// round-trip fixtures from known integer sequences without first
 /// committing a corpus of real `.usdc` byte buffers.
 ///
-/// Not part of the on-disk writer surface — the encoder picks
-/// per-element widths greedily (use code `0` when the delta is zero,
-/// else the smallest width that fits the delta), which exercises
-/// every decode path but isn't necessarily byte-identical to what
-/// a reference writer would produce.
+/// Not part of the on-disk writer surface — the encoder picks the
+/// most frequent element-to-element delta as the common delta, then
+/// chooses per-element widths greedily (code `0` when the delta
+/// equals the common delta, else the smallest width that fits),
+/// which exercises every decode path but isn't necessarily
+/// byte-identical to what a reference writer would produce.
 pub fn encode_int_array_for_tests(values: &[i32]) -> Vec<u8> {
     if values.is_empty() {
         return Vec::new();
     }
+    // Pick the most frequent delta as the preamble's common delta.
+    let mut prev: i32 = 0;
+    let mut histogram: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+    for &v in values {
+        *histogram.entry(v.wrapping_sub(prev)).or_insert(0) += 1;
+        prev = v;
+    }
+    let common_delta = histogram
+        .iter()
+        .max_by_key(|(delta, n)| (**n, std::cmp::Reverse(**delta)))
+        .map(|(delta, _)| *delta)
+        .unwrap_or(0);
     let control_bytes = values.len().div_ceil(4);
     let mut control = vec![0u8; control_bytes];
     let mut payload: Vec<u8> = Vec::new();
     let mut prev: i32 = 0;
     for (i, &v) in values.iter().enumerate() {
         let delta = v.wrapping_sub(prev);
-        let code: u8 = if delta == 0 {
+        let code: u8 = if delta == common_delta {
             0
         } else if (-128..=127).contains(&delta) {
             payload.push((delta as i8) as u8);
@@ -1172,7 +1369,8 @@ pub fn encode_int_array_for_tests(values: &[i32]) -> Vec<u8> {
         control[i / 4] |= code << ((i % 4) * 2);
         prev = v;
     }
-    let mut out = control;
+    let mut out = common_delta.to_le_bytes().to_vec();
+    out.extend(control);
     out.extend(payload);
     out
 }
@@ -1478,6 +1676,59 @@ impl<'a> FieldsSection<'a> {
     pub fn reps_buffer(&self) -> Result<CompressedBuffer<'a>> {
         CompressedBuffer::parse(self.reps_buffer_bytes)
     }
+
+    /// End-to-end decode of the first buffer: §3a framing →
+    /// LZ4 block layer → §3b int-coded stream → `num_fields`
+    /// per-field **token indices** (each field's name, an index
+    /// into the §4.1 TOKENS atom pool).
+    ///
+    /// On the Elephant fixture this yields 157 indices opening
+    /// `[1, 3, 4, 5, 6, 7, 8, 10, …]`, which resolve through the
+    /// TOKENS pool to `defaultPrim`, `endTimeCode`,
+    /// `framesPerSecond`, `metersPerUnit`, `startTimeCode`,
+    /// `timeCodesPerSecond`, `upAxis`, `primChildren`, … — the
+    /// root-layer metadata names. (The trace doc's §4.3 worked
+    /// example shows `[0, 0, …, 0, 20, 101, …]`; those values are
+    /// artifacts of decoding without the §3b common-delta preamble
+    /// — see [`decode_int_array`]'s empirical-grounding note.)
+    pub fn decode_name_indices(&self) -> Result<Vec<i32>> {
+        let count = usize::try_from(self.header.num_fields).map_err(|_| {
+            invalid(format!(
+                "USDC §4.3 FIELDS numFields {} does not fit in usize",
+                self.header.num_fields
+            ))
+        })?;
+        let blob = self.names_buffer()?.decompress(int_coded_max_len(count))?;
+        decode_int_array(&blob, count)
+    }
+
+    /// End-to-end decode of the second buffer: §3a framing →
+    /// LZ4 block layer → `num_fields × uint64` packed **value-rep**
+    /// words (little-endian). Per the trace doc the high bytes
+    /// carry the type code + flags and the low bytes an inline
+    /// value or file offset; this method surfaces the raw words —
+    /// the type-code enumeration is a separate fact-table
+    /// extraction (gap tracker Round B) and is deliberately not
+    /// interpreted here.
+    ///
+    /// On the Elephant fixture the first words match the trace
+    /// doc's §4.3 hex excerpt (`0x400b000000000002`,
+    /// `0x0009000000000058`, …).
+    pub fn decode_reps(&self) -> Result<Vec<u64>> {
+        let count = usize::try_from(self.header.num_fields).map_err(|_| {
+            invalid(format!(
+                "USDC §4.3 FIELDS numFields {} does not fit in usize",
+                self.header.num_fields
+            ))
+        })?;
+        let want = count.checked_mul(8).ok_or_else(|| {
+            invalid(format!(
+                "USDC §4.3 FIELDS reps array: numFields {count} × 8 overflows usize"
+            ))
+        })?;
+        let blob = self.reps_buffer()?.decompress_exact(want)?;
+        Ok(blob.chunks_exact(8).map(read_u64_le).collect())
+    }
 }
 
 /// Helper used by [`FieldsSection::parse`] to read one
@@ -1548,14 +1799,12 @@ fn read_sized_buffer<'a>(
 /// `count`. The `(compressedSize, buffer)` pair is surfaced by
 /// [`FieldSetsSection`] below.
 ///
-/// Per the trace doc's §4.4 caveat the §3b stream uses the "common
-/// value" fast path, which means a naive [`decode_int_array`] call on
-/// the decompressed buffer recovers the **structure** (count, run
-/// boundaries) but not the literal field indices; the per-element
-/// semantic recovery needs a separate decoder step that the trace
-/// doc records as a future fact extraction. This module deliberately
-/// stops at the framing — the LZ4 block payload and the common-value
-/// step are both deferred.
+/// The trace doc's §4.4 caveat (the §3b "common value" fast path)
+/// is resolved by the 4-byte common-delta preamble — see
+/// [`decode_int_array`]'s empirical-grounding note.
+/// [`FieldSetsSection::decode_flat_indices`] /
+/// [`FieldSetsSection::decode_field_sets`] run the full
+/// §3a → LZ4 → §3b chain and recover the literal field indices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FieldSetsHeader {
     /// Number of post-decode `i32` elements the buffer carries. Each
@@ -1694,12 +1943,42 @@ impl<'a> FieldSetsSection<'a> {
     }
 
     /// Forward to [`CompressedBuffer::parse`] on the buffer slice.
-    /// Once the LZ4 block-format decoder is wired in, the
-    /// decompressed output is the input to [`decode_int_array`] with
-    /// `count = header.count`, yielding the concatenated field-set
-    /// `i32` array (each `-1` separating one set from the next).
+    /// The decompressed output is the input to [`decode_int_array`]
+    /// with `count = header.count`, yielding the concatenated
+    /// field-set `i32` array (each `-1` separating one set from the
+    /// next).
     pub fn buffer(&self) -> Result<CompressedBuffer<'a>> {
         CompressedBuffer::parse(self.buffer_bytes)
+    }
+
+    /// End-to-end decode of the section's buffer: §3a framing →
+    /// LZ4 block layer → §3b int-coded stream → the flat
+    /// `header.count`-element array of field indices with `-1`
+    /// sentinels between sets.
+    ///
+    /// On the Elephant fixture this yields 576 values in
+    /// `-1..157` — every non-sentinel a valid index into the
+    /// 157-entry §4.3 FIELDS table — opening
+    /// `[0, 1, 2, 3, 4, 5, 6, 7, -1, 8, …]` (the root layer's
+    /// eight metadata fields, then the sentinel closing the first
+    /// set). The trace doc's §4.4 caveat about the "common value"
+    /// fast path is resolved by the §3b common-delta preamble —
+    /// see [`decode_int_array`]'s empirical-grounding note.
+    pub fn decode_flat_indices(&self) -> Result<Vec<i32>> {
+        let count = usize::try_from(self.header.count).map_err(|_| {
+            invalid(format!(
+                "USDC §4.4 FIELDSETS count {} does not fit in usize",
+                self.header.count
+            ))
+        })?;
+        let blob = self.buffer()?.decompress(int_coded_max_len(count))?;
+        decode_int_array(&blob, count)
+    }
+
+    /// [`Self::decode_flat_indices`] + [`split_field_sets`]: the
+    /// per-set field-index lists, sentinels stripped.
+    pub fn decode_field_sets(&self) -> Result<Vec<Vec<i32>>> {
+        Ok(split_field_sets(&self.decode_flat_indices()?))
     }
 }
 
@@ -1932,6 +2211,50 @@ impl<'a> PathsSection<'a> {
     /// tree-walk reconstruction of the namespace).
     pub fn jumps_buffer(&self) -> Result<CompressedBuffer<'a>> {
         CompressedBuffer::parse(self.jumps_buffer_bytes)
+    }
+
+    /// Shared §3a → LZ4 → §3b chain for the three PATHS buffers.
+    ///
+    /// Each buffer decodes **exactly** as a `num_paths`-element §3b
+    /// stream on the Elephant fixture (zero leftover bytes), so the
+    /// integer streams themselves are recovered. What the integers
+    /// *mean* per element is only partly grounded: the raw
+    /// path-token values exceed the TOKENS pool size on the
+    /// fixture, so the trace doc's per-buffer "holds" column
+    /// (§4.5's table) is not a direct index semantics — the
+    /// tree-walk reconstruction that consumes these three streams
+    /// stays deferred until the trace covers it.
+    fn decode_int_buffer(&self, buffer_bytes: &[u8]) -> Result<Vec<i32>> {
+        let count = usize::try_from(self.header.num_paths).map_err(|_| {
+            invalid(format!(
+                "USDC §4.5 PATHS numPaths {} does not fit in usize",
+                self.header.num_paths
+            ))
+        })?;
+        let blob = CompressedBuffer::parse(buffer_bytes)?.decompress(int_coded_max_len(count))?;
+        decode_int_array(&blob, count)
+    }
+
+    /// End-to-end decode of the first buffer as a raw
+    /// `num_paths`-element §3b integer stream. See
+    /// [`Self::decode_int_buffer`]'s caveat: the per-element
+    /// semantic mapping (the tree-walk) is deferred.
+    pub fn decode_path_token_ints(&self) -> Result<Vec<i32>> {
+        self.decode_int_buffer(self.path_tokens_buffer_bytes)
+    }
+
+    /// End-to-end decode of the second buffer as a raw
+    /// `num_paths`-element §3b integer stream. Same caveat as
+    /// [`Self::decode_path_token_ints`].
+    pub fn decode_element_token_ints(&self) -> Result<Vec<i32>> {
+        self.decode_int_buffer(self.element_tokens_buffer_bytes)
+    }
+
+    /// End-to-end decode of the third buffer as a raw
+    /// `num_paths`-element §3b integer stream. Same caveat as
+    /// [`Self::decode_path_token_ints`].
+    pub fn decode_jump_ints(&self) -> Result<Vec<i32>> {
+        self.decode_int_buffer(self.jumps_buffer_bytes)
     }
 }
 
@@ -2176,6 +2499,45 @@ impl<'a> SpecsSection<'a> {
     pub fn types_buffer(&self) -> Result<CompressedBuffer<'a>> {
         CompressedBuffer::parse(self.types_buffer_bytes)
     }
+
+    /// Shared §3a → LZ4 → §3b chain for the three SPECS buffers:
+    /// parse the chunk framing, decompress under the
+    /// [`int_coded_max_len`] budget, and decode `header.count`
+    /// int-coded elements. On the Elephant fixture the decoded
+    /// path indices come out as an exact permutation of
+    /// `0..numPaths` — see [`decode_int_array`]'s
+    /// empirical-grounding note.
+    fn decode_int_buffer(&self, buffer_bytes: &[u8]) -> Result<Vec<i32>> {
+        let count = usize::try_from(self.header.count).map_err(|_| {
+            invalid(format!(
+                "USDC §4.6 SPECS count {} does not fit in usize",
+                self.header.count
+            ))
+        })?;
+        let blob = CompressedBuffer::parse(buffer_bytes)?.decompress(int_coded_max_len(count))?;
+        decode_int_array(&blob, count)
+    }
+
+    /// End-to-end decode of the first buffer: `count` per-row
+    /// **path indices** into the §4.5 PATHS namespace tree.
+    pub fn decode_path_indices(&self) -> Result<Vec<i32>> {
+        self.decode_int_buffer(self.paths_buffer_bytes)
+    }
+
+    /// End-to-end decode of the second buffer: `count` per-row
+    /// **field-set indices** into the §4.4 FIELDSETS array.
+    pub fn decode_fieldset_indices(&self) -> Result<Vec<i32>> {
+        self.decode_int_buffer(self.fieldsets_buffer_bytes)
+    }
+
+    /// End-to-end decode of the third buffer: `count` per-row
+    /// integer **spec-type codes**. The mapping of the codes to
+    /// (prim / attribute / relationship / …) is a separate
+    /// fact-table extraction and is deliberately not interpreted
+    /// here — the raw `i32`s are surfaced as-is.
+    pub fn decode_spec_types(&self) -> Result<Vec<i32>> {
+        self.decode_int_buffer(self.types_buffer_bytes)
+    }
 }
 
 /// Helper used by [`SpecsSection::parse`] to read one
@@ -2396,6 +2758,14 @@ mod tests {
 
     // ----- §3b integer-coding tests -----
 
+    /// Prepend the 4-byte LE common-delta preamble to a hand-built
+    /// control + payload stream.
+    fn with_common_delta(common_delta: i32, body: &[u8]) -> Vec<u8> {
+        let mut out = common_delta.to_le_bytes().to_vec();
+        out.extend_from_slice(body);
+        out
+    }
+
     #[test]
     fn int_array_empty() {
         assert!(decode_int_array(&[], 0).unwrap().is_empty());
@@ -2403,10 +2773,23 @@ mod tests {
 
     #[test]
     fn int_array_all_zero_deltas_use_one_control_byte_per_four_elements() {
-        // Four zeros: control = 0x00 (four code-0s), no payload.
-        let buf = vec![0x00];
+        // commonDelta = 0; four code-0s pack into control = 0x00,
+        // no payload. Every element repeats prev (+0) → all zeros.
+        let buf = with_common_delta(0, &[0x00]);
         let out = decode_int_array(&buf, 4).unwrap();
         assert_eq!(out, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn int_array_code0_applies_nonzero_common_delta() {
+        // commonDelta = 1; four code-0s → prev+1 each step from
+        // prev=0 → [1, 2, 3, 4]. This is the fast path the Elephant's
+        // SPECS path-index buffer uses (its decoded array is the
+        // identity permutation 0,1,2,…,247 with commonDelta 1 and a
+        // code-1 zero-delta first element).
+        let buf = with_common_delta(1, &[0x00]);
+        let out = decode_int_array(&buf, 4).unwrap();
+        assert_eq!(out, vec![1, 2, 3, 4]);
     }
 
     #[test]
@@ -2415,7 +2798,7 @@ mod tests {
         // LSB-first: bits 0-1 = 1, bits 2-3 = 1, bits 4-5 = 1, bits 6-7 = 0.
         // = 0b00_01_01_01 = 0x15.
         // Payload: deltas +5, +5, -3 → values 5, 10, 7.
-        let buf = vec![0x15, 0x05, 0x05, (-3i8) as u8];
+        let buf = with_common_delta(0, &[0x15, 0x05, 0x05, (-3i8) as u8]);
         let out = decode_int_array(&buf, 3).unwrap();
         assert_eq!(out, vec![5, 10, 7]);
     }
@@ -2424,7 +2807,7 @@ mod tests {
     fn int_array_int16_delta() {
         // Code 2 (int16) for one element: control = 0b00_00_00_10 = 0x02.
         // Payload: i16 = 300 → [0x2C, 0x01]. From prev=0, value = 300.
-        let buf = vec![0x02, 0x2C, 0x01];
+        let buf = with_common_delta(0, &[0x02, 0x2C, 0x01]);
         let out = decode_int_array(&buf, 1).unwrap();
         assert_eq!(out, vec![300]);
     }
@@ -2433,7 +2816,7 @@ mod tests {
     fn int_array_int32_absolute() {
         // Code 3 for one element: control = 0b00_00_00_11 = 0x03.
         // Payload: i32 LE = 0x12345678 → [0x78, 0x56, 0x34, 0x12].
-        let buf = vec![0x03, 0x78, 0x56, 0x34, 0x12];
+        let buf = with_common_delta(0, &[0x03, 0x78, 0x56, 0x34, 0x12]);
         let out = decode_int_array(&buf, 1).unwrap();
         assert_eq!(out, vec![0x12345678]);
     }
@@ -2444,7 +2827,7 @@ mod tests {
         // control = 0b00_00_01_11 = 0x07.
         // Payload: i32 1000 LE = [0xE8, 0x03, 0x00, 0x00], then i8 +5 = 0x05.
         // Decoded: 1000, then 1005.
-        let buf = vec![0x07, 0xE8, 0x03, 0x00, 0x00, 0x05];
+        let buf = with_common_delta(0, &[0x07, 0xE8, 0x03, 0x00, 0x00, 0x05]);
         let out = decode_int_array(&buf, 2).unwrap();
         assert_eq!(out, vec![1000, 1005]);
     }
@@ -2454,7 +2837,7 @@ mod tests {
         // Two elements: code 1, code 1. control = 0b00_00_01_01 = 0x05.
         // Deltas: +0x7F (127), then -1 (0xFF).
         // From prev=0 → 127, then 126.
-        let buf = vec![0x05, 0x7F, 0xFF];
+        let buf = with_common_delta(0, &[0x05, 0x7F, 0xFF]);
         let out = decode_int_array(&buf, 2).unwrap();
         assert_eq!(out, vec![127, 126]);
     }
@@ -2465,15 +2848,25 @@ mod tests {
         // All code-1 (int8 delta of +1): bits arranged so the first
         // byte's 8 bits = 4*code1 = 0x55; the second byte's low 2 bits
         // = code1, upper bits unused = 0x01.
-        let buf = vec![0x55, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01];
+        let buf = with_common_delta(0, &[0x55, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01]);
         let out = decode_int_array(&buf, 5).unwrap();
         assert_eq!(out, vec![1, 2, 3, 4, 5]);
     }
 
     #[test]
+    fn int_array_truncated_preamble_errors() {
+        // Fewer than 4 bytes can't even carry the common-delta
+        // preamble.
+        let err = decode_int_array(&[0x00, 0x00], 8).expect_err("truncated preamble");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("common-delta preamble"), "{msg}");
+    }
+
+    #[test]
     fn int_array_truncated_control_stream_errors() {
-        // count=8 needs 2 control bytes; supply only 1.
-        let err = decode_int_array(&[0x00], 8).expect_err("truncated control");
+        // count=8 needs 2 control bytes after the preamble; supply only 1.
+        let buf = with_common_delta(0, &[0x00]);
+        let err = decode_int_array(&buf, 8).expect_err("truncated control");
         let msg = format!("{err:?}");
         assert!(msg.contains("control stream"), "{msg}");
     }
@@ -2481,7 +2874,7 @@ mod tests {
     #[test]
     fn int_array_truncated_int8_payload_errors() {
         // Control says one code-1, but no payload byte follows.
-        let buf = vec![0x01];
+        let buf = with_common_delta(0, &[0x01]);
         let err = decode_int_array(&buf, 1).expect_err("missing int8 payload");
         let msg = format!("{err:?}");
         assert!(msg.contains("int8"), "{msg}");
@@ -2490,7 +2883,7 @@ mod tests {
     #[test]
     fn int_array_truncated_int16_payload_errors() {
         // Control says one code-2 (int16); only one payload byte.
-        let buf = vec![0x02, 0x05];
+        let buf = with_common_delta(0, &[0x02, 0x05]);
         let err = decode_int_array(&buf, 1).expect_err("missing int16 payload byte");
         let msg = format!("{err:?}");
         assert!(msg.contains("int16"), "{msg}");
@@ -2499,7 +2892,7 @@ mod tests {
     #[test]
     fn int_array_truncated_int32_payload_errors() {
         // Control says one code-3 (int32); only three payload bytes.
-        let buf = vec![0x03, 0x05, 0x06, 0x07];
+        let buf = with_common_delta(0, &[0x03, 0x05, 0x06, 0x07]);
         let err = decode_int_array(&buf, 1).expect_err("missing int32 payload byte");
         let msg = format!("{err:?}");
         assert!(msg.contains("int32"), "{msg}");
@@ -2528,14 +2921,12 @@ mod tests {
 
     #[test]
     fn int_array_monotonic_token_indices() {
-        // Mimics the §4.3 FIELDS name-index pattern: the trace records
-        // the decoded array beginning `[0, 0, …, 0, 20, 101, 106, 107]`
-        // — a run of repeated values then small positive deltas.
-        let values: Vec<i32> = vec![0, 0, 0, 0, 0, 20, 101, 106, 107, 110, 110, 200];
+        // Mimics the §4.3 FIELDS name-index pattern observed on the
+        // Elephant fixture once the common-delta preamble is applied:
+        // mostly-ascending token indices with small positive deltas
+        // and occasional repeats.
+        let values: Vec<i32> = vec![1, 3, 4, 5, 6, 7, 8, 10, 12, 13, 13, 200];
         let encoded = encode_int_array_for_tests(&values);
-        // The first five zeros pack into a single control byte (0x00)
-        // + a second control byte (also 0x00 for elements 4-7 of which
-        // only one stays zero); the remainder uses int8/int16 codes.
         let decoded = decode_int_array(&encoded, values.len()).unwrap();
         assert_eq!(decoded, values);
     }
@@ -4478,5 +4869,321 @@ mod tests {
             assert_eq!(single.as_ptr(), bulk.as_ptr());
             assert_eq!(single.len(), bulk.len());
         }
+    }
+
+    // ----- §3a LZ4 block layer + end-to-end typed decoders -----
+
+    /// Wrap `raw` as a single-chunk §3a compressed buffer: leading
+    /// chunk-count byte `0x00`, then one LZ4 block.
+    fn lz4_single_chunk(raw: &[u8]) -> Vec<u8> {
+        let mut block = Vec::new();
+        compcol::lz4::block::encode_block(raw, &mut block);
+        let mut out = vec![0x00];
+        out.extend(block);
+        out
+    }
+
+    #[test]
+    fn compressed_buffer_decompress_single_chunk_roundtrip() {
+        let raw: Vec<u8> = (0..200u16).flat_map(|i| [(i % 7) as u8, b'x']).collect();
+        let buf = lz4_single_chunk(&raw);
+        let parsed = CompressedBuffer::parse(&buf).unwrap();
+        assert_eq!(parsed.decompress(raw.len()).unwrap(), raw);
+        assert_eq!(parsed.decompress_exact(raw.len()).unwrap(), raw);
+    }
+
+    #[test]
+    fn compressed_buffer_decompress_multi_chunk_concatenates() {
+        // Leading byte 0x01 → 2 chunks, each `int32 LE length` +
+        // LZ4 block. The decompressed outputs concatenate in order.
+        let raw_a = vec![0xAAu8; 64];
+        let raw_b = vec![0xBBu8; 32];
+        let mut block_a = Vec::new();
+        compcol::lz4::block::encode_block(&raw_a, &mut block_a);
+        let mut block_b = Vec::new();
+        compcol::lz4::block::encode_block(&raw_b, &mut block_b);
+        let mut buf = vec![0x01];
+        buf.extend((block_a.len() as i32).to_le_bytes());
+        buf.extend(&block_a);
+        buf.extend((block_b.len() as i32).to_le_bytes());
+        buf.extend(&block_b);
+        let parsed = CompressedBuffer::parse(&buf).unwrap();
+        let mut want = raw_a.clone();
+        want.extend(&raw_b);
+        assert_eq!(parsed.decompress(want.len()).unwrap(), want);
+    }
+
+    #[test]
+    fn compressed_buffer_decompress_enforces_budget() {
+        // 4096 repeated bytes compress tiny; a 100-byte budget must
+        // reject the expansion instead of allocating it.
+        let raw = vec![0x42u8; 4096];
+        let buf = lz4_single_chunk(&raw);
+        let parsed = CompressedBuffer::parse(&buf).unwrap();
+        let err = parsed
+            .decompress(100)
+            .expect_err("budget must bound output");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("LZ4 block decode"), "{msg}");
+    }
+
+    #[test]
+    fn compressed_buffer_decompress_exact_rejects_mismatch() {
+        let raw = b"twelve bytes".to_vec();
+        let buf = lz4_single_chunk(&raw);
+        let parsed = CompressedBuffer::parse(&buf).unwrap();
+        let err = parsed
+            .decompress_exact(raw.len() + 1)
+            .expect_err("length mismatch must fail");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("decompressed to"), "{msg}");
+    }
+
+    #[test]
+    fn tokens_section_end_to_end_decode() {
+        // Synthetic §4.1 TOKENS section: 24-byte header + single-chunk
+        // §3a buffer over the NUL-joined blob.
+        let blob = b"alpha\0beta\0gamma\0";
+        let buffer = lz4_single_chunk(blob);
+        let mut section = Vec::new();
+        section.extend(3u64.to_le_bytes());
+        section.extend((blob.len() as u64).to_le_bytes());
+        section.extend((buffer.len() as u64).to_le_bytes());
+        section.extend(&buffer);
+        let parsed = TokensSection::parse(&section).unwrap();
+        assert_eq!(parsed.decode().unwrap(), vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn fields_section_end_to_end_decodes_names_and_reps() {
+        // Synthetic §4.3 FIELDS section: int64 numFields + two
+        // (int64 compressedSize, §3a buffer) pairs.
+        let name_indices: Vec<i32> = vec![1, 3, 4, 5, 6, 7];
+        let reps: Vec<u64> = vec![
+            0x400b_0000_0000_0002,
+            0x0009_0000_0000_0058,
+            0x4009_0000_4270_0000,
+            0x0009_0000_0000_0060,
+            0x4009_0000_0000_0000,
+            0x4009_0000_4270_0000,
+        ];
+        let names_buf = lz4_single_chunk(&encode_int_array_for_tests(&name_indices));
+        let reps_raw: Vec<u8> = reps.iter().flat_map(|r| r.to_le_bytes()).collect();
+        let reps_buf = lz4_single_chunk(&reps_raw);
+        let mut section = Vec::new();
+        section.extend((name_indices.len() as u64).to_le_bytes());
+        section.extend((names_buf.len() as u64).to_le_bytes());
+        section.extend(&names_buf);
+        section.extend((reps_buf.len() as u64).to_le_bytes());
+        section.extend(&reps_buf);
+        let parsed = FieldsSection::parse(&section).unwrap();
+        assert_eq!(parsed.decode_name_indices().unwrap(), name_indices);
+        assert_eq!(parsed.decode_reps().unwrap(), reps);
+    }
+
+    #[test]
+    fn fieldsets_section_end_to_end_decodes_runs() {
+        // Synthetic §4.4 FIELDSETS section: sentinel-separated runs.
+        let flat: Vec<i32> = vec![0, 1, 2, -1, 3, 4, -1];
+        let buf = lz4_single_chunk(&encode_int_array_for_tests(&flat));
+        let mut section = Vec::new();
+        section.extend((flat.len() as u64).to_le_bytes());
+        section.extend((buf.len() as u64).to_le_bytes());
+        section.extend(&buf);
+        let parsed = FieldSetsSection::parse(&section).unwrap();
+        assert_eq!(parsed.decode_flat_indices().unwrap(), flat);
+        assert_eq!(
+            parsed.decode_field_sets().unwrap(),
+            vec![vec![0, 1, 2], vec![3, 4]]
+        );
+    }
+
+    #[test]
+    fn specs_section_end_to_end_decodes_three_columns() {
+        // Synthetic §4.6 SPECS section: int64 count + three
+        // (int64 compressedSize, §3a buffer) triples.
+        let path_idx: Vec<i32> = vec![0, 1, 2, 3];
+        let fieldset_idx: Vec<i32> = vec![0, 9, 14, 14];
+        let spec_types: Vec<i32> = vec![7, 6, 6, 8];
+        let mut section = (path_idx.len() as u64).to_le_bytes().to_vec();
+        for column in [&path_idx, &fieldset_idx, &spec_types] {
+            let buf = lz4_single_chunk(&encode_int_array_for_tests(column));
+            section.extend((buf.len() as u64).to_le_bytes());
+            section.extend(&buf);
+        }
+        let parsed = SpecsSection::parse(&section).unwrap();
+        assert_eq!(parsed.decode_path_indices().unwrap(), path_idx);
+        assert_eq!(parsed.decode_fieldset_indices().unwrap(), fieldset_idx);
+        assert_eq!(parsed.decode_spec_types().unwrap(), spec_types);
+    }
+
+    #[test]
+    fn paths_section_end_to_end_decodes_three_int_streams() {
+        // Synthetic §4.5 PATHS section: two int64 counts + three
+        // (int64 compressedSize, §3a buffer) triples. The decoded
+        // values are raw §3b streams (semantics deferred), so the
+        // test only asserts stream-level round-tripping.
+        let a: Vec<i32> = vec![11, 2, -19, -20];
+        let b: Vec<i32> = vec![0, 1, 1, 2];
+        let c: Vec<i32> = vec![-1, -1, 0, 8];
+        let mut section = (a.len() as u64).to_le_bytes().to_vec();
+        section.extend((a.len() as u64).to_le_bytes());
+        for column in [&a, &b, &c] {
+            let buf = lz4_single_chunk(&encode_int_array_for_tests(column));
+            section.extend((buf.len() as u64).to_le_bytes());
+            section.extend(&buf);
+        }
+        let parsed = PathsSection::parse(&section).unwrap();
+        assert_eq!(parsed.decode_path_token_ints().unwrap(), a);
+        assert_eq!(parsed.decode_element_token_ints().unwrap(), b);
+        assert_eq!(parsed.decode_jump_ints().unwrap(), c);
+    }
+
+    #[test]
+    fn int_coded_max_len_covers_preamble_control_and_payload() {
+        // 248 elements: 4 (preamble) + 62 (control) + 992 (max
+        // payload) + slack. The Elephant's largest observed stream
+        // for that count is 221 bytes — comfortably inside.
+        assert!(int_coded_max_len(248) >= 4 + 62 + 992);
+        assert!(int_coded_max_len(0) >= 4);
+    }
+
+    #[test]
+    fn real_fixture_decodes_all_typed_sections() {
+        // End-to-end §3a → LZ4 → §3b decode of every section of the
+        // in-tree Elephant fixture, checked against the trace doc's
+        // published facts plus the cross-section invariants that
+        // ground the §3b common-delta preamble (see
+        // `decode_int_array`'s doc).
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/3d/usd/fixtures/SoC-ElephantWithMonochord.usdc");
+        if !fixture.exists() {
+            eprintln!("skip: fixture {fixture:?} not present");
+            return;
+        }
+        let bytes = std::fs::read(&fixture).expect("read fixture");
+        let file = UsdcFile::parse(&bytes).expect("parse Elephant USDC");
+
+        // §4.1 TOKENS: 192 NUL-joined strings (trace §4.1). The
+        // leading `;-)` atom is visible in the trace's hex dump
+        // (`3b 2d 29` right after the chunk-count byte), and the
+        // §4.1 excerpt's named tokens all resolve.
+        let tokens = TokensSection::parse(file.section_bytes(SectionName::Tokens, &bytes).unwrap())
+            .unwrap()
+            .decode()
+            .expect("TOKENS decode");
+        assert_eq!(tokens.len(), 192);
+        assert_eq!(tokens[0], ";-)");
+        assert_eq!(tokens[1], "defaultPrim");
+        assert_eq!(tokens[2], "SoC_ElephantWithMonochord");
+        assert_eq!(tokens.last().map(String::as_str), Some("timeSamples"));
+        for probe in [
+            "endTimeCode",
+            "framesPerSecond",
+            "metersPerUnit",
+            "upAxis",
+            "primChildren",
+            "specifier",
+            "typeName",
+            "Xform",
+            "Material",
+            "xformOp:transform",
+            "auralMode",
+            "filePath",
+        ] {
+            assert!(tokens.iter().any(|t| t == probe), "missing token {probe}");
+        }
+
+        // §4.3 FIELDS: 157 (name, rep) pairs. The name indices open
+        // with the root-layer metadata names; the rep words match the
+        // trace's §4.3 hex excerpt verbatim.
+        let fields =
+            FieldsSection::parse(file.section_bytes(SectionName::Fields, &bytes).unwrap()).unwrap();
+        let names = fields.decode_name_indices().expect("FIELDS names decode");
+        assert_eq!(names.len(), 157);
+        assert_eq!(&names[..8], &[1, 3, 4, 5, 6, 7, 8, 10]);
+        let named: Vec<&str> = names[..8]
+            .iter()
+            .map(|&i| tokens[i as usize].as_str())
+            .collect();
+        assert_eq!(
+            named,
+            [
+                "defaultPrim",
+                "endTimeCode",
+                "framesPerSecond",
+                "metersPerUnit",
+                "startTimeCode",
+                "timeCodesPerSecond",
+                "upAxis",
+                "primChildren"
+            ]
+        );
+        assert!(
+            names.iter().all(|&i| i >= 0 && (i as usize) < tokens.len()),
+            "every field name must be a valid token index"
+        );
+        let reps = fields.decode_reps().expect("FIELDS reps decode");
+        assert_eq!(reps.len(), 157);
+        assert_eq!(
+            &reps[..8],
+            &[
+                0x400b_0000_0000_0002,
+                0x0009_0000_0000_0058,
+                0x4009_0000_4270_0000,
+                0x0009_0000_0000_0060,
+                0x4009_0000_0000_0000,
+                0x4009_0000_4270_0000,
+                0x400b_0000_0000_0009,
+                0x0029_0000_000c_2510,
+            ],
+            "trace doc §4.3 rep-word hex excerpt"
+        );
+
+        // §4.4 FIELDSETS: 576 sentinel-separated field indices, all
+        // inside the 157-entry FIELDS table. The first set is the
+        // root layer's eight metadata fields.
+        let fieldsets =
+            FieldSetsSection::parse(file.section_bytes(SectionName::FieldSets, &bytes).unwrap())
+                .unwrap();
+        let flat = fieldsets.decode_flat_indices().expect("FIELDSETS decode");
+        assert_eq!(flat.len(), 576);
+        assert_eq!(&flat[..10], &[0, 1, 2, 3, 4, 5, 6, 7, -1, 8]);
+        assert!(flat.iter().all(|&v| v == -1 || (0..157).contains(&v)));
+        let sets = fieldsets.decode_field_sets().expect("FIELDSETS split");
+        assert_eq!(sets[0], vec![0, 1, 2, 3, 4, 5, 6, 7]);
+
+        // §4.5 PATHS: the three raw streams decode exactly with
+        // `numPaths` elements each (semantics deferred).
+        let paths =
+            PathsSection::parse(file.section_bytes(SectionName::Paths, &bytes).unwrap()).unwrap();
+        assert_eq!(paths.decode_path_token_ints().unwrap().len(), 248);
+        assert_eq!(paths.decode_element_token_ints().unwrap().len(), 248);
+        assert_eq!(paths.decode_jump_ints().unwrap().len(), 248);
+
+        // §4.6 SPECS: 248 rows. Path indices form an exact
+        // permutation of 0..248; field-set indices stay inside the
+        // 576-entry FIELDSETS array; spec types are small positive
+        // codes.
+        let specs =
+            SpecsSection::parse(file.section_bytes(SectionName::Specs, &bytes).unwrap()).unwrap();
+        let path_idx = specs.decode_path_indices().expect("SPECS paths decode");
+        assert_eq!(path_idx.len(), 248);
+        let mut sorted = path_idx.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            (0..248).collect::<Vec<i32>>(),
+            "SPECS path indices are a permutation of 0..numPaths"
+        );
+        let fieldset_idx = specs
+            .decode_fieldset_indices()
+            .expect("SPECS fieldsets decode");
+        assert_eq!(fieldset_idx.len(), 248);
+        assert!(fieldset_idx.iter().all(|&v| (0..576).contains(&v)));
+        let spec_types = specs.decode_spec_types().expect("SPECS types decode");
+        assert_eq!(spec_types.len(), 248);
+        assert_eq!(spec_types[0], 7);
+        assert!(spec_types.iter().all(|&v| (1..=8).contains(&v)));
     }
 }

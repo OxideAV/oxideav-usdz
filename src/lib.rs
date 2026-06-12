@@ -273,7 +273,8 @@
 //!   variable-width payload bytes. Used by the index arrays
 //!   inside FIELDS / FIELDSETS / SPECS once the §3a LZ4 wrapper
 //!   lands. Sourced exclusively from `docs/3d/usd/usdc-crate-format-trace.md`
-//!   §3b.
+//!   §3b. (Round 282 corrected the wire shape with the leading
+//!   common-delta preamble — see [`usdc::decode_int_array`].)
 //!
 //! Round 217 — USDC §4.2 STRINGS section parser:
 //!
@@ -398,28 +399,46 @@
 //!   (`numFields = 157`, `csize₁ = 141`, `csize₂ = 833`, section
 //!   size = 998).
 //!
-//! Deferred to round 230+:
+//! Round 282 — USDC §3a LZ4 block layer + §3b common-delta
+//! preamble + end-to-end typed section decoders:
 //!
-//! * **`.usdc` §3a LZ4 wrapper.** The outer per-buffer wrapper
-//!   that feeds bytes into §3b. The remaining primitive needed
-//!   before any index section can be decoded end-to-end.
-//! * **`.usdc` section-payload semantics.** Rounds 212 / 217 / 222 /
-//!   229 / 236 / 239 land the TOKENS string-atom pool header
-//!   (§4.1), the STRINGS index table (§4.2), the FIELDS two-buffer
-//!   framing (§4.3), the FIELDSETS single-buffer framing (§4.4),
-//!   the PATHS 16-byte leading prefix (§4.5) and the SPECS
-//!   three-buffer framing (§4.6). The remaining payload-semantic
-//!   step is the PATHS namespace tree's compressed-buffer
-//!   decomposition (trace doc caveat: a recursive child/sibling
-//!   jump encoding rather than three flat §3b arrays — see
-//!   #1463) layered on top of §3a + §3b.
-//! * **§3b "common value" fast path.** Round 229's §4.4 framing
-//!   exposes the buffer but the trace doc records that FIELDSETS
-//!   (and PATHS) layer a common-value compression step on top of
-//!   the §3b shape. [`usdc::decode_int_array`] recovers the
-//!   structural run boundaries but not the literal field indices;
-//!   the per-element semantic-recovery step is a separate decoder
-//!   pass the trace doc leaves as a future fact extraction.
+//! * [`usdc::CompressedBuffer::decompress`] /
+//!   [`usdc::CompressedBuffer::decompress_exact`] — the §3a LZ4
+//!   *block* layer, delegated to `compcol` under a caller-supplied
+//!   output bound (decompression-bomb guard).
+//! * [`usdc::decode_int_array`] now consumes the §3b stream's
+//!   leading `int32` **common delta**: code `0` decodes to
+//!   *previous + common delta* (the previously-documented form is
+//!   the `commonDelta = 0` special case). Pinned down empirically:
+//!   all eight int-coded buffers of the committed Elephant fixture
+//!   decode **exactly** (zero leftover bytes) under this model,
+//!   SPECS path indices come out as a permutation of `0..numPaths`,
+//!   FIELDS name indices resolve through TOKENS to the root-layer
+//!   metadata names, and FIELDSETS recovers literal field indices
+//!   with the documented `-1` sentinels. This resolves the §4.4 /
+//!   §4.5 "common value" caveat.
+//! * End-to-end typed decoders: [`usdc::TokensSection::decode`],
+//!   [`usdc::FieldsSection::decode_name_indices`] /
+//!   [`usdc::FieldsSection::decode_reps`],
+//!   [`usdc::FieldSetsSection::decode_flat_indices`] /
+//!   [`usdc::FieldSetsSection::decode_field_sets`],
+//!   [`usdc::SpecsSection::decode_path_indices`] /
+//!   [`usdc::SpecsSection::decode_fieldset_indices`] /
+//!   [`usdc::SpecsSection::decode_spec_types`], plus the three
+//!   PATHS raw-stream decoders (exact streams; per-element
+//!   semantics deferred).
+//!
+//! Deferred to round 283+:
+//!
+//! * **`.usdc` PATHS tree-walk semantics.** The three PATHS buffers
+//!   decode exactly as `numPaths`-element §3b streams, but the raw
+//!   values don't directly index the token pool — the trace doc's
+//!   §4.5 "holds" column needs the tree-walk reconstruction step
+//!   (see #1463) before the `SdfPath` namespace can be rebuilt.
+//! * **SPECS spec-type enumeration.** The Elephant's spec types
+//!   decode to small codes in `1..=8`; mapping them to
+//!   (prim / attribute / relationship / …) is a fact-table
+//!   extraction the trace doc doesn't yet carry.
 //! * **FIELDS value-rep type-code enumeration.** A separate
 //!   fact-table extraction (gap tracker's Round B) that the
 //!   [`usdc`] primitives don't depend on.

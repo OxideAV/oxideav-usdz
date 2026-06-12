@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 282 (USDC §3a LZ4 layer + §3b common-delta preamble + typed section decoders)
+
+- **`usdc::CompressedBuffer::decompress` / `decompress_exact`** —
+  the §3a wrapper's inner LZ4 *block* layer, delegated to the new
+  `compcol` dependency (Karpelès Lab's compression collection,
+  `lz4` feature only) under a caller-supplied output bound
+  (decompression-bomb guard). Multi-chunk buffers concatenate in
+  declaration order. `usdc::int_coded_max_len` supplies the §3b
+  arithmetic budget.
+- **End-to-end typed section decoders** chaining §3a → LZ4 → §3b:
+  `TokensSection::decode`, `FieldsSection::decode_name_indices` /
+  `decode_reps`, `FieldSetsSection::decode_flat_indices` /
+  `decode_field_sets`, `SpecsSection::decode_path_indices` /
+  `decode_fieldset_indices` / `decode_spec_types`, and the three
+  PATHS raw-stream decoders (`decode_path_token_ints` /
+  `decode_element_token_ints` / `decode_jump_ints`). Validated
+  end-to-end against the committed Elephant fixture: 192 tokens,
+  157 field (name, rep) pairs with the trace doc's §4.3 rep-word
+  hex excerpt matched verbatim, 576 sentinel-separated field-set
+  indices, 248 spec rows whose path indices form an exact
+  permutation of `0..numPaths`.
+
+### Changed — Round 282
+
+- **`usdc::decode_int_array` now consumes the §3b stream's leading
+  `int32` common-delta preamble**; control code `0` decodes to
+  *previous + common delta* (the previously-implemented form is the
+  `commonDelta = 0` special case). This resolves the trace doc's
+  §4.4/§4.5 "common value" caveat empirically: all eight int-coded
+  buffers of the Elephant fixture decode exactly (zero leftover
+  bytes) and yield semantically coherent indices under the
+  corrected model, where the preamble-less reading yields
+  out-of-range/negative values. `usdc::encode_int_array_for_tests`
+  emits the preamble (picking the most frequent delta as the
+  common delta).
+
 ### Added — Round 273 (USDC §4.5 PATHS three-buffer framing)
 
 - **`usdc::PathsSection` now splits the three §3a compressed

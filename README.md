@@ -324,7 +324,49 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   module is required, so this oracle runs anywhere Apple USD Tools /
   the USD CLI binary is installed.
 
-## Round 273 scope (USDC §4.5 PATHS three-buffer framing)
+## Round 282 scope (USDC §3a LZ4 layer + §3b common-delta preamble + typed section decoders)
+
+- **`usdc::CompressedBuffer::decompress` / `decompress_exact`** —
+  the §3a wrapper's inner LZ4 *block* layer, delegated to `compcol`
+  (the workspace-wide compression collection) under a
+  caller-supplied output bound so a hostile buffer can't balloon
+  into a decompression bomb. Multi-chunk buffers concatenate in
+  declaration order.
+- **§3b common-delta preamble (trace-doc empirical correction).**
+  The trace doc's §3b prose flags a "common value" fast path it
+  had not recovered (§4.4/§4.5 caveats), and its §4.3 worked
+  example decodes the FIELDS name indices as `[0, 0, …, 0, 20,
+  101, …]`. Decoding the committed Elephant fixture shows the §3b
+  stream opens with a leading `int32` **common delta**, and
+  control code `0` means *previous + common delta* — the
+  documented form is the `commonDelta = 0` special case. Under
+  the corrected model all **eight** int-coded fixture buffers
+  (FIELDS names, FIELDSETS, 3× PATHS, 3× SPECS) decode **exactly**
+  — zero leftover bytes — and the values become semantically
+  coherent: SPECS path indices form an exact permutation of
+  `0..numPaths` (248), FIELDS name indices resolve through TOKENS
+  to the root-layer metadata names (`defaultPrim`, `endTimeCode`,
+  `framesPerSecond`, `metersPerUnit`, …), and FIELDSETS recovers
+  literal field indices in `0..157` with the documented `-1`
+  sentinels. `usdc::decode_int_array` implements the corrected
+  model; the §4.3 example values in the trace doc are artifacts of
+  the preamble-less reading and should be re-derived by the docs
+  team. Code `3`'s absolute-value semantics are unexercised by the
+  fixture (no code-3 element anywhere) and rest on the trace doc
+  alone.
+- **End-to-end typed decoders** chaining §3a → LZ4 → §3b:
+  `TokensSection::decode` (the 192-string atom pool),
+  `FieldsSection::decode_name_indices` / `decode_reps` (the rep
+  words match the trace's §4.3 hex excerpt verbatim),
+  `FieldSetsSection::decode_flat_indices` / `decode_field_sets`,
+  `SpecsSection::decode_path_indices` / `decode_fieldset_indices` /
+  `decode_spec_types` (Elephant spec types decode to codes in
+  `1..=8`; the code→kind mapping is a deferred fact-table
+  extraction), and `PathsSection::decode_path_token_ints` /
+  `decode_element_token_ints` / `decode_jump_ints` (exact raw
+  streams; the tree-walk semantics that turn them into the
+  `SdfPath` namespace stay deferred — the raw values don't
+  directly index the token pool).
 
 - **`usdc::PathsSection` splits the three §3a compressed buffers.**
   The docs collaborator corrected trace doc §4.5 to record that the

@@ -25,6 +25,11 @@ oxideav-core = { version = "0.1", optional = true }
 # build chains all the way through.
 oxideav-mesh3d = { version = "0.0", default-features = false }
 serde_json = "1"
+# `compcol` (Karpelès Lab's compression collection, the
+# workspace-wide choice for compression codecs) supplies the LZ4
+# *block* decoder that the USDC §3a "compressed buffer" wrapper
+# carries inside it. Only the `lz4` algorithm is pulled in.
+compcol = { version = "0.6", default-features = false, features = ["lz4"] }
 
 [features]
 default = ["registry"]
