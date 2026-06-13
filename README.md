@@ -324,6 +324,33 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   module is required, so this oracle runs anywhere Apple USD Tools /
   the USD CLI binary is installed.
 
+## Round 290 scope (USDC §5 step 7 SPECS → FIELDSETS → FIELDS resolved join)
+
+- **`usdc::UsdcFile::decode_specs(file_bytes)`** — the capstone of
+  the trace doc §5 "how a reader uses it" pipeline: it iterates the
+  §4.6 `SPECS` rows and returns one **`usdc::ResolvedSpec`** each,
+  joining the `(pathIndex, fieldSetOffset, specType)` triple and
+  expanding the row's field set into its concrete
+  `(fieldNameTokenIndex, valueRep)` property list by chasing §4.4
+  `FIELDSETS` → §4.3 `FIELDS`. The `FIELDS` / `FIELDSETS` / `SPECS`
+  sections are each decoded once (not per row), so the cost is
+  linear in the total field count.
+- **Flat-offset field-set indexing.** The §4.6 middle buffer's
+  per-row field-set index is a **flat offset into the concatenated
+  `FIELDSETS` array** — the position the row's run begins at — not
+  an ordinal "Nth set" number. This is confirmed against the
+  committed Elephant fixture: all 248 rows' indices land exactly on
+  a run boundary (offset 0 or the slot after a `-1` sentinel), and
+  the largest index (570) exceeds the 113 distinct sets, ruling out
+  the ordinal reading. **`usdc::field_set_at`** reads one run from a
+  flat offset up to the next `-1`.
+- Cross-validated on the Elephant fixture: 248 resolved specs,
+  `path_index` the identity permutation `0..248`, spec-type codes
+  `{1, 6, 7, 8}`, every resolved `(name, rep)` pair traceable to the
+  `FIELDS` table, and every name token a valid `TOKENS`-pool index.
+  The spec-type and value-rep type-code enumerations remain
+  uninterpreted (gap-tracker Round B fact tables).
+
 ## Round 282 scope (USDC §3a LZ4 layer + §3b common-delta preamble + typed section decoders)
 
 - **`usdc::CompressedBuffer::decompress` / `decompress_exact`** —

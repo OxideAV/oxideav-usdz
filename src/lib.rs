@@ -428,6 +428,28 @@
 //!   PATHS raw-stream decoders (exact streams; per-element
 //!   semantics deferred).
 //!
+//! Round 290 — USDC §5 step 7 SPECS → FIELDSETS → FIELDS resolved
+//! join:
+//!
+//! * [`usdc::UsdcFile::decode_specs`] materialises the trace doc §5
+//!   "how a reader uses it" pipeline into one [`usdc::ResolvedSpec`]
+//!   per spec row: for each §4.6 SPECS row it joins the
+//!   `(pathIndex, fieldSetOffset, specType)` triple and expands the
+//!   row's field set into its concrete `(fieldNameTokenIndex,
+//!   valueRep)` property list via §4.4 FIELDSETS → §4.3 FIELDS. The
+//!   §4.6 middle buffer's field-set index is a **flat offset into
+//!   the concatenated FIELDSETS array** (the run start), not an
+//!   ordinal "Nth set" number — confirmed against the committed
+//!   Elephant fixture, where all 248 rows' indices land on a run
+//!   boundary and the largest (570) exceeds the 113 distinct sets.
+//! * [`usdc::field_set_at`] reads one field-set run from a flat
+//!   FIELDSETS offset up to the next `-1` sentinel (companion to
+//!   [`usdc::split_field_sets`], which splits the whole array).
+//! * Cross-validated on the Elephant fixture: 248 resolved specs,
+//!   `path_index` the identity permutation `0..248`, spec-type codes
+//!   `{1, 6, 7, 8}`, every resolved `(name, rep)` pair traceable to
+//!   the FIELDS table and every name token a valid TOKENS-pool index.
+//!
 //! Deferred to round 283+:
 //!
 //! * **`.usdc` PATHS tree-walk semantics.** The three PATHS buffers

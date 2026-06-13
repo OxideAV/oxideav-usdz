@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 290 (USDC §5 step 7 SPECS → FIELDSETS → FIELDS resolved join)
+
+- **`usdc::UsdcFile::decode_specs`** — materialises the trace doc §5
+  "how a reader uses it" pipeline into one **`usdc::ResolvedSpec`**
+  per spec row: each §4.6 SPECS row's
+  `(pathIndex, fieldSetOffset, specType)` triple is joined and the
+  row's field set expanded into its concrete
+  `(fieldNameTokenIndex, valueRep)` property list via §4.4 FIELDSETS
+  → §4.3 FIELDS. The §4.6 middle buffer's field-set index is a
+  **flat offset into the concatenated FIELDSETS array** (the run
+  start), not an ordinal "Nth set" number — confirmed against the
+  committed Elephant fixture (all 248 rows' indices land on a run
+  boundary; the largest, 570, exceeds the 113 distinct sets).
+- **`usdc::field_set_at`** — reads one field-set run from a flat
+  FIELDSETS offset up to the next `-1` sentinel (companion to
+  `usdc::split_field_sets`, which splits the whole array).
+- Cross-validated on the Elephant fixture: 248 resolved specs,
+  `path_index` the identity permutation `0..248`, spec-type codes
+  `{1, 6, 7, 8}`, every resolved `(name, rep)` pair traceable to the
+  FIELDS table and every name token a valid TOKENS-pool index.
+
 ### Added — Round 282 (USDC §3a LZ4 layer + §3b common-delta preamble + typed section decoders)
 
 - **`usdc::CompressedBuffer::decompress` / `decompress_exact`** —

@@ -2015,6 +2015,39 @@ pub fn split_field_sets(values: &[i32]) -> Vec<Vec<i32>> {
     out
 }
 
+/// Read one field set out of a flat `FIELDSETS` integer array
+/// (the output of [`decode_int_array`]) starting at a given
+/// **flat-array offset**.
+///
+/// The §4.6 SPECS section's middle buffer stores, per spec row, a
+/// field-set index that is a **flat offset into the concatenated
+/// `FIELDSETS` array** — i.e. the position at which that spec's run
+/// of field indices begins, not an ordinal "Nth set" number. This
+/// is confirmed against the committed Elephant fixture: every one of
+/// the 248 spec rows' field-set indices lands exactly on a run
+/// boundary (offset 0, or the slot immediately after a `-1`
+/// sentinel), and reading from that offset up to the next `-1`
+/// recovers the row's field list. (The ordinal-set interpretation
+/// is ruled out — the largest index, 570, exceeds the 113 distinct
+/// sets.)
+///
+/// Returns the contiguous run `flat[start..]` up to (but excluding)
+/// the first `-1` sentinel, or the remainder of the array if no
+/// sentinel follows. Returns an empty slice when `start` is at or
+/// past the array end (a spec row pointing past the table — treated
+/// as "no fields" rather than an error so a corrupt index degrades
+/// gracefully).
+pub fn field_set_at(flat: &[i32], start: usize) -> &[i32] {
+    if start >= flat.len() {
+        return &[];
+    }
+    let tail = &flat[start..];
+    match tail.iter().position(|&v| v == -1) {
+        Some(end) => &tail[..end],
+        None => tail,
+    }
+}
+
 /// The 16-byte fixed prefix of the §4.5 PATHS section.
 ///
 /// Trace doc §4.5 records the section opens with `int64 numPaths`
@@ -2582,6 +2615,135 @@ fn read_specs_buffer<'a>(
     let body = &bytes[8..8 + csz_usize];
     let tail = &bytes[8 + csz_usize..];
     Ok((csz, body, tail))
+}
+
+/// One fully-resolved row of the §4.6 `SPECS` table — the join
+/// `(pathIndex, fieldSetOffset, specType)` with the spec's field set
+/// already expanded into its concrete `(fieldNameTokenIndex,
+/// valueRep)` property list.
+///
+/// This is the per-row product of the trace doc §5 step 7
+/// "iterate SPECS rows … resolve its field set → fields → reps".
+/// `path_index` indexes the §4.5 `PATHS` namespace tree (an
+/// `SdfPath` position); `spec_type` is the raw §4.6 spec-type code
+/// (the prim / attribute / relationship enumeration is a separate
+/// fact-table extraction and is surfaced uninterpreted); `fields`
+/// pairs each field-name **token index** (an index into the §4.1
+/// `TOKENS` atom pool, via the §4.3 `FIELDS` name array) with its
+/// packed `uint64` value-rep word (type code + flags + inline value
+/// or file offset — also surfaced uninterpreted, per gap-tracker
+/// Round B).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSpec {
+    /// Index into the §4.5 `PATHS` namespace tree for this spec's
+    /// `SdfPath` position.
+    pub path_index: i32,
+    /// Flat offset into the concatenated §4.4 `FIELDSETS` array at
+    /// which this spec's field-set run begins (see
+    /// [`field_set_at`]).
+    pub field_set_offset: i32,
+    /// Raw §4.6 spec-type code (uninterpreted — the prim /
+    /// attribute / relationship enumeration is gap-tracker Round B
+    /// material).
+    pub spec_type: i32,
+    /// The spec's `(fieldNameTokenIndex, valueRep)` property list,
+    /// resolved through §4.4 `FIELDSETS` → §4.3 `FIELDS`.
+    pub fields: Vec<(i32, u64)>,
+}
+
+impl UsdcFile {
+    /// End-to-end materialisation of the §4.6 `SPECS` table — the
+    /// trace doc §5 "how a reader uses it" pipeline, joined into one
+    /// [`ResolvedSpec`] per spec row.
+    ///
+    /// For each of the `count` spec rows this:
+    ///
+    /// 1. reads the row's `(pathIndex, fieldSetOffset, specType)`
+    ///    triple from the three §4.6 `SPECS` buffers,
+    /// 2. expands the field set at `fieldSetOffset` into a run of
+    ///    field indices via [`field_set_at`] over the flat §4.4
+    ///    `FIELDSETS` array,
+    /// 3. resolves each field index into its
+    ///    `(fieldNameTokenIndex, valueRep)` pair from the two §4.3
+    ///    `FIELDS` arrays (names + reps).
+    ///
+    /// `file_bytes` must be the same buffer [`UsdcFile::parse`] was
+    /// called on. The `FIELDS`, `FIELDSETS` and `SPECS` sections are
+    /// each decoded once (not per row), so the cost is linear in the
+    /// total field count.
+    ///
+    /// On the committed Elephant fixture this returns 248 specs;
+    /// `path_index` is the identity permutation `0..248`, the four
+    /// distinct `spec_type` codes are `{1, 6, 7, 8}`, and the root
+    /// prim's spec (row 0) resolves to its eight metadata fields
+    /// (`defaultPrim`, `endTimeCode`, … via the §4.1 `TOKENS` pool).
+    ///
+    /// Errors:
+    ///
+    /// * [`Error::InvalidData`](crate::Error) if any of the
+    ///   `FIELDS` / `FIELDSETS` / `SPECS` sections is missing from
+    ///   the TOC or fails to decode,
+    /// * [`Error::InvalidData`] if a field index in a resolved set
+    ///   is out of range of the `FIELDS` table (a corrupt
+    ///   `FIELDSETS` entry).
+    pub fn decode_specs(&self, file_bytes: &[u8]) -> Result<Vec<ResolvedSpec>> {
+        let fields_bytes = self
+            .section_bytes(SectionName::Fields, file_bytes)
+            .ok_or_else(|| invalid("USDC §5: FIELDS section absent — cannot resolve specs"))?;
+        let fieldsets_bytes = self
+            .section_bytes(SectionName::FieldSets, file_bytes)
+            .ok_or_else(|| invalid("USDC §5: FIELDSETS section absent — cannot resolve specs"))?;
+        let specs_bytes = self
+            .section_bytes(SectionName::Specs, file_bytes)
+            .ok_or_else(|| invalid("USDC §5: SPECS section absent — cannot resolve specs"))?;
+
+        let fields = FieldsSection::parse(fields_bytes)?;
+        let field_names = fields.decode_name_indices()?;
+        let field_reps = fields.decode_reps()?;
+        debug_assert_eq!(field_names.len(), field_reps.len());
+
+        let fieldsets = FieldSetsSection::parse(fieldsets_bytes)?;
+        let flat_fieldsets = fieldsets.decode_flat_indices()?;
+
+        let specs = SpecsSection::parse(specs_bytes)?;
+        let path_indices = specs.decode_path_indices()?;
+        let field_set_offsets = specs.decode_fieldset_indices()?;
+        let spec_types = specs.decode_spec_types()?;
+
+        let count = path_indices.len();
+        let mut out = Vec::with_capacity(count);
+        for row in 0..count {
+            let fs_offset = field_set_offsets[row];
+            let start = usize::try_from(fs_offset).map_err(|_| {
+                invalid(format!(
+                    "USDC §5: spec row {row} has negative field-set offset {fs_offset}"
+                ))
+            })?;
+            let run = field_set_at(&flat_fieldsets, start);
+            let mut fields_out = Vec::with_capacity(run.len());
+            for &field_idx in run {
+                let fi = usize::try_from(field_idx).map_err(|_| {
+                    invalid(format!(
+                        "USDC §5: spec row {row} field-set references negative field index {field_idx}"
+                    ))
+                })?;
+                if fi >= field_names.len() {
+                    return Err(invalid(format!(
+                        "USDC §5: spec row {row} field index {fi} out of range of the {}-entry FIELDS table",
+                        field_names.len()
+                    )));
+                }
+                fields_out.push((field_names[fi], field_reps[fi]));
+            }
+            out.push(ResolvedSpec {
+                path_index: path_indices[row],
+                field_set_offset: fs_offset,
+                spec_type: spec_types[row],
+                fields: fields_out,
+            });
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -5185,5 +5347,106 @@ mod tests {
         assert_eq!(spec_types.len(), 248);
         assert_eq!(spec_types[0], 7);
         assert!(spec_types.iter().all(|&v| (1..=8).contains(&v)));
+    }
+
+    // ----- §5 step 7: SPECS → FIELDSETS → FIELDS resolved join -----
+
+    #[test]
+    fn field_set_at_reads_run_from_flat_offset() {
+        // Trace doc §4.4: the flat array concatenates per-set runs
+        // separated by -1. field_set_at reads from a flat offset up
+        // to the next sentinel.
+        let flat = [0, 1, 2, -1, 8, 9, 10, 11, -1, 8, 12];
+        assert_eq!(field_set_at(&flat, 0), &[0, 1, 2]);
+        assert_eq!(field_set_at(&flat, 4), &[8, 9, 10, 11]);
+        // A run with no trailing sentinel returns the remainder.
+        assert_eq!(field_set_at(&flat, 9), &[8, 12]);
+        // An offset at/past the array end is an empty set, not a panic.
+        assert_eq!(field_set_at(&flat, 11), &[] as &[i32]);
+        assert_eq!(field_set_at(&flat, 99), &[] as &[i32]);
+        // An offset landing on a sentinel itself yields an empty run.
+        assert_eq!(field_set_at(&flat, 3), &[] as &[i32]);
+    }
+
+    #[test]
+    fn real_fixture_decode_specs_joins_path_fieldset_fields() {
+        // Trace doc §5 step 7: iterate SPECS rows, resolve each
+        // field set → fields → reps. Grounded on the committed
+        // Elephant fixture.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/3d/usd/fixtures/SoC-ElephantWithMonochord.usdc");
+        if !fixture.exists() {
+            eprintln!("skip: fixture {fixture:?} not present");
+            return;
+        }
+        let bytes = std::fs::read(&fixture).expect("read fixture");
+        let file = UsdcFile::parse(&bytes).expect("parse Elephant USDC");
+        let specs = file.decode_specs(&bytes).expect("resolve SPECS join");
+
+        // Trace doc §4.6: 248 spec rows.
+        assert_eq!(specs.len(), 248, "trace doc §4.6 count");
+
+        // Path indices are the identity permutation 0..248.
+        let mut path_idx: Vec<i32> = specs.iter().map(|s| s.path_index).collect();
+        path_idx.sort_unstable();
+        assert_eq!(path_idx, (0..248).collect::<Vec<i32>>());
+
+        // Spec-type codes match the per-buffer decode set {1,6,7,8}.
+        let types: std::collections::BTreeSet<i32> = specs.iter().map(|s| s.spec_type).collect();
+        assert_eq!(
+            types,
+            [1, 6, 7, 8]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<i32>>()
+        );
+
+        // Every resolved field's name index is a valid TOKENS index
+        // and its rep word is the FIELDS rep at the same field slot.
+        let fields_sec = {
+            let fb = file.section_bytes(SectionName::Fields, &bytes).unwrap();
+            FieldsSection::parse(fb).unwrap()
+        };
+        let names = fields_sec.decode_name_indices().unwrap();
+        let reps = fields_sec.decode_reps().unwrap();
+        // Build the reverse map (nameTokenIdx, rep) -> appears in FIELDS.
+        let field_pairs: std::collections::HashSet<(i32, u64)> =
+            names.iter().copied().zip(reps.iter().copied()).collect();
+        for spec in &specs {
+            for &(name_tok, rep) in &spec.fields {
+                assert!(name_tok >= 0, "field name token index must be non-negative");
+                assert!(
+                    field_pairs.contains(&(name_tok, rep)),
+                    "resolved (name {name_tok}, rep {rep:#018x}) must come from the FIELDS table"
+                );
+            }
+        }
+
+        // Row 0 is the root prim spec (path 0). Its field set must be
+        // non-empty (the root layer metadata), and its first field's
+        // name token resolves through TOKENS.
+        let root = specs.iter().find(|s| s.path_index == 0).unwrap();
+        assert!(
+            !root.fields.is_empty(),
+            "root prim spec must carry its metadata fields"
+        );
+        let tokens = {
+            let tb = file.section_bytes(SectionName::Tokens, &bytes).unwrap();
+            TokensSection::parse(tb).unwrap().decode().unwrap()
+        };
+        for &(name_tok, _) in &root.fields {
+            assert!(
+                (name_tok as usize) < tokens.len(),
+                "root field name token {name_tok} indexes the {}-entry TOKENS pool",
+                tokens.len()
+            );
+        }
+        // The total resolved field count across all specs equals the
+        // number of non-sentinel entries reachable as run elements —
+        // i.e. the join visited every field a spec references.
+        let total_fields: usize = specs.iter().map(|s| s.fields.len()).sum();
+        assert!(
+            total_fields >= specs.len(),
+            "each spec resolves at least one field on this fixture"
+        );
     }
 }
