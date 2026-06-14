@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 303 (USDC §5 step 3 + 7 — field-name `TOKENS` resolution)
+
+- **`usdc::UsdcFile::decode_named_specs(file_bytes)`** — carries the
+  trace doc §5 reader pipeline one step past `decode_specs`: loads the
+  §4.1 `TOKENS` atom pool (step 3) and rewrites each resolved spec
+  row's `(fieldNameTokenIndex, valueRep)` pairs into
+  `(fieldName, valueRep)` by indexing the pool, returning the new
+  **`usdc::NamedSpec`** struct. `TOKENS` / `FIELDS` / `FIELDSETS` /
+  `SPECS` are each decoded once. Only field names are humanised;
+  `value_rep`, `path_index` and `spec_type` stay raw (type-code
+  enumerations remain gap-tracker Round B). An absent `TOKENS` section,
+  or a field-name token index out of pool range, is an
+  `Error::InvalidData`.
+- Cross-validated on the committed Elephant fixture: 248 named specs,
+  row structure identical to `decode_specs`, every named field equal to
+  its `TOKENS` pool entry, and the root prim (path 0) naming its eight
+  metadata fields in field order.
+
 ### Added — Round 297 (USDC §1 version-compatibility dispatch gate)
 
 - **`usdc::Version::READER_MAX`** — the highest `(major, minor)` this

@@ -369,6 +369,30 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   The spec-type and value-rep type-code enumerations remain
   uninterpreted (gap-tracker Round B fact tables).
 
+## Round 303 scope (USDC §5 step 3 + 7 — field-name `TOKENS` resolution)
+
+- **`usdc::UsdcFile::decode_named_specs(file_bytes)`** carries the
+  §5 reader pipeline one step further than `decode_specs`: it loads
+  the §4.1 `TOKENS` atom pool (step 3), runs the §4.6 SPECS join, and
+  rewrites each row's `(fieldNameTokenIndex, valueRep)` pairs into
+  `(fieldName, valueRep)` by indexing the pool. The result is the
+  human-readable form a consumer iterates — at a namespace path, of
+  some spec type, a list of **named** properties — surfaced as the new
+  **`usdc::NamedSpec`** struct. `TOKENS`, `FIELDS`, `FIELDSETS` and
+  `SPECS` are each decoded exactly once. Trace doc §4.1 grounds the
+  mapping: "Every other section refers to a token by its index into
+  this pool."
+- The naming step touches **only** field names. `value_rep` words stay
+  uninterpreted `u64`s and `path_index` / `spec_type` stay raw — the
+  type-code enumerations remain gap-tracker Round B fact tables.
+- Cross-validated on the Elephant fixture: 248 named specs, identical
+  row structure to `decode_specs`, every named field equal to the
+  `TOKENS` entry its index pointed at, and the root prim (path 0)
+  naming its eight metadata fields in field order — `defaultPrim`,
+  `endTimeCode`, `framesPerSecond`, `metersPerUnit`, `startTimeCode`,
+  `timeCodesPerSecond`, `upAxis`, `primChildren`. An absent `TOKENS`
+  section is a clear `Error::InvalidData`, not a panic.
+
 ## Round 282 scope (USDC §3a LZ4 layer + §3b common-delta preamble + typed section decoders)
 
 - **`usdc::CompressedBuffer::decompress` / `decompress_exact`** —

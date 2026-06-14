@@ -192,6 +192,13 @@
 //!   join columns of the §4.6 spec table), and the three PATHS
 //!   raw-stream decoders ([`PathsSection::decode_path_token_ints`]
 //!   et al. — exact streams, semantics still deferred).
+//! * The §5 reader-pipeline join: [`UsdcFile::decode_specs`]
+//!   (→ `Vec<ResolvedSpec>`, each spec row's field set expanded to
+//!   `(fieldNameTokenIndex, valueRep)` pairs) and
+//!   [`UsdcFile::decode_named_specs`] (→ `Vec<NamedSpec>`, the same
+//!   rows with field-name token indices resolved to UTF-8 strings
+//!   against the §4.1 `TOKENS` pool — the §5 step-3 + step-7
+//!   materialisation).
 //!
 //! What this module does **not** do (deferred to a follow-up round):
 //!
@@ -2702,6 +2709,39 @@ pub struct ResolvedSpec {
     pub fields: Vec<(i32, u64)>,
 }
 
+/// One §4.6 `SPECS` row with its field-name **token indices already
+/// resolved to UTF-8 strings** against the §4.1 `TOKENS` atom pool.
+///
+/// This is [`ResolvedSpec`] carried one step further along the trace
+/// doc §5 reader pipeline: step 3 loads the `TOKENS` pool, and the
+/// final materialisation (steps 6–7) names each field by its token.
+/// Every field name in a real `.usdc` is interned once in `TOKENS`
+/// and referenced everywhere else by its pool index (trace §4.1:
+/// "Every other section refers to a token by its index into this
+/// pool"); a [`NamedSpec`] performs that final index → string lookup
+/// so a consumer gets `("upAxis", rep)` instead of `(6, rep)`.
+///
+/// The `value_rep` words stay **uninterpreted** `u64`s (the type-code
+/// enumeration is gap-tracker Round B), and `path_index` /
+/// `spec_type` stay raw — only the *field names* are humanised here,
+/// because that is the one mapping the trace doc fully grounds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedSpec {
+    /// Index into the §4.5 `PATHS` namespace tree (raw — same as
+    /// [`ResolvedSpec::path_index`]).
+    pub path_index: i32,
+    /// Flat offset into the §4.4 `FIELDSETS` array (raw — same as
+    /// [`ResolvedSpec::field_set_offset`]).
+    pub field_set_offset: i32,
+    /// Raw §4.6 spec-type code (uninterpreted — gap-tracker Round B).
+    pub spec_type: i32,
+    /// The spec's `(fieldName, valueRep)` property list. `fieldName`
+    /// is the §4.1 `TOKENS` string the §4.3 `FIELDS` name index
+    /// pointed at; `valueRep` is the same packed `u64` rep word as
+    /// [`ResolvedSpec`], still uninterpreted.
+    pub fields: Vec<(String, u64)>,
+}
+
 impl UsdcFile {
     /// End-to-end materialisation of the §4.6 `SPECS` table — the
     /// trace doc §5 "how a reader uses it" pipeline, joined into one
@@ -2791,6 +2831,72 @@ impl UsdcFile {
                 field_set_offset: fs_offset,
                 spec_type: spec_types[row],
                 fields: fields_out,
+            });
+        }
+        Ok(out)
+    }
+
+    /// End-to-end §4.6 `SPECS` materialisation with field names
+    /// resolved to strings — [`UsdcFile::decode_specs`] followed by
+    /// the trace doc §5 step-3 `TOKENS` join.
+    ///
+    /// This decodes the §4.1 `TOKENS` atom pool once, then runs
+    /// [`decode_specs`](Self::decode_specs) and rewrites each spec
+    /// row's `(fieldNameTokenIndex, valueRep)` pairs into
+    /// `(fieldName, valueRep)` by indexing the pool. The result is the
+    /// human-readable form a downstream consumer iterates: at a
+    /// namespace path, of some spec type, a list of named properties
+    /// with their (still-uninterpreted) value-rep words.
+    ///
+    /// `file_bytes` must be the same buffer [`UsdcFile::parse`] was
+    /// called on. `TOKENS`, `FIELDS`, `FIELDSETS` and `SPECS` are each
+    /// decoded exactly once.
+    ///
+    /// On the committed Elephant fixture this returns 248 named specs;
+    /// the root prim (row at `path_index == 0`) names its eight
+    /// metadata fields (`defaultPrim`, `endTimeCode`,
+    /// `framesPerSecond`, `metersPerUnit`, `startTimeCode`,
+    /// `timeCodesPerSecond`, `upAxis`, `primChildren`).
+    ///
+    /// Errors:
+    ///
+    /// * [`Error::InvalidData`](crate::Error) propagated from
+    ///   [`decode_specs`](Self::decode_specs) (missing / corrupt
+    ///   `FIELDS` / `FIELDSETS` / `SPECS`),
+    /// * [`Error::InvalidData`] if the `TOKENS` section is absent from
+    ///   the TOC or fails to decode,
+    /// * [`Error::InvalidData`] if a resolved field-name token index
+    ///   is negative or past the end of the `TOKENS` pool (a corrupt
+    ///   `FIELDS` name array).
+    pub fn decode_named_specs(&self, file_bytes: &[u8]) -> Result<Vec<NamedSpec>> {
+        let tokens_bytes = self
+            .section_bytes(SectionName::Tokens, file_bytes)
+            .ok_or_else(|| invalid("USDC §5: TOKENS section absent — cannot name spec fields"))?;
+        let tokens = TokensSection::parse(tokens_bytes)?.decode()?;
+
+        let specs = self.decode_specs(file_bytes)?;
+        let mut out = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let mut named = Vec::with_capacity(spec.fields.len());
+            for (name_tok, rep) in spec.fields {
+                let ti = usize::try_from(name_tok).map_err(|_| {
+                    invalid(format!(
+                        "USDC §5: field name token index {name_tok} is negative"
+                    ))
+                })?;
+                let name = tokens.get(ti).ok_or_else(|| {
+                    invalid(format!(
+                        "USDC §5: field name token index {ti} out of range of the {}-entry TOKENS pool",
+                        tokens.len()
+                    ))
+                })?;
+                named.push((name.clone(), rep));
+            }
+            out.push(NamedSpec {
+                path_index: spec.path_index,
+                field_set_offset: spec.field_set_offset,
+                spec_type: spec.spec_type,
+                fields: named,
             });
         }
         Ok(out)
@@ -5611,5 +5717,92 @@ mod tests {
             total_fields >= specs.len(),
             "each spec resolves at least one field on this fixture"
         );
+    }
+
+    #[test]
+    fn real_fixture_decode_named_specs_resolves_field_names() {
+        // Trace doc §5 step 3 + step 7: load the TOKENS pool, then
+        // name every resolved spec field by its token. Grounded on
+        // the committed Elephant fixture.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/3d/usd/fixtures/SoC-ElephantWithMonochord.usdc");
+        if !fixture.exists() {
+            eprintln!("skip: fixture {fixture:?} not present");
+            return;
+        }
+        let bytes = std::fs::read(&fixture).expect("read fixture");
+        let file = UsdcFile::parse(&bytes).expect("parse Elephant USDC");
+
+        let named = file.decode_named_specs(&bytes).expect("name SPECS join");
+        let raw = file.decode_specs(&bytes).expect("resolve SPECS join");
+
+        // Same row count and per-row structure as the index form, only
+        // the names are humanised.
+        assert_eq!(named.len(), 248, "trace doc §4.6 count");
+        assert_eq!(named.len(), raw.len());
+        for (n, r) in named.iter().zip(raw.iter()) {
+            assert_eq!(n.path_index, r.path_index);
+            assert_eq!(n.field_set_offset, r.field_set_offset);
+            assert_eq!(n.spec_type, r.spec_type);
+            assert_eq!(n.fields.len(), r.fields.len());
+        }
+
+        // Cross-check every named field against the TOKENS pool: the
+        // string must equal `tokens[nameTokenIndex]` from the raw join.
+        let tokens = {
+            let tb = file.section_bytes(SectionName::Tokens, &bytes).unwrap();
+            TokensSection::parse(tb).unwrap().decode().unwrap()
+        };
+        for (n, r) in named.iter().zip(raw.iter()) {
+            for ((name, n_rep), (tok, r_rep)) in n.fields.iter().zip(r.fields.iter()) {
+                assert_eq!(n_rep, r_rep, "rep word preserved by the naming step");
+                assert_eq!(
+                    name.as_str(),
+                    tokens[*tok as usize].as_str(),
+                    "named field equals the TOKENS pool entry the index pointed at"
+                );
+            }
+        }
+
+        // The root prim (path 0) names exactly the root-layer metadata
+        // fields the §4.1 / §4.3 worked examples list, in field order.
+        let root = named.iter().find(|s| s.path_index == 0).unwrap();
+        let root_names: Vec<&str> = root.fields.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            root_names,
+            [
+                "defaultPrim",
+                "endTimeCode",
+                "framesPerSecond",
+                "metersPerUnit",
+                "startTimeCode",
+                "timeCodesPerSecond",
+                "upAxis",
+                "primChildren",
+            ],
+            "root prim metadata fields, named via TOKENS"
+        );
+
+        // Every named field across all specs is a non-empty token.
+        assert!(
+            named
+                .iter()
+                .flat_map(|s| s.fields.iter())
+                .all(|(name, _)| !name.is_empty()),
+            "no resolved field name is the empty string"
+        );
+    }
+
+    #[test]
+    fn decode_named_specs_rejects_missing_tokens_section() {
+        // A TOC without a TOKENS section can't name field tokens; the
+        // join surfaces a clear InvalidData rather than panicking.
+        let bytes = synthetic_usdc(Version::V0_8_0, &[(b"FIELDS", &[0u8; 8])]);
+        let file = UsdcFile::parse(&bytes).expect("parse synthetic file");
+        let err = file
+            .decode_named_specs(&bytes)
+            .expect_err("absent TOKENS must fail");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("TOKENS section absent"), "{msg}");
     }
 }
