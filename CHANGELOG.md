@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 297 (USDC §1 version-compatibility dispatch gate)
+
+- **`usdc::Version::READER_MAX`** — the highest `(major, minor)` this
+  reader has behaviour for, set to the trace doc's only observed
+  version `0.8.0`.
+- **`usdc::Version::is_readable_by` / `usdc::Version::is_readable`** —
+  the trace doc §1 dispatch rule ("the version is the **only** dispatch
+  key — a reader compares `(major, minor)` and refuses files it is too
+  old to understand"). A file is readable iff its `(major, minor)`
+  does not exceed the reader's; patch is excluded from the gate (not
+  part of the dispatch key). `(major, minor)` is compared
+  lexicographically, so a major bump dominates any minor.
+- **`usdc::UsdcFile::parse`** now refuses a forward-incompatible file
+  up front (before TOC parse) with an `Unsupported` error rather than
+  a downstream structural error, when the file version's dispatch key
+  exceeds `READER_MAX`. Equal/older `(major, minor)` parse unchanged;
+  the committed `0.8.0` Elephant fixture is unaffected.
+
 ### Added — Round 290 (USDC §5 step 7 SPECS → FIELDSETS → FIELDS resolved join)
 
 - **`usdc::UsdcFile::decode_specs`** — materialises the trace doc §5

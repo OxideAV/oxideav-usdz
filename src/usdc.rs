@@ -229,7 +229,7 @@
 
 use core::fmt;
 
-use crate::error::invalid;
+use crate::error::{invalid, unsupported};
 use crate::Result;
 
 /// The 8-byte file signature observed at offset `0x00` of every
@@ -326,10 +326,45 @@ impl Version {
         })
     }
 
+    /// The highest `(major, minor)` this reader knows how to
+    /// interpret. The trace doc records `0.8.0` as the version both
+    /// observed real `.usdc` samples carry; that is the newest layout
+    /// we have behaviour for, so it is also the ceiling
+    /// [`Self::is_readable`] compares against. (Patch is *not* part of
+    /// the gate — the trace doc names `(major, minor)` as the sole
+    /// dispatch key, so a higher patch within a known `(major, minor)`
+    /// is read on a best-effort basis.)
+    pub const READER_MAX: Version = Version::V0_8_0;
+
     /// `(major, minor)` — the trace doc names this the dispatch key
     /// a reader compares against to decide it understands the file.
     pub fn dispatch_key(self) -> (u8, u8) {
         (self.major, self.minor)
+    }
+
+    /// Whether a reader with the given highest-understood version can
+    /// interpret a file at this version.
+    ///
+    /// The trace doc (§1 "Bootstrap header") states the version is the
+    /// **only** dispatch key: *"a reader compares `(major, minor)` and
+    /// refuses files it is too old to understand."* A file is therefore
+    /// readable iff its `(major, minor)` does not exceed the reader's —
+    /// a newer `(major, minor)` describes a layout the (older) reader
+    /// has no behaviour for and must refuse. Patch is excluded from the
+    /// comparison because it is not part of the dispatch key.
+    ///
+    /// `(major, minor)` is compared lexicographically: a smaller major
+    /// always reads; an equal major reads iff the file's minor does not
+    /// exceed the reader's.
+    pub fn is_readable_by(self, reader_max: Version) -> bool {
+        self.dispatch_key() <= reader_max.dispatch_key()
+    }
+
+    /// Convenience over [`Self::is_readable_by`] using this crate's
+    /// [`Version::READER_MAX`] ceiling — `true` iff this file version's
+    /// `(major, minor)` is one this reader understands.
+    pub fn is_readable(self) -> bool {
+        self.is_readable_by(Version::READER_MAX)
     }
 }
 
@@ -693,6 +728,22 @@ impl UsdcFile {
     /// integer-coding decoders not implemented in this round).
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let bootstrap = Bootstrap::parse(bytes)?;
+        // Trace doc §1: the version is the only dispatch key — a
+        // reader refuses a file whose `(major, minor)` is newer than
+        // the layout it has behaviour for. Gate before touching the
+        // TOC so a forward-incompatible file is rejected up front with
+        // a clear "unsupported version" signal rather than a
+        // downstream structural error.
+        if !bootstrap.version.is_readable() {
+            return Err(unsupported(format!(
+                "USDC §1: file version {} is newer than this reader understands (max {}); \
+                 (major, minor) dispatch key {:?} exceeds {:?}",
+                bootstrap.version,
+                Version::READER_MAX,
+                bootstrap.version.dispatch_key(),
+                Version::READER_MAX.dispatch_key(),
+            )));
+        }
         let toc = Toc::parse(bytes, &bootstrap)?;
         Ok(Self { bootstrap, toc })
     }
@@ -2784,6 +2835,84 @@ mod tests {
         assert!(msg.contains("reserved"), "{msg}");
     }
 
+    #[test]
+    fn version_reader_ceiling_is_observed_0_8_0() {
+        // The trace doc records 0.8.0 as the only observed version, so
+        // the reader's understood ceiling is exactly that.
+        assert_eq!(Version::READER_MAX, Version::V0_8_0);
+        assert_eq!(Version::READER_MAX.dispatch_key(), (0, 8));
+    }
+
+    #[test]
+    fn version_readability_compares_major_minor_only() {
+        // Equal (major, minor): readable regardless of patch (patch is
+        // not part of the dispatch key — a newer patch within a known
+        // (major, minor) is read best-effort).
+        assert!(Version::V0_8_0.is_readable());
+        assert!(Version {
+            major: 0,
+            minor: 8,
+            patch: 9,
+        }
+        .is_readable());
+        // Older (major, minor): always readable.
+        assert!(Version {
+            major: 0,
+            minor: 7,
+            patch: 0,
+        }
+        .is_readable());
+        // Newer minor within same major: refused.
+        assert!(!Version {
+            major: 0,
+            minor: 9,
+            patch: 0,
+        }
+        .is_readable());
+        // Newer major: refused even with a smaller minor.
+        assert!(!Version {
+            major: 1,
+            minor: 0,
+            patch: 0,
+        }
+        .is_readable());
+    }
+
+    #[test]
+    fn version_is_readable_by_arbitrary_ceiling() {
+        // The comparison is lexicographic over (major, minor); a major
+        // bump dominates any minor.
+        let reader = Version {
+            major: 1,
+            minor: 2,
+            patch: 0,
+        };
+        assert!(Version {
+            major: 1,
+            minor: 2,
+            patch: 5,
+        }
+        .is_readable_by(reader));
+        assert!(Version {
+            major: 0,
+            minor: 99,
+            patch: 0,
+        }
+        .is_readable_by(reader));
+        assert!(!Version {
+            major: 1,
+            minor: 3,
+            patch: 0,
+        }
+        .is_readable_by(reader));
+        assert!(!Version {
+            major: 2,
+            minor: 0,
+            patch: 0,
+        }
+        .is_readable_by(reader));
+    }
+
     /// Build a minimal valid USDC byte image: bootstrap, one TOKENS
     /// section payload, then the TOC.
     fn synthetic_usdc(version: Version, sections: &[(&[u8], &[u8])]) -> Vec<u8> {
@@ -2821,6 +2950,40 @@ mod tests {
         let b = Bootstrap::parse(&bytes).unwrap();
         assert_eq!(b.version, Version::V0_8_0);
         assert_eq!(b.toc_offset, BOOTSTRAP_SIZE as u64);
+    }
+
+    #[test]
+    fn usdc_parse_refuses_forward_incompatible_version() {
+        // A file claiming a (major, minor) newer than the reader
+        // understands is refused at the bootstrap gate (trace §1)
+        // before the TOC is even read.
+        let newer = Version {
+            major: 0,
+            minor: 9,
+            patch: 0,
+        };
+        let bytes = synthetic_usdc(newer, &[(b"TOKENS", &[0; 16])]);
+        let err = UsdcFile::parse(&bytes).expect_err("newer minor must be refused");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("newer than this reader"), "{msg}");
+    }
+
+    #[test]
+    fn usdc_parse_accepts_older_and_equal_version() {
+        // Older (major, minor) and the exact understood version both
+        // parse cleanly.
+        for v in [
+            Version {
+                major: 0,
+                minor: 7,
+                patch: 0,
+            },
+            Version::V0_8_0,
+        ] {
+            let bytes = synthetic_usdc(v, &[(b"TOKENS", &[0; 16])]);
+            let file = UsdcFile::parse(&bytes).expect("readable version must parse");
+            assert_eq!(file.bootstrap.version, v);
+        }
     }
 
     #[test]

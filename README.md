@@ -324,6 +324,24 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   module is required, so this oracle runs anywhere Apple USD Tools /
   the USD CLI binary is installed.
 
+## Round 297 scope (USDC §1 version-compatibility dispatch gate)
+
+- **`usdc::Version::is_readable` / `is_readable_by(reader_max)`** —
+  implements the trace doc §1 dispatch rule: *"the version is the only
+  dispatch key — a reader compares `(major, minor)` and refuses files
+  it is too old to understand."* A file is readable iff its
+  `(major, minor)` does not exceed the reader's understood ceiling.
+  Patch is deliberately excluded (it is not part of the dispatch key),
+  and `(major, minor)` is compared lexicographically so a major bump
+  dominates any minor.
+- **`usdc::Version::READER_MAX`** — the reader's understood ceiling,
+  set to the trace doc's only observed version `0.8.0`.
+- **`usdc::UsdcFile::parse`** now applies the gate up front: a file
+  whose `(major, minor)` is newer than `READER_MAX` is refused with an
+  `Unsupported` error before the TOC is touched, instead of failing
+  later with an opaque structural error. Equal/older versions (incl.
+  the committed `0.8.0` Elephant fixture) parse exactly as before.
+
 ## Round 290 scope (USDC §5 step 7 SPECS → FIELDSETS → FIELDS resolved join)
 
 - **`usdc::UsdcFile::decode_specs(file_bytes)`** — the capstone of
