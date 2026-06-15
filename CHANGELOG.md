@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 312 (USDC §5 step 3 — STRINGS → TOKENS pool resolution)
+
+- **`usdc::UsdcFile::decode_strings(file_bytes)`** — completes the
+  trace doc §5 step-3 "load STRINGS indices" join to its
+  string-resolved form. The §4.2 `STRINGS` section is a flat
+  `count × uint32` array of token indices; per §4.2 the pool is the
+  subset of §4.1 `TOKENS` atoms used as string-typed values. The
+  method composes the two indirections (`STRINGS[i]` is a token index,
+  `TOKENS[that]` is the UTF-8 atom) and returns the resolved strings in
+  pool order — the same `index → string` lookup `decode_named_specs`
+  performs for field names. `TOKENS` and `STRINGS` are each decoded
+  once. The Elephant fixture's documented zero-count `STRINGS` section
+  resolves to an empty vector without a `TOKENS` decode; an absent
+  `STRINGS`/`TOKENS` section, or an index past the `TOKENS` pool, is an
+  `Error::InvalidData`.
+- Cross-validated on the committed Elephant fixture (`STRINGS`
+  count = 0 → empty pool) plus synthetic populated, out-of-range, and
+  missing-section cases.
+
 ### Added — Round 303 (USDC §5 step 3 + 7 — field-name `TOKENS` resolution)
 
 - **`usdc::UsdcFile::decode_named_specs(file_bytes)`** — carries the

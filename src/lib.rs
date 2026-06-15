@@ -450,6 +450,21 @@
 //!   `{1, 6, 7, 8}`, every resolved `(name, rep)` pair traceable to
 //!   the FIELDS table and every name token a valid TOKENS-pool index.
 //!
+//! Round 312 — USDC §5 step 3 STRINGS → TOKENS pool resolution:
+//!
+//! * [`usdc::UsdcFile::decode_strings`] completes the trace doc §5
+//!   step-3 "load STRINGS indices" join to its string-resolved form:
+//!   the §4.2 STRINGS section is a flat `count × uint32` array of
+//!   token indices, and per §4.2 the pool is the subset of §4.1
+//!   TOKENS atoms used as string-typed values. The method composes
+//!   the two indirections — `STRINGS[i]` is a token index,
+//!   `TOKENS[that]` is the UTF-8 atom — and returns the resolved
+//!   strings in pool order, the same `index → string` lookup
+//!   [`usdc::UsdcFile::decode_named_specs`] performs for field names.
+//!   The Elephant fixture's documented zero-count STRINGS section
+//!   resolves to an empty vector without needing a TOKENS decode; an
+//!   index past the TOKENS pool is a clear `InvalidData`.
+//!
 //! Deferred to round 283+:
 //!
 //! * **`.usdc` PATHS tree-walk semantics.** The three PATHS buffers

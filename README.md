@@ -369,6 +369,27 @@ invoke `UsdzDecoder::new()` / `UsdzEncoder::new()` directly.
   The spec-type and value-rep type-code enumerations remain
   uninterpreted (gap-tracker Round B fact tables).
 
+## Round 312 scope (USDC §5 step 3 — STRINGS → TOKENS pool resolution)
+
+- **`usdc::UsdcFile::decode_strings(file_bytes)`** completes the trace
+  doc §5 step-3 "load STRINGS indices" join to its string-resolved
+  form. The §4.2 `STRINGS` section is a flat `count × uint32` array of
+  token indices, and per §4.2 the pool is *"the subset of `TOKENS`
+  atoms that are used as USDA string-typed values"* — a string-valued
+  field's rep references one of these `uint32`s, which is itself an
+  index into the §4.1 `TOKENS` atom pool. The method composes the two
+  indirections (`STRINGS[i]` is a token index, `TOKENS[that]` is the
+  UTF-8 atom) and returns the `count` resolved strings in pool order,
+  the same `index → string` lookup `decode_named_specs` performs for
+  field names. `TOKENS` and `STRINGS` are each decoded exactly once.
+- The Elephant fixture's documented zero-count `STRINGS` section
+  resolves to an empty vector **without** requiring a `TOKENS` decode;
+  the teapot sample populates the pool with 15 entries. An absent
+  `STRINGS` / `TOKENS` section, or a `STRINGS` index past the end of
+  the `TOKENS` pool, surfaces as `Error::InvalidData` rather than a
+  panic. Cross-validated on the committed Elephant fixture plus
+  synthetic populated, out-of-range, and missing-section cases.
+
 ## Round 303 scope (USDC §5 step 3 + 7 — field-name `TOKENS` resolution)
 
 - **`usdc::UsdcFile::decode_named_specs(file_bytes)`** carries the

@@ -2901,6 +2901,67 @@ impl UsdcFile {
         }
         Ok(out)
     }
+
+    /// Resolve the §4.2 `STRINGS` pool into its concrete UTF-8 atoms —
+    /// the trace doc §5 step-3 "load STRINGS indices" join carried to
+    /// its string-resolved form.
+    ///
+    /// The `STRINGS` section is a flat `count × uint32` array of token
+    /// indices (raw, not LZ4-compressed). Per the trace doc §4.2 the
+    /// pool is "the subset of `TOKENS` atoms that are used as USDA
+    /// *string-typed* values": a string-valued field's value-rep
+    /// references one of these `uint32`s, which is itself an index into
+    /// the §4.1 `TOKENS` atom pool. This method composes the two
+    /// indirections — `STRINGS[i]` is a token index, `TOKENS[that]` is
+    /// the UTF-8 atom — and returns the `count` resolved strings in
+    /// pool order, so a string-valued rep that names "the i-th string"
+    /// can be read out directly.
+    ///
+    /// `file_bytes` must be the same buffer [`UsdcFile::parse`] was
+    /// called on. `TOKENS` and `STRINGS` are each decoded exactly once.
+    ///
+    /// On the committed Elephant fixture the `STRINGS` section's
+    /// `count` is 0 (the whole section is its 8-byte header), so this
+    /// returns an empty vector — the documented edge. The teapot
+    /// sample populates the pool with 15 entries.
+    ///
+    /// Errors:
+    ///
+    /// * [`Error::InvalidData`](crate::Error) if the `STRINGS` or
+    ///   `TOKENS` section is absent from the TOC or fails to decode,
+    /// * [`Error::InvalidData`] if a `STRINGS` token index is past the
+    ///   end of the `TOKENS` pool (a corrupt index array).
+    pub fn decode_strings(&self, file_bytes: &[u8]) -> Result<Vec<String>> {
+        let strings_bytes = self
+            .section_bytes(SectionName::Strings, file_bytes)
+            .ok_or_else(|| {
+                invalid("USDC §5: STRINGS section absent — cannot resolve string pool")
+            })?;
+        let indices = StringsSection::parse(strings_bytes)?.parse_indices();
+        if indices.is_empty() {
+            // The Elephant fixture's documented zero-count edge: no
+            // TOKENS decode is needed when the pool is empty.
+            return Ok(Vec::new());
+        }
+        let tokens_bytes = self
+            .section_bytes(SectionName::Tokens, file_bytes)
+            .ok_or_else(|| {
+                invalid("USDC §5: TOKENS section absent — cannot resolve string pool")
+            })?;
+        let tokens = TokensSection::parse(tokens_bytes)?.decode()?;
+        let mut out = Vec::with_capacity(indices.len());
+        for idx in indices {
+            let ti = idx as usize;
+            let atom = tokens.get(ti).ok_or_else(|| {
+                invalid(format!(
+                    "USDC §5: STRINGS token index {ti} out of range of the {}-entry TOKENS pool",
+                    tokens.len()
+                ))
+            })?;
+            out.push(atom.clone());
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -5804,5 +5865,112 @@ mod tests {
             .expect_err("absent TOKENS must fail");
         let msg = format!("{err:?}");
         assert!(msg.contains("TOKENS section absent"), "{msg}");
+    }
+
+    // ----- §4.2 STRINGS → TOKENS pool resolution (`decode_strings`) -----
+
+    /// Build a real §4.1 TOKENS section payload from a list of atoms:
+    /// 24-byte header (`numTokens`, `uncompressedSize`,
+    /// `compressedSize`) + a §3a single-chunk LZ4 buffer of the
+    /// NUL-joined blob. Mirrors the on-wire shape the trace doc §4.1
+    /// records so `TokensSection::parse(...).decode()` round-trips it.
+    fn build_tokens_section_payload(atoms: &[&str]) -> Vec<u8> {
+        let mut blob = Vec::new();
+        for a in atoms {
+            blob.extend_from_slice(a.as_bytes());
+            blob.push(0); // NUL delimiter, trailing-NUL form
+        }
+        let buffer = lz4_single_chunk(&blob);
+        let mut out = Vec::new();
+        out.extend_from_slice(&(atoms.len() as u64).to_le_bytes()); // numTokens
+        out.extend_from_slice(&(blob.len() as u64).to_le_bytes()); // uncompressedSize
+        out.extend_from_slice(&(buffer.len() as u64).to_le_bytes()); // compressedSize
+        out.extend_from_slice(&buffer);
+        out
+    }
+
+    #[test]
+    fn decode_strings_resolves_indices_through_tokens_pool() {
+        // §5 step 3: a STRINGS array of token indices resolves through
+        // the TOKENS pool into the concrete string atoms, in pool
+        // order. The STRINGS pool is the subset of TOKENS used as
+        // string-typed values (trace §4.2), so the indices need not be
+        // contiguous and may repeat.
+        let atoms = ["alpha", "beta", "gamma", "delta"];
+        let tokens = build_tokens_section_payload(&atoms);
+        // STRINGS picks tokens 3, 1, 1, 0 → "delta", "beta", "beta", "alpha".
+        let strings = build_strings_section(&[3, 1, 1, 0]);
+        let bytes = synthetic_usdc(
+            Version::V0_8_0,
+            &[(b"TOKENS", &tokens), (b"STRINGS", &strings)],
+        );
+        let file = UsdcFile::parse(&bytes).expect("parse synthetic file");
+        let resolved = file.decode_strings(&bytes).expect("resolve STRINGS pool");
+        assert_eq!(resolved, vec!["delta", "beta", "beta", "alpha"]);
+    }
+
+    #[test]
+    fn decode_strings_empty_pool_needs_no_tokens() {
+        // The Elephant fixture's documented zero-count edge: an empty
+        // STRINGS array resolves to an empty vector WITHOUT requiring a
+        // TOKENS section to be present at all.
+        let strings = build_strings_section(&[]);
+        let bytes = synthetic_usdc(Version::V0_8_0, &[(b"STRINGS", &strings)]);
+        let file = UsdcFile::parse(&bytes).expect("parse synthetic file");
+        let resolved = file.decode_strings(&bytes).expect("empty pool resolves");
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn decode_strings_rejects_index_past_tokens_pool() {
+        // A STRINGS index beyond the TOKENS pool is a corrupt array;
+        // the join surfaces a clear InvalidData rather than panicking.
+        let atoms = ["one", "two"];
+        let tokens = build_tokens_section_payload(&atoms);
+        let strings = build_strings_section(&[5]); // out of range for a 2-atom pool
+        let bytes = synthetic_usdc(
+            Version::V0_8_0,
+            &[(b"TOKENS", &tokens), (b"STRINGS", &strings)],
+        );
+        let file = UsdcFile::parse(&bytes).expect("parse synthetic file");
+        let err = file
+            .decode_strings(&bytes)
+            .expect_err("out-of-range index must fail");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("out of range") && msg.contains("TOKENS pool"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn decode_strings_rejects_missing_strings_section() {
+        // No STRINGS section at all → clear InvalidData, not a panic.
+        let bytes = synthetic_usdc(Version::V0_8_0, &[(b"FIELDS", &[0u8; 8])]);
+        let file = UsdcFile::parse(&bytes).expect("parse synthetic file");
+        let err = file
+            .decode_strings(&bytes)
+            .expect_err("absent STRINGS must fail");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("STRINGS section absent"), "{msg}");
+    }
+
+    #[test]
+    fn real_fixture_decode_strings_zero_count() {
+        // Trace doc §4.2 / §5 step 3 on the committed Elephant fixture:
+        // STRINGS count = 0, so the resolved pool is empty.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/3d/usd/fixtures/SoC-ElephantWithMonochord.usdc");
+        if !fixture.exists() {
+            eprintln!("skip: fixture {fixture:?} not present");
+            return;
+        }
+        let bytes = std::fs::read(&fixture).expect("read fixture");
+        let file = UsdcFile::parse(&bytes).expect("parse Elephant USDC");
+        let resolved = file.decode_strings(&bytes).expect("resolve STRINGS pool");
+        assert!(
+            resolved.is_empty(),
+            "trace doc §4.2 records Elephant STRINGS count = 0"
+        );
     }
 }
