@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- usdc: end-to-end §3a → LZ4 → §3b section-content regression test
+  against the committed Elephant fixture (192 tokens / 157 fields /
+  576 field-set indices / 248 paths / 248 specs); correct the
+  `decode_specs` doc-comment (`path_index` is a permutation of
+  `0..248`, identity for the first 36 rows, not the full identity map).
+
 ## [0.0.3](https://github.com/OxideAV/oxideav-usdz/compare/v0.0.2...v0.0.3) - 2026-06-15
 
 ### Other

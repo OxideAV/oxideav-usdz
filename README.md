@@ -81,18 +81,31 @@ A clean-room USDC reader is in progress. Implemented so far:
 - The TOC and the outer framing of all six standard sections — TOKENS,
   STRINGS, FIELDS, FIELDSETS, PATHS, SPECS — with typed section accessors
   and canonical-order predicates.
-- The §3a compressed-buffer framing and the §3b compressed-integer
-  decoder, plus the STRINGS → TOKENS and field-name TOKENS pool
-  resolution and the SPECS → FIELDSETS → FIELDS resolved join.
+- The §3a compressed-buffer framing with the public LZ4 block decode,
+  and the §3b compressed-integer decoder including the 4-byte
+  common-delta preamble.
+- End-to-end section-content decode chaining §3a → LZ4 → §3b: the TOKENS
+  atom pool, the FIELDS `(nameIndex, valueRep)` pairs, the FIELDSETS flat
+  index array, and the three PATHS buffers — each decoding exactly on the
+  committed Elephant fixture (192 tokens, 157 fields, 576 field-set
+  indices, 248 paths).
+- The STRINGS → TOKENS and field-name TOKENS pool resolution and the
+  full §5 SPECS → FIELDSETS → FIELDS join (`decode_specs` /
+  `decode_named_specs`), which materialises all 248 Elephant spec rows
+  with their field names resolved to strings.
 
 Not yet implemented (so USDC files do not fully decode to a scene yet):
 
-- **LZ4 block decompression** of chunk payloads — the framing exposes
-  each chunk's raw bytes, but the block decode awaits a staged
-  clean-room trace of the public LZ4 block format.
-- **§3b common-value semantic recovery** and the **FIELDS value-rep
-  type-code** materialisation that turn the bounded section buffers into
-  values.
+- **FIELDS value-rep type-code materialisation** — each spec field's
+  value-rep word is surfaced as a raw `u64`; decomposing the packed
+  type-enum / flag bits / inline-or-offset payload into typed values
+  needs the type-code enumeration, which is not yet staged in
+  `docs/3d/usd/`.
+- **PATHS namespace-tree reconstruction** — the three parallel buffers
+  (path-token indices, element-token indices, jump offsets) decode to
+  their raw integer streams, but the jump-walk that turns them into
+  `SdfPath` strings is not yet documented (the per-element semantics and
+  the jump-offset encoding are not pinned by the staged trace).
 
 ## Not yet supported
 

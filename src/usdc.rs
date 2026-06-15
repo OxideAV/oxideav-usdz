@@ -2764,10 +2764,12 @@ impl UsdcFile {
     /// total field count.
     ///
     /// On the committed Elephant fixture this returns 248 specs;
-    /// `path_index` is the identity permutation `0..248`, the four
-    /// distinct `spec_type` codes are `{1, 6, 7, 8}`, and the root
-    /// prim's spec (row 0) resolves to its eight metadata fields
-    /// (`defaultPrim`, `endTimeCode`, … via the §4.1 `TOKENS` pool).
+    /// `path_index` is a permutation of `0..248` (identity for the
+    /// first 36 rows, then it reorders — it is *not* the full identity
+    /// map), the four distinct `spec_type` codes are `{1, 6, 7, 8}`,
+    /// and the root prim's spec (row 0) resolves to its eight metadata
+    /// fields (`defaultPrim`, `endTimeCode`, … via the §4.1 `TOKENS`
+    /// pool).
     ///
     /// Errors:
     ///
