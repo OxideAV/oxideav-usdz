@@ -92,7 +92,10 @@ A clean-room USDC reader is in progress. Implemented so far:
 - The STRINGS → TOKENS and field-name TOKENS pool resolution and the
   full §5 SPECS → FIELDSETS → FIELDS join (`decode_specs` /
   `decode_named_specs`), which materialises all 248 Elephant spec rows
-  with their field names resolved to strings.
+  with their field names resolved to strings. Each spec row's `pathIndex`
+  is bounds-checked against the §4.5 PATHS `numPaths`, so a corrupt
+  path-index column referencing a non-existent namespace path is rejected
+  rather than producing a dangling `SdfPath` reference.
 
 Not yet implemented (so USDC files do not fully decode to a scene yet):
 

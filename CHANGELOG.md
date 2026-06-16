@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- usdc §5: bounds-check each spec row's `pathIndex` against the §4.5
+  PATHS `numPaths` in `decode_specs` — a corrupt §4.6 path-index column
+  referencing a non-existent namespace path now fails with a clear
+  `InvalidData` rather than producing a dangling `SdfPath` reference.
 - usdc: end-to-end §3a → LZ4 → §3b section-content regression test
   against the committed Elephant fixture (192 tokens / 157 fields /
   576 field-set indices / 248 paths / 248 specs); correct the

@@ -194,7 +194,9 @@
 //!   et al. — exact streams, semantics still deferred).
 //! * The §5 reader-pipeline join: [`UsdcFile::decode_specs`]
 //!   (→ `Vec<ResolvedSpec>`, each spec row's field set expanded to
-//!   `(fieldNameTokenIndex, valueRep)` pairs) and
+//!   `(fieldNameTokenIndex, valueRep)` pairs, with each row's
+//!   `pathIndex` bounds-checked against the §4.5 PATHS `numPaths`)
+//!   and
 //!   [`UsdcFile::decode_named_specs`] (→ `Vec<NamedSpec>`, the same
 //!   rows with field-name token indices resolved to UTF-8 strings
 //!   against the §4.1 `TOKENS` pool — the §5 step-3 + step-7
@@ -2774,11 +2776,17 @@ impl UsdcFile {
     /// Errors:
     ///
     /// * [`Error::InvalidData`](crate::Error) if any of the
-    ///   `FIELDS` / `FIELDSETS` / `SPECS` sections is missing from
-    ///   the TOC or fails to decode,
+    ///   `FIELDS` / `FIELDSETS` / `PATHS` / `SPECS` sections is
+    ///   missing from the TOC or fails to decode,
     /// * [`Error::InvalidData`] if a field index in a resolved set
     ///   is out of range of the `FIELDS` table (a corrupt
-    ///   `FIELDSETS` entry).
+    ///   `FIELDSETS` entry),
+    /// * [`Error::InvalidData`] if a spec row's `pathIndex` falls
+    ///   outside `0..numPaths` (a corrupt §4.6 path-index column —
+    ///   trace doc §4.6 records buffer 1 as "path indices into
+    ///   `PATHS`", and §4.5's header pins `numPaths`, so an index at
+    ///   or past `numPaths` names a namespace path the file does not
+    ///   carry).
     pub fn decode_specs(&self, file_bytes: &[u8]) -> Result<Vec<ResolvedSpec>> {
         let fields_bytes = self
             .section_bytes(SectionName::Fields, file_bytes)
@@ -2786,9 +2794,22 @@ impl UsdcFile {
         let fieldsets_bytes = self
             .section_bytes(SectionName::FieldSets, file_bytes)
             .ok_or_else(|| invalid("USDC §5: FIELDSETS section absent — cannot resolve specs"))?;
+        let paths_bytes = self
+            .section_bytes(SectionName::Paths, file_bytes)
+            .ok_or_else(|| {
+                invalid("USDC §5: PATHS section absent — cannot bound spec path indices")
+            })?;
         let specs_bytes = self
             .section_bytes(SectionName::Specs, file_bytes)
             .ok_or_else(|| invalid("USDC §5: SPECS section absent — cannot resolve specs"))?;
+
+        // Trace doc §4.5: the PATHS header's leading `int64 numPaths`
+        // is the count of namespace paths the file carries. Each §4.6
+        // spec row's `pathIndex` indexes into this tree (§4.6 buffer 1
+        // / §5 step 7), so a valid index is `0..numPaths`. We only need
+        // the count here — the tree-walk reconstruction itself stays
+        // deferred (see `PathsSection`'s caveat).
+        let num_paths = PathsSection::parse(paths_bytes)?.header.num_paths;
 
         let fields = FieldsSection::parse(fields_bytes)?;
         let field_names = fields.decode_name_indices()?;
@@ -2806,6 +2827,19 @@ impl UsdcFile {
         let count = path_indices.len();
         let mut out = Vec::with_capacity(count);
         for row in 0..count {
+            // §4.6 path-index bound: the row's pathIndex must name a
+            // path the §4.5 PATHS section actually carries.
+            let path_idx = path_indices[row];
+            let pi = usize::try_from(path_idx).map_err(|_| {
+                invalid(format!(
+                    "USDC §5: spec row {row} has negative path index {path_idx}"
+                ))
+            })?;
+            if (pi as u64) >= num_paths {
+                return Err(invalid(format!(
+                    "USDC §5: spec row {row} path index {pi} out of range of the {num_paths}-path §4.5 PATHS namespace tree"
+                )));
+            }
             let fs_offset = field_set_offsets[row];
             let start = usize::try_from(fs_offset).map_err(|_| {
                 invalid(format!(
@@ -5867,6 +5901,134 @@ mod tests {
             .expect_err("absent TOKENS must fail");
         let msg = format!("{err:?}");
         assert!(msg.contains("TOKENS section absent"), "{msg}");
+    }
+
+    // ----- §5 spec-row pathIndex bound against §4.5 numPaths -----
+
+    /// Build a minimal but structurally-valid §4.3 FIELDS section
+    /// payload (int64 numFields + names buffer + reps buffer).
+    fn build_fields_payload(names: &[i32], reps: &[u64]) -> Vec<u8> {
+        assert_eq!(names.len(), reps.len());
+        let names_buf = lz4_single_chunk(&encode_int_array_for_tests(names));
+        let reps_raw: Vec<u8> = reps.iter().flat_map(|r| r.to_le_bytes()).collect();
+        let reps_buf = lz4_single_chunk(&reps_raw);
+        let mut s = (names.len() as u64).to_le_bytes().to_vec();
+        s.extend((names_buf.len() as u64).to_le_bytes());
+        s.extend(&names_buf);
+        s.extend((reps_buf.len() as u64).to_le_bytes());
+        s.extend(&reps_buf);
+        s
+    }
+
+    /// Build a §4.4 FIELDSETS section payload from a flat (sentinel
+    /// `-1`-separated) field-index array.
+    fn build_fieldsets_payload(flat: &[i32]) -> Vec<u8> {
+        let buf = lz4_single_chunk(&encode_int_array_for_tests(flat));
+        let mut s = (flat.len() as u64).to_le_bytes().to_vec();
+        s.extend((buf.len() as u64).to_le_bytes());
+        s.extend(&buf);
+        s
+    }
+
+    /// Build a §4.5 PATHS section payload publishing `num_paths` (the
+    /// three buffers carry placeholder `num_paths`-element streams; the
+    /// path-index bound only consults the header's numPaths).
+    fn build_paths_payload(num_paths: u64) -> Vec<u8> {
+        let n = num_paths as usize;
+        let stream: Vec<i32> = (0..n as i32).collect();
+        let mut s = num_paths.to_le_bytes().to_vec();
+        s.extend(num_paths.to_le_bytes()); // repeated count (§4.5 invariant)
+        for _ in 0..3 {
+            let buf = lz4_single_chunk(&encode_int_array_for_tests(&stream));
+            s.extend((buf.len() as u64).to_le_bytes());
+            s.extend(&buf);
+        }
+        s
+    }
+
+    /// Build a §4.6 SPECS section payload from its three columns.
+    fn build_specs_payload(path_idx: &[i32], fieldset_idx: &[i32], spec_types: &[i32]) -> Vec<u8> {
+        let mut s = (path_idx.len() as u64).to_le_bytes().to_vec();
+        for column in [path_idx, fieldset_idx, spec_types] {
+            let buf = lz4_single_chunk(&encode_int_array_for_tests(column));
+            s.extend((buf.len() as u64).to_le_bytes());
+            s.extend(&buf);
+        }
+        s
+    }
+
+    /// Assemble a full synthetic USDC carrying the four sections
+    /// `decode_specs` joins (FIELDS / FIELDSETS / PATHS / SPECS), with
+    /// a caller-chosen `num_paths` and SPECS path-index column.
+    fn synthetic_specs_file(num_paths: u64, path_idx: &[i32]) -> Vec<u8> {
+        // One field set `{0}` (run + sentinel), one field, all specs
+        // point at field-set offset 0.
+        let fields = build_fields_payload(&[0], &[0]);
+        let fieldsets = build_fieldsets_payload(&[0, -1]);
+        let paths = build_paths_payload(num_paths);
+        let fieldset_idx: Vec<i32> = vec![0; path_idx.len()];
+        let spec_types: Vec<i32> = vec![1; path_idx.len()];
+        let specs = build_specs_payload(path_idx, &fieldset_idx, &spec_types);
+        synthetic_usdc(
+            Version::V0_8_0,
+            &[
+                (b"FIELDS", &fields),
+                (b"FIELDSETS", &fieldsets),
+                (b"PATHS", &paths),
+                (b"SPECS", &specs),
+            ],
+        )
+    }
+
+    #[test]
+    fn decode_specs_accepts_in_range_path_indices() {
+        // Trace §4.6: spec path indices index the §4.5 PATHS tree.
+        // With numPaths = 3 and rows pointing at 0/1/2, the join
+        // succeeds and preserves each row's path index.
+        let bytes = synthetic_specs_file(3, &[0, 2, 1]);
+        let file = UsdcFile::parse(&bytes).expect("parse synthetic file");
+        let specs = file.decode_specs(&bytes).expect("in-range join");
+        let got: Vec<i32> = specs.iter().map(|s| s.path_index).collect();
+        assert_eq!(got, vec![0, 2, 1]);
+    }
+
+    #[test]
+    fn decode_specs_rejects_path_index_at_or_past_num_paths() {
+        // numPaths = 2 but a row names path 2 (one past the last valid
+        // path). Trace §4.5 / §4.6: that path does not exist in the
+        // file, so the join must reject it rather than emit a row with
+        // a dangling SdfPath reference.
+        let bytes = synthetic_specs_file(2, &[0, 2]);
+        let file = UsdcFile::parse(&bytes).expect("parse synthetic file");
+        let err = file
+            .decode_specs(&bytes)
+            .expect_err("out-of-range path index must fail");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("path index 2 out of range"), "{msg}");
+        assert!(msg.contains("2-path"), "{msg}");
+    }
+
+    #[test]
+    fn decode_specs_rejects_missing_paths_section() {
+        // Without a PATHS section there is no numPaths to bound spec
+        // path indices against; the join refuses up front.
+        let fields = build_fields_payload(&[0], &[0]);
+        let fieldsets = build_fieldsets_payload(&[0, -1]);
+        let specs = build_specs_payload(&[0], &[0], &[1]);
+        let bytes = synthetic_usdc(
+            Version::V0_8_0,
+            &[
+                (b"FIELDS", &fields),
+                (b"FIELDSETS", &fieldsets),
+                (b"SPECS", &specs),
+            ],
+        );
+        let file = UsdcFile::parse(&bytes).expect("parse synthetic file");
+        let err = file
+            .decode_specs(&bytes)
+            .expect_err("absent PATHS must fail");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("PATHS section absent"), "{msg}");
     }
 
     // ----- §4.2 STRINGS → TOKENS pool resolution (`decode_strings`) -----
