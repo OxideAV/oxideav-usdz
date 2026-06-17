@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- usdc §3b: `decode_int_array` now rejects an int-coded buffer that
+  leaves payload bytes unconsumed after the last element. The trace
+  doc §3b records every buffer as consuming its variable-width payload
+  exactly ("zero leftover bytes"); trailing slack signals a mis-framed
+  or corrupt buffer (e.g. a `compressedSize` that over-reads into the
+  next section, or a control stream that under-counts wide codes) and
+  now fails with a clear `InvalidData` instead of silently dropping
+  the extra bytes. All eight real Elephant-fixture buffers continue to
+  decode (they consume their payload exactly, as documented).
 - usdc §5: bounds-check each spec row's `pathIndex` against the §4.5
   PATHS `numPaths` in `decode_specs` — a corrupt §4.6 path-index column
   referencing a non-existent namespace path now fails with a clear

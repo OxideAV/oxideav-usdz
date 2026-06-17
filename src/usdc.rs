@@ -1311,6 +1311,12 @@ pub fn split_tokens_blob(blob: &[u8], header: &TokensHeader) -> Result<Vec<Strin
 ///   preamble plus the `ceil(count/4)`-byte control stream, or if
 ///   the payload runs short for the widths the control stream
 ///   declared.
+/// * `Error::InvalidData` if any payload bytes remain unconsumed
+///   after the last element — the trace doc §3b records every
+///   buffer as consuming its payload exactly ("zero leftover
+///   bytes"), so trailing slack signals a mis-framed or corrupt
+///   buffer (control stream and payload disagreeing on the array's
+///   byte length).
 pub fn decode_int_array(buf: &[u8], count: usize) -> Result<Vec<i32>> {
     if count == 0 {
         return Ok(Vec::new());
@@ -1376,6 +1382,20 @@ pub fn decode_int_array(buf: &[u8], count: usize) -> Result<Vec<i32>> {
         };
         out.push(value);
         prev = value;
+    }
+    // Trace doc §3b: every int-coded buffer consumes its variable-width
+    // payload **exactly** — all eight Elephant buffers decode with "zero
+    // leftover payload bytes". Trailing payload after the last element's
+    // width has been read means the control stream and the payload
+    // disagree about how many bytes the array should occupy: a mis-framed
+    // or corrupt buffer (e.g. a `compressedSize` that over-reads into the
+    // next section, or a control byte that under-counts wide codes).
+    // Reject it rather than silently dropping the slack.
+    if !payload.is_empty() {
+        return Err(invalid(format!(
+            "USDC int-coded array: {} payload byte(s) left unconsumed after decoding all {count} element(s) — the §3b control stream and payload disagree (trace doc §3b records every buffer as consuming its payload exactly)",
+            payload.len()
+        )));
     }
     Ok(out)
 }
@@ -3424,6 +3444,29 @@ mod tests {
         let err = decode_int_array(&buf, 1).expect_err("missing int32 payload byte");
         let msg = format!("{err:?}");
         assert!(msg.contains("int32"), "{msg}");
+    }
+
+    #[test]
+    fn int_array_rejects_trailing_payload_bytes() {
+        // One element via code 1 (int8 delta, 1 payload byte), but two
+        // payload bytes follow. The control stream accounts for one
+        // byte; the second is unconsumed slack — the §3b control/payload
+        // disagreement the trace doc rules out ("zero leftover bytes").
+        let buf = with_common_delta(0, &[0x01, 0x05, 0x99]);
+        let err = decode_int_array(&buf, 1).expect_err("trailing payload byte");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("unconsumed"), "{msg}");
+    }
+
+    #[test]
+    fn int_array_rejects_trailing_padding_after_all_code0() {
+        // Four code-0 elements consume zero payload bytes; a single
+        // trailing payload byte after the one control byte is leftover
+        // slack and must be rejected.
+        let buf = with_common_delta(7, &[0x00, 0x42]);
+        let err = decode_int_array(&buf, 4).expect_err("trailing padding byte");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("unconsumed") && msg.contains('1'), "{msg}");
     }
 
     #[test]

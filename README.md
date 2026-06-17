@@ -83,7 +83,11 @@ A clean-room USDC reader is in progress. Implemented so far:
   and canonical-order predicates.
 - The §3a compressed-buffer framing with the public LZ4 block decode,
   and the §3b compressed-integer decoder including the 4-byte
-  common-delta preamble.
+  common-delta preamble. The int-coded decoder enforces the §3b
+  "zero leftover bytes" invariant: a buffer whose control stream and
+  payload disagree on the array's byte length (trailing unconsumed
+  payload after the last element) is rejected rather than silently
+  truncated.
 - End-to-end section-content decode chaining §3a → LZ4 → §3b: the TOKENS
   atom pool, the FIELDS `(nameIndex, valueRep)` pairs, the FIELDSETS flat
   index array, and the three PATHS buffers — each decoding exactly on the
