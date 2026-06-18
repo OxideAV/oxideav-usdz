@@ -92,7 +92,11 @@ A clean-room USDC reader is in progress. Implemented so far:
   atom pool, the FIELDS `(nameIndex, valueRep)` pairs, the FIELDSETS flat
   index array, and the three PATHS buffers — each decoding exactly on the
   committed Elephant fixture (192 tokens, 157 fields, 576 field-set
-  indices, 248 paths).
+  indices, 248 paths). Each FIELDS value-rep word is further split into a
+  typed `ValueRep` — the high-16-bit type-enum + flags word and the
+  low-48-bit inline-or-offset payload — the documented byte boundary read
+  off the trace's §4.3 hex excerpt (lossless: `ValueRep::raw()` rebuilds
+  the original `u64`).
 - The STRINGS → TOKENS and field-name TOKENS pool resolution and the
   full §5 SPECS → FIELDSETS → FIELDS join (`decode_specs` /
   `decode_named_specs`), which materialises all 248 Elephant spec rows
@@ -103,11 +107,14 @@ A clean-room USDC reader is in progress. Implemented so far:
 
 Not yet implemented (so USDC files do not fully decode to a scene yet):
 
-- **FIELDS value-rep type-code materialisation** — each spec field's
-  value-rep word is surfaced as a raw `u64`; decomposing the packed
-  type-enum / flag bits / inline-or-offset payload into typed values
-  needs the type-code enumeration, which is not yet staged in
-  `docs/3d/usd/`.
+- **FIELDS value-rep type-code materialisation** — each value-rep
+  word is split into its documented two-part shape (`ValueRep`: the
+  high-16-bit type-enum + flags word and the low-48-bit inline-or-offset
+  payload), exactly as the trace records the byte boundary. Decomposing
+  the `type_and_flags` word further — which concrete type-enum, which of
+  the is-array / is-inlined / is-compressed flag bits, and therefore
+  whether the payload is an inline value or a file offset — needs the
+  type-code enumeration, which is not yet staged in `docs/3d/usd/`.
 - **PATHS namespace-tree reconstruction** — the three parallel buffers
   (path-token indices, element-token indices, jump offsets) decode to
   their raw integer streams, but the jump-walk that turns them into

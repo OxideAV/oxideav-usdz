@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- usdc §4.3: `ValueRep` + `FieldsSection::decode_value_reps` split each
+  packed `uint64` FIELDS value-rep word into its documented two-part
+  shape — the high-16-bit type-enum + flags word and the low-48-bit
+  inline-or-offset payload — the byte boundary read straight off the
+  trace doc's §4.3 hex excerpt. `ValueRep::from_raw` / `ValueRep::raw`
+  are exact inverses (lossless relative to `decode_reps`). The
+  per-value type-code enumeration (which type-enum, which flag bits,
+  inline-vs-offset) stays deferred to the gap tracker's Round B
+  fact-table extraction. Cross-validated against the real Elephant
+  fixture's first eight rep words.
+
 ### Other
 
 - usdc §3b: `decode_int_array` now rejects an int-coded buffer that

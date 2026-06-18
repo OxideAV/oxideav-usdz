@@ -465,6 +465,29 @@
 //!   resolves to an empty vector without needing a TOKENS decode; an
 //!   index past the TOKENS pool is a clear `InvalidData`.
 //!
+//! Round 332 — USDC §4.3 FIELDS value-rep structural split:
+//!
+//! * [`usdc::ValueRep`] + [`usdc::FieldsSection::decode_value_reps`]
+//!   surface each packed `uint64` value-rep word in the documented
+//!   two-part shape the trace doc §4.3 grounds from the Elephant
+//!   bytes: the **high 16 bits** carry the type code + flags
+//!   (is-array / is-inlined / is-compressed) and the **low 48 bits**
+//!   carry the inline value or file offset. The byte boundary is
+//!   read straight off the §4.3 hex excerpt — every observed word
+//!   keeps its type/flags in the top 16 bits and its payload in the
+//!   low 48 (`0x400b_0000_0000_0002` → type/flags `0x400b`, payload
+//!   `0x2`; `0x4009_0000_4270_0000` → `0x4009` / `0x4270_0000`;
+//!   `0x0029_0000_000c_2510` → `0x0029` / `0xc_2510`).
+//!   [`usdc::ValueRep::from_raw`] / [`usdc::ValueRep::raw`] are exact
+//!   inverses, so no information is lost relative to
+//!   [`usdc::FieldsSection::decode_reps`]. The split deliberately
+//!   does **not** interpret which type-enum or which flag bits a
+//!   given `type_and_flags` carries, nor whether a `payload` is an
+//!   inline value or an offset — that per-value enumeration remains
+//!   the deferred fact-table extraction below. Cross-validated by
+//!   decoding the real Elephant FIELDS reps and asserting the first
+//!   eight words split onto the trace doc's documented parts.
+//!
 //! Deferred to round 283+:
 //!
 //! * **`.usdc` PATHS tree-walk semantics.** The three PATHS buffers
@@ -476,9 +499,13 @@
 //!   decode to small codes in `1..=8`; mapping them to
 //!   (prim / attribute / relationship / …) is a fact-table
 //!   extraction the trace doc doesn't yet carry.
-//! * **FIELDS value-rep type-code enumeration.** A separate
-//!   fact-table extraction (gap tracker's Round B) that the
-//!   [`usdc`] primitives don't depend on.
+//! * **FIELDS value-rep type-code enumeration.** Round 332 splits
+//!   each rep word into its `(type_and_flags, payload)` parts
+//!   ([`usdc::ValueRep`]); mapping a `type_and_flags` value onto a
+//!   concrete type-enum + the is-array / is-inlined / is-compressed
+//!   flag bits (and so deciding inline-value vs offset) is a separate
+//!   fact-table extraction (gap tracker's Round B) that the [`usdc`]
+//!   primitives don't yet carry.
 //! * `UsdSkelSkeleton` + `UsdSkelBindingAPI` skinning — UsdSkel
 //!   schema docs are not in our `docs/3d/usd/` (the spec README
 //!   notes UsdSkel sits behind a per-schema URL pattern not yet

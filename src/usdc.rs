@@ -1809,6 +1809,88 @@ impl<'a> FieldsSection<'a> {
         let blob = self.reps_buffer()?.decompress_exact(want)?;
         Ok(blob.chunks_exact(8).map(read_u64_le).collect())
     }
+
+    /// Like [`decode_reps`](Self::decode_reps), but each raw `uint64`
+    /// rep word is split into its documented two-part on-disk shape —
+    /// see [`ValueRep`]. The integer values are identical to
+    /// [`decode_reps`]; this method only surfaces the structural
+    /// `(type_and_flags, payload)` decomposition the trace doc §4.3
+    /// grounds, without interpreting the individual type codes (that
+    /// enumeration is gap-tracker Round B).
+    ///
+    /// On the Elephant fixture the first word `0x400b000000000002`
+    /// decomposes to `type_and_flags = 0x400b`, `payload = 0x2`.
+    pub fn decode_value_reps(&self) -> Result<Vec<ValueRep>> {
+        Ok(self
+            .decode_reps()?
+            .into_iter()
+            .map(ValueRep::from_raw)
+            .collect())
+    }
+}
+
+/// A §4.3 FIELDS **value representation** word, split into the two
+/// parts the trace doc grounds from the Elephant sample bytes.
+///
+/// Trace doc §4.3 records each field's value is stored as a packed
+/// little-endian `uint64` "rep" word whose **high bytes carry the
+/// type code and flags** (such as *is-array* / *is-inlined* /
+/// *is-compressed*) and whose **low bytes carry either an inline
+/// value or a file offset to the value's bytes**. The worked hex
+/// excerpt makes the byte boundary explicit: every observed rep word
+/// keeps its type/flags in the top 16 bits and its payload in the
+/// low 48 bits — e.g. `0x400b_0000_0000_0002` (type/flags `0x400b`,
+/// payload `0x2`), `0x4009_0000_4270_0000` (type/flags `0x4009`,
+/// payload `0x4270_0000`), `0x0029_0000_000c_2510` (type/flags
+/// `0x0029`, payload `0xc_2510`).
+///
+/// This type performs **only** that documented structural split. It
+/// deliberately does **not** decode the meaning of an individual
+/// `type_and_flags` value (which type-enum, which flag bits), nor
+/// whether a given `payload` is an inline value or a file offset —
+/// both require the type-code enumeration the trace doc defers to a
+/// separate fact-table extraction (GAP-TRACKER Round B). Until that
+/// is staged, a consumer gets the raw two-part word and the original
+/// `u64` back via [`ValueRep::raw`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValueRep {
+    /// The high 16 bits of the rep word — the packed type-enum plus
+    /// the flag bits (is-array / is-inlined / is-compressed, per the
+    /// trace doc). Surfaced uninterpreted: the per-value enumeration
+    /// of these bits is GAP-TRACKER Round B material.
+    pub type_and_flags: u16,
+    /// The low 48 bits of the rep word — either an inline value or a
+    /// file offset to the value's bytes, depending on the (currently
+    /// uninterpreted) flag bits in `type_and_flags`. Always fits in a
+    /// `u64`; the top 16 bits are guaranteed zero.
+    pub payload: u64,
+}
+
+impl ValueRep {
+    /// Mask selecting the low-48-bit payload field of a rep word.
+    const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+    /// Bit width of the payload field (the type/flags word starts at
+    /// this shift).
+    const TYPE_SHIFT: u32 = 48;
+
+    /// Split a raw little-endian rep `u64` into its documented
+    /// `(type_and_flags, payload)` parts. Total information is
+    /// preserved — [`ValueRep::raw`] reconstructs the original word
+    /// exactly.
+    #[inline]
+    pub fn from_raw(rep: u64) -> Self {
+        Self {
+            type_and_flags: (rep >> Self::TYPE_SHIFT) as u16,
+            payload: rep & Self::PAYLOAD_MASK,
+        }
+    }
+
+    /// Reassemble the original packed `uint64` rep word from its two
+    /// parts. Exact inverse of [`ValueRep::from_raw`].
+    #[inline]
+    pub fn raw(self) -> u64 {
+        ((self.type_and_flags as u64) << Self::TYPE_SHIFT) | self.payload
+    }
 }
 
 /// Helper used by [`FieldsSection::parse`] to read one
@@ -4256,6 +4338,98 @@ mod tests {
             !rb.chunks.is_empty(),
             "every §3a buffer has at least one chunk"
         );
+    }
+
+    // === §4.3 FIELDS value-rep structural split (ValueRep) ===
+
+    #[test]
+    fn value_rep_splits_trace_doc_hex_excerpt() {
+        // Trace doc §4.3 worked example: the high 16 bits carry
+        // type + flags, the low 48 bits carry the inline value or
+        // offset. Each entry is (raw, expected type_and_flags,
+        // expected payload).
+        let cases: &[(u64, u16, u64)] = &[
+            (0x400b_0000_0000_0002, 0x400b, 0x0000_0000_0002),
+            (0x0009_0000_0000_0058, 0x0009, 0x0000_0000_0058),
+            (0x4009_0000_4270_0000, 0x4009, 0x0000_4270_0000),
+            (0x0009_0000_0000_0060, 0x0009, 0x0000_0000_0060),
+            (0x4009_0000_0000_0000, 0x4009, 0x0000_0000_0000),
+            (0x400b_0000_0000_0009, 0x400b, 0x0000_0000_0009),
+            (0x0029_0000_000c_2510, 0x0029, 0x0000_000c_2510),
+        ];
+        for &(raw, tf, payload) in cases {
+            let rep = ValueRep::from_raw(raw);
+            assert_eq!(rep.type_and_flags, tf, "type/flags of {raw:#018x}");
+            assert_eq!(rep.payload, payload, "payload of {raw:#018x}");
+            // The payload field never sets any of the top 16 bits.
+            assert_eq!(
+                rep.payload >> 48,
+                0,
+                "payload of {raw:#018x} fits in 48 bits"
+            );
+        }
+    }
+
+    #[test]
+    fn value_rep_round_trips_raw_word() {
+        // from_raw / raw are exact inverses for arbitrary words,
+        // including ones with bits set across the whole range.
+        for raw in [
+            0u64,
+            0xffff_ffff_ffff_ffff,
+            0x400b_0000_0000_0002,
+            0x0029_0000_000c_2510,
+            0x1234_5678_9abc_def0,
+        ] {
+            assert_eq!(ValueRep::from_raw(raw).raw(), raw, "round-trip {raw:#018x}");
+        }
+    }
+
+    #[test]
+    fn real_fixture_fields_decode_value_reps_splits_first_words() {
+        // Trace doc §4.3 / §5: decode the real Elephant FIELDS reps
+        // buffer end-to-end, then split each word into its documented
+        // (type_and_flags, payload) shape. Cross-validates that the
+        // structural split lands on the §4.3 hex excerpt.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/3d/usd/fixtures/SoC-ElephantWithMonochord.usdc");
+        if !fixture.exists() {
+            eprintln!("skip: fixture {fixture:?} not present");
+            return;
+        }
+        let bytes = std::fs::read(&fixture).expect("read fixture");
+        let file = UsdcFile::parse(&bytes).expect("parse Elephant USDC");
+        let section = file
+            .section_bytes(SectionName::Fields, &bytes)
+            .expect("FIELDS section present");
+        let sec = FieldsSection::parse(section).expect("parse FIELDS section");
+
+        let raw = sec.decode_reps().expect("FIELDS reps decode");
+        let split = sec.decode_value_reps().expect("FIELDS value-reps decode");
+        assert_eq!(split.len(), 157, "one ValueRep per field");
+        assert_eq!(split.len(), raw.len());
+
+        // Every ValueRep must reconstruct its raw word exactly.
+        for (vr, &r) in split.iter().zip(raw.iter()) {
+            assert_eq!(vr.raw(), r, "ValueRep reconstructs raw rep word");
+        }
+
+        // The first eight words match the trace doc §4.3 excerpt's
+        // documented split.
+        let expected: &[(u16, u64)] = &[
+            (0x400b, 0x0000_0000_0002),
+            (0x0009, 0x0000_0000_0058),
+            (0x4009, 0x0000_4270_0000),
+            (0x0009, 0x0000_0000_0060),
+            (0x4009, 0x0000_0000_0000),
+            (0x4009, 0x0000_4270_0000),
+            (0x400b, 0x0000_0000_0009),
+            (0x0029, 0x0000_000c_2510),
+        ];
+        for (i, &(tf, payload)) in expected.iter().enumerate() {
+            assert_eq!(split[i].type_and_flags, tf, "row {i} type/flags");
+            assert_eq!(split[i].payload, payload, "row {i} payload");
+        }
     }
 
     // === §4.4 FIELDSETS section tests ===
