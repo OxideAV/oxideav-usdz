@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- usdc §4.3: **value-region resolution** — `UsdcFile::value_region`
+  turns a `ValueRep` into a `ValueRegion`: `Inline(payload)` for inline
+  scalars, `ScalarOffset` for offset scalars, `Array { count, elements }`
+  for uncompressed arrays (parses the leading `u64` count and borrows
+  the raw element bytes — element *width* stays type-code dependent), and
+  `CompressedArray { count, region_offset }` for compressed arrays
+  (count + offset; full decode needs the deferred type-code width).
+  Array offsets and count headers are bounds-checked against the value
+  region `[0x58, toc_offset)`. Grounded by a synthetic round-trip plus a
+  fixture test that resolves every Elephant FIELDS rep.
 - usdc §4.3: observer-grounded **ValueRep flag decomposition**. The
   rep word's top byte (bits 5/6/7) is now decoded into
   `ValueRep::is_array` (bit 63), `is_inline` (bit 62) and

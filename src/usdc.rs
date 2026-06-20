@@ -3224,6 +3224,114 @@ impl UsdcFile {
         }
         Ok(out)
     }
+
+    /// Resolve a §4.3 [`ValueRep`] into its on-disk **value region**,
+    /// per the layout observed in the Elephant fixture's value bytes.
+    ///
+    /// The three flag classes (see [`ValueRep`]) resolve as:
+    ///
+    /// * **inline** ([`ValueRep::is_inline`]) → the value lives in the
+    ///   rep word itself; this returns [`ValueRegion::Inline`] carrying
+    ///   the 48-bit payload. The caller bit-casts it per the (deferred)
+    ///   type code — e.g. `0x4009`'s payload `0x42700000` is a `float`
+    ///   of `60.0`.
+    /// * **uncompressed array** ([`ValueRep::is_array`] without
+    ///   [`ValueRep::is_compressed`]) → `payload` is a file offset to a
+    ///   `[u64 count][count × raw elements]` blob. This returns
+    ///   [`ValueRegion::Array`] with the parsed `count` and a borrow of
+    ///   the raw element bytes (element *width* is type-code dependent,
+    ///   so the bytes are surfaced unsliced).
+    /// * **compressed array** ([`ValueRep::is_compressed`]) → the
+    ///   element region is itself a §3a/§3b compressed buffer whose
+    ///   element width is type-code dependent; fully materialising it
+    ///   needs the deferred type-code enumeration (GAP-TRACKER Round
+    ///   B), so this returns [`ValueRegion::CompressedArray`] with the
+    ///   declared `count` and the file offset of the compressed region,
+    ///   rather than guessing a width.
+    /// * **non-inline scalar** (neither flag) → `payload` is a file
+    ///   offset to the scalar's raw bytes, of a type-code-dependent
+    ///   length; returns [`ValueRegion::ScalarOffset`] with that
+    ///   offset.
+    ///
+    /// Errors with [`Error::InvalidData`](crate::Error) if an array's
+    /// offset, count header, or element region falls outside the file's
+    /// value region (`0x58 ..= toc_offset`).
+    pub fn value_region<'a>(&self, rep: ValueRep, file_bytes: &'a [u8]) -> Result<ValueRegion<'a>> {
+        if rep.is_inline() {
+            return Ok(ValueRegion::Inline(rep.payload));
+        }
+        let off = usize::try_from(rep.payload).map_err(|_| {
+            invalid(format!(
+                "USDC §4.3 value offset {} does not fit in usize",
+                rep.payload
+            ))
+        })?;
+        // Every non-inline value lives in the value region between the
+        // 88-byte bootstrap and the tail TOC.
+        let toc = usize::try_from(self.bootstrap.toc_offset).unwrap_or(usize::MAX);
+        let region_end = toc.min(file_bytes.len());
+        if off < BOOTSTRAP_SIZE || off >= region_end {
+            return Err(invalid(format!(
+                "USDC §4.3 value offset {off:#x} outside the value region [{BOOTSTRAP_SIZE:#x}, {region_end:#x})",
+            )));
+        }
+        if !rep.is_array() {
+            return Ok(ValueRegion::ScalarOffset(off));
+        }
+        // Array: [u64 count][...].
+        if off + 8 > region_end {
+            return Err(invalid(format!(
+                "USDC §4.3 array at {off:#x}: u64 count header runs past value region end {region_end:#x}",
+            )));
+        }
+        let count = read_u64_le(&file_bytes[off..off + 8]);
+        if rep.is_compressed() {
+            return Ok(ValueRegion::CompressedArray {
+                count,
+                region_offset: off + 8,
+            });
+        }
+        // Uncompressed array element bytes run from `off + 8` to the
+        // end of the value region; the slice is the *available* element
+        // bytes — the element width that turns `count` into a precise
+        // byte length is type-code dependent (GAP-TRACKER Round B), so
+        // we surface the bytes rather than slicing to `count × width`.
+        let elements = &file_bytes[off + 8..region_end];
+        Ok(ValueRegion::Array { count, elements })
+    }
+}
+
+/// The resolved on-disk form of a §4.3 [`ValueRep`], produced by
+/// [`UsdcFile::value_region`]. The variants mirror the rep's flag
+/// classes; see that method for the full mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueRegion<'a> {
+    /// An inline value — the (up-to-48-bit) payload carried in the rep
+    /// word itself. The caller bit-casts it per the deferred type code.
+    Inline(u64),
+    /// A non-inline scalar stored at this absolute file offset. Its
+    /// byte length is type-code dependent (GAP-TRACKER Round B).
+    ScalarOffset(usize),
+    /// An uncompressed array: a parsed element `count` plus a borrow of
+    /// the raw element bytes (from the byte after the `u64` count
+    /// header to the end of the value region). The element width that
+    /// turns `count` into an exact byte length is type-code dependent.
+    Array {
+        /// Element count, read from the array's leading `u64`.
+        count: u64,
+        /// Raw element bytes following the count header.
+        elements: &'a [u8],
+    },
+    /// A compressed array: the declared element `count` plus the file
+    /// offset at which the §3a/§3b compressed element region begins.
+    /// Decompressing it to typed elements needs the deferred type-code
+    /// width, so the offset is surfaced rather than the bytes.
+    CompressedArray {
+        /// Declared element count, read from the array's leading `u64`.
+        count: u64,
+        /// Absolute file offset of the compressed element region.
+        region_offset: usize,
+    },
 }
 
 #[cfg(test)]
@@ -4661,6 +4769,118 @@ mod tests {
         assert!(saw_array, "fixture has array reps");
         assert!(saw_inline, "fixture has inline reps");
         assert!(saw_compressed, "fixture has compressed-array reps");
+    }
+
+    #[test]
+    fn value_region_resolves_each_flag_class() {
+        // Synthetic file: bootstrap (88 zero-ish bytes) + a value
+        // region + a tail TOC offset. We only exercise value_region, so
+        // the TOC bytes themselves don't need to be valid.
+        let mut f = vec![0u8; BOOTSTRAP_SIZE];
+        // value region begins at 0x58.
+        let arr_off = f.len(); // 88
+        f.extend_from_slice(&3u64.to_le_bytes()); // count = 3
+        f.extend_from_slice(&[0xaa; 12]); // 3 × 4-byte elements (raw)
+        let carr_off = f.len();
+        f.extend_from_slice(&7u64.to_le_bytes()); // compressed count = 7
+        f.extend_from_slice(&[0x00, 0x11, 0x22]); // (opaque compressed region)
+        let scalar_off = f.len();
+        f.extend_from_slice(&[0x42, 0x43, 0x44, 0x45]);
+        let toc_off = f.len() as u64;
+        f.extend_from_slice(&[0xff; 8]); // junk TOC
+
+        // Hand-build a UsdcFile via the parser path: write a real
+        // bootstrap so UsdcFile::parse accepts it.
+        f[0..8].copy_from_slice(b"PXR-USDC");
+        f[8..16].copy_from_slice(&[0, 8, 0, 0, 0, 0, 0, 0]); // v0.8.0
+        f[16..24].copy_from_slice(&toc_off.to_le_bytes());
+        // TOC at toc_off must parse: int64 sectionCount = 0.
+        f[scalar_off + 4..scalar_off + 4 + 8].copy_from_slice(&0u64.to_le_bytes());
+        // Re-derive offsets after we overwrote some bytes — they were
+        // all in the value region, untouched except the TOC's count.
+        let file = UsdcFile::parse(&f).expect("parse synthetic USDC");
+
+        // Inline rep: payload returned verbatim.
+        let inline = ValueRep::from_raw(0x4009_0000_4270_0000);
+        assert_eq!(
+            file.value_region(inline, &f).unwrap(),
+            ValueRegion::Inline(0x4270_0000)
+        );
+
+        // Uncompressed array: count parsed, elements borrowed.
+        let arr = ValueRep::from_raw((ValueRep::FLAG_ARRAY as u64) << 48 | arr_off as u64);
+        match file.value_region(arr, &f).unwrap() {
+            ValueRegion::Array { count, elements } => {
+                assert_eq!(count, 3);
+                assert_eq!(&elements[..3], &[0xaa, 0xaa, 0xaa]);
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+
+        // Compressed array: count + region offset, no byte guess.
+        let carr = ValueRep::from_raw(
+            ((ValueRep::FLAG_ARRAY | ValueRep::FLAG_COMPRESSED) as u64) << 48 | carr_off as u64,
+        );
+        match file.value_region(carr, &f).unwrap() {
+            ValueRegion::CompressedArray {
+                count,
+                region_offset,
+            } => {
+                assert_eq!(count, 7);
+                assert_eq!(region_offset, carr_off + 8);
+            }
+            other => panic!("expected CompressedArray, got {other:?}"),
+        }
+
+        // Non-inline scalar: just the offset.
+        let scalar = ValueRep::from_raw(scalar_off as u64); // flag byte 0
+        assert_eq!(
+            file.value_region(scalar, &f).unwrap(),
+            ValueRegion::ScalarOffset(scalar_off)
+        );
+
+        // Out-of-region offset is rejected.
+        let bad = ValueRep::from_raw((ValueRep::FLAG_ARRAY as u64) << 48 | (toc_off + 100));
+        assert!(file.value_region(bad, &f).is_err());
+    }
+
+    #[test]
+    fn real_fixture_value_region_reads_uncompressed_arrays() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/3d/usd/fixtures/SoC-ElephantWithMonochord.usdc");
+        if !fixture.exists() {
+            eprintln!("skip: fixture {fixture:?} not present");
+            return;
+        }
+        let bytes = std::fs::read(&fixture).expect("read fixture");
+        let file = UsdcFile::parse(&bytes).expect("parse Elephant USDC");
+        let section = file
+            .section_bytes(SectionName::Fields, &bytes)
+            .expect("FIELDS section present");
+        let sec = FieldsSection::parse(section).expect("parse FIELDS section");
+        let reps = sec.decode_value_reps().expect("value-reps decode");
+
+        let mut uncompressed = 0usize;
+        let mut compressed = 0usize;
+        for r in &reps {
+            match file.value_region(*r, &bytes).expect("resolve value region") {
+                ValueRegion::Array { count, elements } => {
+                    uncompressed += 1;
+                    // Count is always positive for the fixture's arrays
+                    // and the element bytes are available.
+                    assert!(count >= 1, "array count {count}");
+                    assert!(!elements.is_empty());
+                }
+                ValueRegion::CompressedArray { count, .. } => {
+                    compressed += 1;
+                    assert!(count >= 1, "compressed array count {count}");
+                }
+                ValueRegion::Inline(_) | ValueRegion::ScalarOffset(_) => {}
+            }
+        }
+        // The fixture has both uncompressed and compressed arrays.
+        assert!(uncompressed > 0, "uncompressed arrays resolved");
+        assert!(compressed > 0, "compressed arrays resolved");
     }
 
     #[test]
