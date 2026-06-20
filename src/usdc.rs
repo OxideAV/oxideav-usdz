@@ -3334,6 +3334,80 @@ pub enum ValueRegion<'a> {
     },
 }
 
+impl ValueRegion<'_> {
+    /// Reinterpret an [`Inline`](ValueRegion::Inline) payload as a
+    /// little-endian `f32` (the low 32 bits bit-cast). `None` for any
+    /// non-inline variant.
+    ///
+    /// The caller decides this is a `float` per the (deferred) type
+    /// code — e.g. the Elephant's `0x4009` inline reps are `float`s
+    /// whose payload `0x42700000` is `60.0`. This method performs only
+    /// the bit-cast; it does not assert the type.
+    #[inline]
+    pub fn as_f32(&self) -> Option<f32> {
+        match self {
+            ValueRegion::Inline(p) => Some(f32::from_bits(*p as u32)),
+            _ => None,
+        }
+    }
+
+    /// Reinterpret an [`Inline`](ValueRegion::Inline) payload's low 32
+    /// bits as a little-endian `i32`. `None` for non-inline variants.
+    #[inline]
+    pub fn as_i32(&self) -> Option<i32> {
+        match self {
+            ValueRegion::Inline(p) => Some(*p as i32),
+            _ => None,
+        }
+    }
+
+    /// Reinterpret an [`Inline`](ValueRegion::Inline) payload's low 32
+    /// bits as a little-endian `u32`. `None` for non-inline variants.
+    #[inline]
+    pub fn as_u32(&self) -> Option<u32> {
+        match self {
+            ValueRegion::Inline(p) => Some(*p as u32),
+            _ => None,
+        }
+    }
+
+    /// Reinterpret an [`Inline`](ValueRegion::Inline) payload as a
+    /// boolean (non-zero → `true`). `None` for non-inline variants.
+    #[inline]
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            ValueRegion::Inline(p) => Some(*p != 0),
+            _ => None,
+        }
+    }
+
+    /// For an uncompressed [`Array`](ValueRegion::Array), slice the
+    /// element bytes to exactly `count × elem_width`, returning the
+    /// trimmed element slice. `elem_width` is supplied by the caller
+    /// (it is type-code dependent — GAP-TRACKER Round B). Returns
+    /// `None` for non-`Array` variants or when `count × elem_width`
+    /// overflows or runs past the available element bytes.
+    ///
+    /// This is the bridge between the structural array reader and a
+    /// concrete element type: a caller that knows the element is a
+    /// 4-byte `float` passes `elem_width = 4` and gets a slice it can
+    /// `chunks_exact(4)` into `f32`s.
+    pub fn array_elements_exact(&self, elem_width: usize) -> Option<&[u8]> {
+        match self {
+            ValueRegion::Array { count, elements } => {
+                let count = usize::try_from(*count).ok()?;
+                let want = count.checked_mul(elem_width)?;
+                if want <= elements.len() {
+                    Some(&elements[..want])
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4842,6 +4916,72 @@ mod tests {
         // Out-of-region offset is rejected.
         let bad = ValueRep::from_raw((ValueRep::FLAG_ARRAY as u64) << 48 | (toc_off + 100));
         assert!(file.value_region(bad, &f).is_err());
+    }
+
+    #[test]
+    fn value_region_typed_accessors() {
+        let inl = ValueRegion::Inline(0x4270_0000);
+        assert_eq!(inl.as_f32(), Some(60.0));
+        assert_eq!(inl.as_u32(), Some(0x4270_0000));
+        assert_eq!(inl.as_i32(), Some(0x4270_0000));
+        assert_eq!(ValueRegion::Inline(0).as_bool(), Some(false));
+        assert_eq!(ValueRegion::Inline(1).as_bool(), Some(true));
+        // Non-inline variants yield None for scalar accessors.
+        assert_eq!(ValueRegion::ScalarOffset(0x100).as_f32(), None);
+
+        // array_elements_exact trims to count × width.
+        let bytes = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let arr = ValueRegion::Array {
+            count: 2,
+            elements: &bytes,
+        };
+        assert_eq!(arr.array_elements_exact(4), Some(&bytes[..8]));
+        // Overrun (count × width > available) → None.
+        assert_eq!(arr.array_elements_exact(7), None);
+        // Non-array → None.
+        assert_eq!(inl.array_elements_exact(4), None);
+    }
+
+    #[test]
+    fn real_fixture_inline_float_is_sixty() {
+        // The Elephant's third FIELDS rep is the inline float 60.0
+        // (framesPerSecond / timeCodesPerSecond etc.).
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/3d/usd/fixtures/SoC-ElephantWithMonochord.usdc");
+        if !fixture.exists() {
+            eprintln!("skip: fixture {fixture:?} not present");
+            return;
+        }
+        let bytes = std::fs::read(&fixture).expect("read fixture");
+        let file = UsdcFile::parse(&bytes).expect("parse Elephant USDC");
+        let section = file
+            .section_bytes(SectionName::Fields, &bytes)
+            .expect("FIELDS section present");
+        let sec = FieldsSection::parse(section).expect("parse FIELDS section");
+        let reps = sec.decode_value_reps().expect("value-reps decode");
+
+        // rep[2] = 0x4009_0000_4270_0000 — inline float 60.0.
+        let region = file.value_region(reps[2], &bytes).expect("resolve");
+        assert_eq!(region.as_f32(), Some(60.0), "rep[2] inline float");
+
+        // At least one uncompressed array decodes as 8-byte doubles
+        // (tc=0x0f) whose first element is 1.0 (0x3ff0000000000000).
+        let mut saw_double_one = false;
+        for r in &reps {
+            if r.type_code() == 0x0f && r.is_array() && !r.is_compressed() {
+                let region = file.value_region(*r, &bytes).expect("resolve");
+                if let ValueRegion::Array { count, .. } = region {
+                    if let Some(elems) = region.array_elements_exact(8) {
+                        assert_eq!(elems.len() as u64, count * 8);
+                        let first = f64::from_le_bytes(elems[0..8].try_into().unwrap());
+                        if first == 1.0 {
+                            saw_double_one = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(saw_double_one, "a 0x0f double[] array starts with 1.0");
     }
 
     #[test]

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- usdc §4.3: **typed `ValueRegion` accessors** — `as_f32` / `as_i32` /
+  `as_u32` / `as_bool` bit-cast an inline payload, and
+  `array_elements_exact(width)` trims an uncompressed array's element
+  bytes to `count × width` (the caller supplies the type-code-dependent
+  width). The Elephant fixture's inline `0x4009` rep decodes to the
+  `float` `60.0` and its `0x0f` `double[]` array reads back with `1.0`
+  as the first element — both asserted by new tests.
 - usdc §4.3: **value-region resolution** — `UsdcFile::value_region`
   turns a `ValueRep` into a `ValueRegion`: `Inline(payload)` for inline
   scalars, `ScalarOffset` for offset scalars, `Array { count, elements }`
