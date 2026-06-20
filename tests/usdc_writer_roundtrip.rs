@@ -69,6 +69,28 @@ fn elephant_value_reps_survive_unchanged() {
 }
 
 #[test]
+fn elephant_full_spec_join_survives_round_trip() {
+    // Stronger than the array-level round-trip: the re-emitted file must
+    // reproduce the entire §5 SPECS→FIELDSETS→FIELDS→TOKENS join
+    // (decode_named_specs), so every named property of every spec row is
+    // preserved, not just the raw section arrays.
+    let Some(bytes) = elephant() else { return };
+    let file = UsdcFile::parse(&bytes).expect("parse Elephant");
+    let original = file.decode_named_specs(&bytes).expect("join original");
+
+    let image = CrateImage::from_bytes(&bytes).expect("decode image");
+    let written = image.to_bytes().expect("serialise");
+    let file2 = UsdcFile::parse(&written).expect("parse output");
+    let rewritten = file2.decode_named_specs(&written).expect("join output");
+
+    assert_eq!(original.len(), 248, "trace doc §4.6 spec count");
+    assert_eq!(
+        original, rewritten,
+        "the full named-spec join is identical after a writer round-trip"
+    );
+}
+
+#[test]
 fn elephant_read_modify_write() {
     // Read-modify-write: load the real crate, append an authored field
     // to the FIELDS table, re-emit, and confirm the new field survives
