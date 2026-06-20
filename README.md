@@ -93,11 +93,24 @@ writer** (`usdc_writer::CrateImage`). Implemented so far:
   atom pool, the FIELDS `(nameIndex, valueRep)` pairs, the FIELDSETS flat
   index array, and the three PATHS buffers — each decoding exactly on the
   committed Elephant fixture (192 tokens, 157 fields, 576 field-set
-  indices, 248 paths). Each FIELDS value-rep word is further split into a
-  typed `ValueRep` — the high-16-bit type-enum + flags word and the
-  low-48-bit inline-or-offset payload — the documented byte boundary read
-  off the trace's §4.3 hex excerpt (lossless: `ValueRep::raw()` rebuilds
-  the original `u64`).
+  indices, 248 paths). Each FIELDS value-rep word is split into a typed
+  `ValueRep` — the high-16-bit type-code + flags word and the low-48-bit
+  inline-or-offset payload (lossless: `ValueRep::raw()` rebuilds the
+  original `u64`). The flag bits are **observer-grounded from the fixture
+  bytes**: `is_array` (bit 63), `is_inline` (bit 62) and `is_compressed`
+  (bit 61) — across all 157 Elephant reps the flag byte only ever takes
+  `0x00/0x40/0x80/0xa0`, array and inline are mutually exclusive, and
+  compressed only rides on array. `UsdcFile::value_region` then resolves
+  a rep to its on-disk value: an inline payload (bit-cast via
+  `as_f32`/`as_i32`/`as_u32`/`as_bool`), a `[u64 count][elements]`
+  uncompressed array (`array_elements_exact(width)` trims to
+  `count × width`), a compressed-array `(count, offset)`, or a scalar
+  offset — all bounds-checked against the value region `[0x58,
+  toc_offset)`. The fixture's inline `0x4009` rep decodes to the `float`
+  `60.0` and its `0x0f` `double[]` array reads back with `1.0` as element
+  0. Only the *naming* of the raw `type_code()` byte (which code is
+  `float`, which is `int[]`) stays deferred — that enumeration is
+  GAP-TRACKER Round B.
 - The STRINGS → TOKENS and field-name TOKENS pool resolution and the
   full §5 SPECS → FIELDSETS → FIELDS join (`decode_specs` /
   `decode_named_specs`), which materialises all 248 Elephant spec rows
@@ -122,14 +135,16 @@ writer** (`usdc_writer::CrateImage`). Implemented so far:
 
 Not yet implemented (so USDC files do not fully decode to a scene yet):
 
-- **FIELDS value-rep type-code materialisation** — each value-rep
-  word is split into its documented two-part shape (`ValueRep`: the
-  high-16-bit type-enum + flags word and the low-48-bit inline-or-offset
-  payload), exactly as the trace records the byte boundary. Decomposing
-  the `type_and_flags` word further — which concrete type-enum, which of
-  the is-array / is-inlined / is-compressed flag bits, and therefore
-  whether the payload is an inline value or a file offset — needs the
-  type-code enumeration, which is not yet staged in `docs/3d/usd/`.
+- **FIELDS value-rep type-code naming** — the value-rep word's flag
+  bits (array / inline / compressed) and its on-disk value region (inline
+  payload, uncompressed/compressed array, scalar offset) are now decoded,
+  so a caller that knows an element is a 4-byte `float` can read it. What
+  remains is the **mapping from the raw `type_code()` byte to a named USD
+  value type** (`0x09` → `float`, `0x0f` → `double`, `0x29` → `int[]`,
+  …). That enumeration lives in `crateFile.h` (off-limits source) and is
+  not yet staged in `docs/3d/usd/` — GAP-TRACKER Round B. Without it the
+  reader cannot auto-select element widths or build a typed scene from a
+  `.usdc` value section.
 - **PATHS namespace-tree reconstruction** — the three parallel buffers
   (path-token indices, element-token indices, jump offsets) decode to
   their raw integer streams, but the jump-walk that turns them into
