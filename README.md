@@ -72,9 +72,10 @@ resolved in the documented strength order. The writer flattens the
 composed tree into a single output layer rather than preserving the
 multi-file or class-hierarchy authoring.
 
-## USDC (binary crate file) — partial reader
+## USDC (binary crate file) — partial reader + structural writer
 
-A clean-room USDC reader is in progress. Implemented so far:
+A clean-room USDC reader is in progress, with a matching **structural
+writer** (`usdc_writer::CrateImage`). Implemented so far:
 
 - The §1 version-compatibility dispatch gate (`usdc::Version` with a
   reader-max ceiling; files newer than the ceiling are refused up front).
@@ -104,6 +105,20 @@ A clean-room USDC reader is in progress. Implemented so far:
   is bounds-checked against the §4.5 PATHS `numPaths`, so a corrupt
   path-index column referencing a non-existent namespace path is rejected
   rather than producing a dangling `SdfPath` reference.
+- **Structural writer** — `usdc_writer::CrateImage` is the inverse of
+  the reader at the documented structural layer. `from_bytes` /
+  `from_file` decode a `.usdc` into a content image (the six sections'
+  decoded arrays); `to_bytes` re-emits the bootstrap, the six section
+  payloads in canonical order, and the tail TOC, using the §3a
+  single-chunk LZ4 framing and §3b integer coding. The committed
+  Elephant fixture round-trips structurally (all 192 tokens / 157
+  fields / 576 field-set indices / 248 paths / 248 specs reproduced),
+  and supports **read-modify-write**: load, intern tokens / `add_field`
+  authored properties, and re-emit a valid file. The §4.3 value-rep
+  words ride through opaque (the type-code enumeration is not staged),
+  so authored values are preserved losslessly rather than interpreted.
+  The public §3a/§3b encoders (`encode_compressed_buffer`,
+  `encode_int_coded`) are the byte-exact inverses of the read path.
 
 Not yet implemented (so USDC files do not fully decode to a scene yet):
 
