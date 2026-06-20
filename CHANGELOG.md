@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   opaque (the type-code enumeration is not staged — GAP-TRACKER Round
   B). Synthetic and empty images round-trip too; cross-array length
   mismatches are rejected before any bytes are produced.
+- usdc writer authoring surface: `CrateImage::from_bytes` (parse +
+  decode in one call), `intern_token` (single-interning per trace doc
+  §4.1), `add_field` (intern name + append `(name, valueRep)`), and
+  `field_name` (resolve a field's name back through the token pool).
+  These enable **read-modify-write**: the committed Elephant fixture
+  loads, gains an authored field, and re-emits to a valid file where
+  the new field survives alongside the original 157 untouched.
 - usdc §3a/§3b: production `encode_compressed_buffer` (single-chunk
   LZ4 framing) and `encode_int_coded` (the inverse of
   `decode_int_array`, including the 4-byte common-delta preamble) are

@@ -69,6 +69,39 @@ fn elephant_value_reps_survive_unchanged() {
 }
 
 #[test]
+fn elephant_read_modify_write() {
+    // Read-modify-write: load the real crate, append an authored field
+    // to the FIELDS table, re-emit, and confirm the new field survives
+    // alongside the original 157.
+    let Some(bytes) = elephant() else { return };
+    let mut image = CrateImage::from_bytes(&bytes).expect("decode Elephant");
+    let original_fields = image.fields.len();
+    let original_tokens = image.tokens.len();
+
+    let idx = image.add_field("oxideavAuthoredField", 0x4009_0000_0000_0007);
+    assert_eq!(idx as usize, original_fields);
+    assert_eq!(
+        image.tokens.len(),
+        original_tokens + 1,
+        "new token interned"
+    );
+
+    let written = image.to_bytes().expect("serialise modified image");
+    let back = CrateImage::from_bytes(&written).expect("re-decode modified");
+    assert_eq!(back.fields.len(), original_fields + 1);
+    assert_eq!(
+        back.field_name(original_fields),
+        Some("oxideavAuthoredField")
+    );
+    assert_eq!(back.fields[original_fields].1, 0x4009_0000_0000_0007);
+    // The original fields are untouched.
+    assert_eq!(
+        &back.fields[..original_fields],
+        &image.fields[..original_fields]
+    );
+}
+
+#[test]
 fn synthetic_image_round_trips() {
     // A small hand-built image exercising every section, including a
     // populated STRINGS list (the Elephant's is empty) and a FIELDSETS

@@ -86,6 +86,19 @@ pub struct CrateImage {
 }
 
 impl CrateImage {
+    /// Parse a `.usdc` byte buffer and decode its six standard sections
+    /// into a [`CrateImage`] in one call — [`UsdcFile::parse`] followed
+    /// by [`CrateImage::from_file`].
+    ///
+    /// This is the entry point for the **read-modify-write** workflow:
+    /// load a real crate, mutate the resulting image (rename a token,
+    /// add a field, rewrite a value-rep word), then [`Self::to_bytes`]
+    /// it back to a valid file the reader accepts.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let file = UsdcFile::parse(bytes)?;
+        Self::from_file(&file, bytes)
+    }
+
     /// Decode the six standard sections of an already-parsed file into
     /// a [`CrateImage`]. `file` and `file_bytes` must be the
     /// `UsdcFile` / byte buffer pair from [`UsdcFile::parse`].
@@ -345,6 +358,41 @@ impl CrateImage {
             .map(|(_, r)| ValueRep::from_raw(*r))
             .collect()
     }
+
+    // ----- authoring helpers (read-modify-write surface) -----
+
+    /// Return the index of `token` in the §4.1 pool, interning it (and
+    /// appending it to [`Self::tokens`]) if it is not already present.
+    ///
+    /// The trace doc §4.1 records that "every other section refers to a
+    /// token by its index into this pool" and that each string is
+    /// stored once; this helper preserves that single-interning
+    /// invariant for authored edits.
+    pub fn intern_token(&mut self, token: &str) -> i32 {
+        if let Some(pos) = self.tokens.iter().position(|t| t == token) {
+            return pos as i32;
+        }
+        self.tokens.push(token.to_owned());
+        (self.tokens.len() - 1) as i32
+    }
+
+    /// Append a `(name, valueRep)` field to the §4.3 FIELDS table,
+    /// interning `name` into the token pool first, and return the new
+    /// field's index. The `value_rep` word is stored verbatim (opaque).
+    pub fn add_field(&mut self, name: &str, value_rep: u64) -> i32 {
+        let name_idx = self.intern_token(name);
+        self.fields.push((name_idx, value_rep));
+        (self.fields.len() - 1) as i32
+    }
+
+    /// Resolve a §4.3 FIELDS entry's name token index back to its
+    /// string via the §4.1 pool, or `None` if the field index or its
+    /// token index is out of range.
+    pub fn field_name(&self, field_index: usize) -> Option<&str> {
+        let (name_idx, _) = self.fields.get(field_index)?;
+        let ti = usize::try_from(*name_idx).ok()?;
+        self.tokens.get(ti).map(String::as_str)
+    }
 }
 
 /// Fetch one standard section's payload bytes or fail with a writer-
@@ -392,6 +440,45 @@ mod tests {
         assert_eq!(reps[1].payload, 0x58);
         // Lossless: rebuilding the raw word matches the input.
         assert_eq!(reps[0].raw(), 0x400b_0000_0000_0002);
+    }
+
+    #[test]
+    fn intern_token_dedups_and_appends() {
+        let mut image = CrateImage {
+            tokens: vec!["a".into(), "b".into()],
+            ..Default::default()
+        };
+        // Existing token → existing index, no append.
+        assert_eq!(image.intern_token("b"), 1);
+        assert_eq!(image.tokens.len(), 2);
+        // New token → appended at the end.
+        assert_eq!(image.intern_token("c"), 2);
+        assert_eq!(image.tokens, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn add_field_interns_name_and_resolves_back() {
+        let mut image = CrateImage::default();
+        let idx = image.add_field("upAxis", 0x4009_0000_0000_0003);
+        assert_eq!(idx, 0);
+        assert_eq!(image.field_name(0), Some("upAxis"));
+        assert_eq!(image.fields[0].1, 0x4009_0000_0000_0003);
+        // A second field reusing the same name doesn't duplicate the
+        // token.
+        image.add_field("upAxis", 0x1);
+        assert_eq!(image.tokens.len(), 1);
+    }
+
+    #[test]
+    fn authored_field_round_trips_through_bytes() {
+        // Author a field from scratch, serialise, and confirm the name
+        // and value-rep survive a reader round-trip.
+        let mut image = CrateImage::default();
+        image.add_field("metersPerUnit", 0x4009_0000_4270_0000);
+        let bytes = image.to_bytes().expect("serialise authored image");
+        let back = CrateImage::from_bytes(&bytes).expect("re-decode");
+        assert_eq!(back.field_name(0), Some("metersPerUnit"));
+        assert_eq!(back.fields[0].1, 0x4009_0000_4270_0000);
     }
 
     #[test]
