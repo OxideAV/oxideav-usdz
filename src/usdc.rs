@@ -1017,6 +1017,92 @@ pub fn int_coded_max_len(count: usize) -> usize {
         .saturating_add(INT_CODED_TRAILING_SLACK)
 }
 
+/// Encode `raw` as a §3a "compressed buffer" in the single-chunk form
+/// the trace doc records as the common case.
+///
+/// Trace doc §3a: a compressed buffer is one leading byte = the number
+/// of **extra** chunks (`total − 1`), then the chunk data. The leading
+/// `0x00` form — "a single LZ4 block follows immediately" — is the one
+/// both real samples use for every compressed buffer, so this writer
+/// always emits it: a `0x00` byte followed by one LZ4 *block*.
+///
+/// The LZ4 block layer is delegated to `compcol` (the workspace-wide
+/// compression collection), the exact inverse of the
+/// [`CompressedBuffer::decompress`] read path. The output round-trips:
+/// feeding it to [`CompressedBuffer::parse`] then
+/// [`CompressedBuffer::decompress`] / [`CompressedBuffer::decompress_exact`]
+/// recovers `raw` byte-for-byte.
+pub fn encode_compressed_buffer(raw: &[u8]) -> Vec<u8> {
+    let mut block = Vec::new();
+    compcol::lz4::block::encode_block(raw, &mut block);
+    let mut out = Vec::with_capacity(1 + block.len());
+    out.push(0x00); // single-chunk form: zero *extra* chunks
+    out.extend_from_slice(&block);
+    out
+}
+
+/// Encode `values` as a §3b "compressed integer" stream — the exact
+/// inverse of [`decode_int_array`].
+///
+/// The stream is the 4-byte common-delta preamble, then a 2-bit
+/// per-element control stream (LSB-first), then the variable-width
+/// payload, per trace doc §3b. The encoder picks the most frequent
+/// element-to-element delta as the common delta (so the maximum number
+/// of elements take the zero-payload code `0`), then chooses the
+/// narrowest width that represents each remaining element: an `int8`
+/// or `int16` *delta* from the previous value, or — when neither
+/// fits — an absolute `int32` (code `3`, which the trace doc records
+/// as an absolute value, not a delta).
+///
+/// Round-trips with [`decode_int_array`]: `decode_int_array(&encode_int_coded(v), v.len())`
+/// returns `v` for any `&[i32]`. An empty slice encodes to the empty
+/// buffer (matching `decode_int_array`'s `count == 0` early return).
+pub fn encode_int_coded(values: &[i32]) -> Vec<u8> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+    // Pick the most frequent element-to-element delta as the common
+    // delta so the maximum number of elements take the zero-payload
+    // code `0`. Ties break toward the larger delta for determinism.
+    let mut prev: i32 = 0;
+    let mut histogram: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+    for &v in values {
+        *histogram.entry(v.wrapping_sub(prev)).or_insert(0) += 1;
+        prev = v;
+    }
+    let common_delta = histogram
+        .iter()
+        .max_by_key(|(delta, n)| (**n, **delta))
+        .map(|(delta, _)| *delta)
+        .unwrap_or(0);
+
+    let control_bytes = values.len().div_ceil(4);
+    let mut control = vec![0u8; control_bytes];
+    let mut payload: Vec<u8> = Vec::new();
+    let mut prev: i32 = 0;
+    for (i, &v) in values.iter().enumerate() {
+        let delta = v.wrapping_sub(prev);
+        let code: u8 = if delta == common_delta {
+            0
+        } else if let Ok(d) = i8::try_from(delta) {
+            payload.push(d as u8);
+            1
+        } else if let Ok(d) = i16::try_from(delta) {
+            payload.extend_from_slice(&d.to_le_bytes());
+            2
+        } else {
+            payload.extend_from_slice(&v.to_le_bytes());
+            3
+        };
+        control[i / 4] |= code << ((i % 4) * 2);
+        prev = v;
+    }
+    let mut out = common_delta.to_le_bytes().to_vec();
+    out.extend(control);
+    out.extend(payload);
+    out
+}
+
 /// The 24-byte header at the start of the §4.1 TOKENS section.
 ///
 /// Trace doc §4.1: three little-endian `int64` counts —
@@ -1400,59 +1486,14 @@ pub fn decode_int_array(buf: &[u8], count: usize) -> Result<Vec<i32>> {
     Ok(out)
 }
 
-/// Encode `values` as a §3b "compressed integer" stream (including
-/// the 4-byte common-delta preamble). The inverse of
-/// [`decode_int_array`]; used internally by tests to synthesise
-/// round-trip fixtures from known integer sequences without first
-/// committing a corpus of real `.usdc` byte buffers.
+/// Encode `values` as a §3b "compressed integer" stream — thin alias
+/// of [`encode_int_coded`] kept for the existing in-module round-trip
+/// tests that synthesise fixtures from known integer sequences.
 ///
-/// Not part of the on-disk writer surface — the encoder picks the
-/// most frequent element-to-element delta as the common delta, then
-/// chooses per-element widths greedily (code `0` when the delta
-/// equals the common delta, else the smallest width that fits),
-/// which exercises every decode path but isn't necessarily
-/// byte-identical to what a reference writer would produce.
+/// Identical output to [`encode_int_coded`]; both round-trip with
+/// [`decode_int_array`].
 pub fn encode_int_array_for_tests(values: &[i32]) -> Vec<u8> {
-    if values.is_empty() {
-        return Vec::new();
-    }
-    // Pick the most frequent delta as the preamble's common delta.
-    let mut prev: i32 = 0;
-    let mut histogram: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
-    for &v in values {
-        *histogram.entry(v.wrapping_sub(prev)).or_insert(0) += 1;
-        prev = v;
-    }
-    let common_delta = histogram
-        .iter()
-        .max_by_key(|(delta, n)| (**n, std::cmp::Reverse(**delta)))
-        .map(|(delta, _)| *delta)
-        .unwrap_or(0);
-    let control_bytes = values.len().div_ceil(4);
-    let mut control = vec![0u8; control_bytes];
-    let mut payload: Vec<u8> = Vec::new();
-    let mut prev: i32 = 0;
-    for (i, &v) in values.iter().enumerate() {
-        let delta = v.wrapping_sub(prev);
-        let code: u8 = if delta == common_delta {
-            0
-        } else if (-128..=127).contains(&delta) {
-            payload.push((delta as i8) as u8);
-            1
-        } else if (-32_768..=32_767).contains(&delta) {
-            payload.extend_from_slice(&(delta as i16).to_le_bytes());
-            2
-        } else {
-            payload.extend_from_slice(&v.to_le_bytes());
-            3
-        };
-        control[i / 4] |= code << ((i % 4) * 2);
-        prev = v;
-    }
-    let mut out = common_delta.to_le_bytes().to_vec();
-    out.extend(control);
-    out.extend(payload);
-    out
+    encode_int_coded(values)
 }
 
 /// The 8-byte header at the start of the §4.2 STRINGS section.
@@ -3582,6 +3623,54 @@ mod tests {
         let encoded = encode_int_array_for_tests(&values);
         let decoded = decode_int_array(&encoded, values.len()).unwrap();
         assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn encode_int_coded_empty_is_empty() {
+        // Mirrors `decode_int_array`'s `count == 0` early return: the
+        // empty array encodes to the empty buffer.
+        assert!(encode_int_coded(&[]).is_empty());
+    }
+
+    #[test]
+    fn encode_int_coded_round_trips_all_codes() {
+        // Same varied sequence as the test-helper round-trip, but
+        // through the production §3b encoder directly.
+        let values: Vec<i32> = vec![0, 1, 1, 0, -1, 500, -500, 0, 70_000, 70_001, -70_001, 0];
+        let encoded = encode_int_coded(&values);
+        assert_eq!(decode_int_array(&encoded, values.len()).unwrap(), values);
+    }
+
+    #[test]
+    fn encode_int_coded_single_element() {
+        // One element: common delta = the value itself, control code 0,
+        // zero payload bytes — 4-byte preamble + 1 control byte.
+        let encoded = encode_int_coded(&[42]);
+        assert_eq!(encoded.len(), 5);
+        assert_eq!(decode_int_array(&encoded, 1).unwrap(), vec![42]);
+    }
+
+    #[test]
+    fn encode_compressed_buffer_round_trips() {
+        // The §3a single-chunk writer is the inverse of the read path:
+        // parse → decompress_exact recovers the original bytes, and the
+        // leading byte is the documented `0x00` single-chunk marker.
+        let raw: Vec<u8> = (0u8..=200).cycle().take(4096).collect();
+        let buf = encode_compressed_buffer(&raw);
+        assert_eq!(buf[0], 0x00, "single-chunk marker");
+        let parsed = CompressedBuffer::parse(&buf).unwrap();
+        assert!(parsed.as_single_chunk().is_some());
+        assert_eq!(parsed.decompress_exact(raw.len()).unwrap(), raw);
+    }
+
+    #[test]
+    fn encode_compressed_buffer_empty_payload() {
+        // An empty payload still produces a valid single-chunk buffer
+        // that decompresses back to empty.
+        let buf = encode_compressed_buffer(&[]);
+        assert_eq!(buf[0], 0x00);
+        let parsed = CompressedBuffer::parse(&buf).unwrap();
+        assert_eq!(parsed.decompress_exact(0).unwrap(), Vec::<u8>::new());
     }
 
     // ----- §3a compressed-buffer framing tests -----

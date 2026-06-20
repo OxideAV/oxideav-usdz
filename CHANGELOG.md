@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- usdc writer: new `usdc_writer::CrateImage` — a clean-room **USDC
+  "Crate" structural writer**. `CrateImage::from_file` decodes the six
+  standard sections of a parsed `.usdc` into a content image;
+  `CrateImage::to_bytes` re-serialises it (bootstrap + six section
+  payloads in canonical order + tail TOC, §3a single-chunk LZ4 + §3b
+  integer coding) so the result re-decodes byte-exactly through the
+  reader. The committed Elephant fixture round-trips structurally
+  (192 tokens / 157 fields / 576 field-set indices / 248 paths / 248
+  specs all reproduced), with the §4.3 value-rep words riding through
+  opaque (the type-code enumeration is not staged — GAP-TRACKER Round
+  B). Synthetic and empty images round-trip too; cross-array length
+  mismatches are rejected before any bytes are produced.
+- usdc §3a/§3b: production `encode_compressed_buffer` (single-chunk
+  LZ4 framing) and `encode_int_coded` (the inverse of
+  `decode_int_array`, including the 4-byte common-delta preamble) are
+  now public, the byte-exact inverses of the read path.
+  `encode_int_array_for_tests` is now a thin alias of `encode_int_coded`.
 - usdc §4.3: `ValueRep` + `FieldsSection::decode_value_reps` split each
   packed `uint64` FIELDS value-rep word into its documented two-part
   shape — the high-16-bit type-enum + flags word and the low-48-bit
