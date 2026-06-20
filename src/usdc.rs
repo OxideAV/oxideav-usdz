@@ -1856,8 +1856,11 @@ impl<'a> FieldsSection<'a> {
     /// see [`ValueRep`]. The integer values are identical to
     /// [`decode_reps`]; this method only surfaces the structural
     /// `(type_and_flags, payload)` decomposition the trace doc §4.3
-    /// grounds, without interpreting the individual type codes (that
-    /// enumeration is gap-tracker Round B).
+    /// grounds. Each [`ValueRep`] further exposes the observer-grounded
+    /// flag bits ([`ValueRep::is_array`] / [`ValueRep::is_inline`] /
+    /// [`ValueRep::is_compressed`]) and the raw [`ValueRep::type_code`]
+    /// byte; only the *naming* of that type code stays deferred to
+    /// gap-tracker Round B.
     ///
     /// On the Elephant fixture the first word `0x400b000000000002`
     /// decomposes to `type_and_flags = 0x400b`, `payload = 0x2`.
@@ -1885,25 +1888,46 @@ impl<'a> FieldsSection<'a> {
 /// payload `0x4270_0000`), `0x0029_0000_000c_2510` (type/flags
 /// `0x0029`, payload `0xc_2510`).
 ///
-/// This type performs **only** that documented structural split. It
-/// deliberately does **not** decode the meaning of an individual
-/// `type_and_flags` value (which type-enum, which flag bits), nor
-/// whether a given `payload` is an inline value or a file offset —
-/// both require the type-code enumeration the trace doc defers to a
-/// separate fact-table extraction (GAP-TRACKER Round B). Until that
-/// is staged, a consumer gets the raw two-part word and the original
-/// `u64` back via [`ValueRep::raw`].
+/// This type performs the documented structural split **and** the
+/// observer-grounded decomposition of the `type_and_flags` field into
+/// its three flag bits and its raw type-code byte (see the accessors
+/// below). Those bit positions are pinned **from the Elephant fixture
+/// bytes** — across all 157 of its FIELDS reps, the top byte of the
+/// rep word only ever takes the four values `0x00 / 0x40 / 0x80 /
+/// 0xa0`, i.e. only bits 5/6/7 of that byte fire, and they correlate
+/// exactly with the trace-doc flag triplet:
+///
+/// * **bit 63 (top byte `0x80`) — is-array.** Every rep with this bit
+///   set points its `payload` at an in-file value region; none carries
+///   an inline value. The bytes at that offset begin with a `u64`
+///   element count (e.g. `02 00 00 00 00 00 00 00` then two `float`s).
+/// * **bit 62 (top byte `0x40`) — is-inline.** Set on scalar reps
+///   whose value is small enough to live in the `payload` itself —
+///   e.g. `0x4009_…_42700000` is a `float` of `60.0` (`0x42700000`
+///   bit-cast). Mutually exclusive with is-array across the fixture.
+/// * **bit 61 (top byte `0x20`) — is-compressed.** Only ever observed
+///   together with is-array (top byte `0xa0`); marks large arrays
+///   whose in-file value region is itself LZ4/int-coded rather than a
+///   raw `[count][elements]` blob.
+///
+/// What stays **uninterpreted** is the *meaning of the type-code byte*
+/// — i.e. "is `0x09` `float`, `0x0b` `int`, `0x29` `int[]`?". That
+/// per-code enumeration is the trace doc's deferred fact-table
+/// extraction (GAP-TRACKER Round B, sourced from `crateFile.h`); this
+/// crate surfaces the raw [`ValueRep::type_code`] byte but does not
+/// name it. The flag *bits*, by contrast, are fully observable from
+/// the fixture's value bytes and are decoded here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValueRep {
-    /// The high 16 bits of the rep word — the packed type-enum plus
-    /// the flag bits (is-array / is-inlined / is-compressed, per the
-    /// trace doc). Surfaced uninterpreted: the per-value enumeration
-    /// of these bits is GAP-TRACKER Round B material.
+    /// The high 16 bits of the rep word — the packed type-code byte
+    /// (low 8 bits, see [`ValueRep::type_code`]) plus the flag bits
+    /// (high 8 bits, see [`ValueRep::is_array`] /
+    /// [`ValueRep::is_inline`] / [`ValueRep::is_compressed`]).
     pub type_and_flags: u16,
-    /// The low 48 bits of the rep word — either an inline value or a
-    /// file offset to the value's bytes, depending on the (currently
-    /// uninterpreted) flag bits in `type_and_flags`. Always fits in a
-    /// `u64`; the top 16 bits are guaranteed zero.
+    /// The low 48 bits of the rep word — either an inline value
+    /// ([`ValueRep::is_inline`]) or a file offset to the value's bytes
+    /// ([`ValueRep::is_array`] or a non-inline scalar). Always fits in
+    /// a `u64`; the top 16 bits are guaranteed zero.
     pub payload: u64,
 }
 
@@ -1913,6 +1937,20 @@ impl ValueRep {
     /// Bit width of the payload field (the type/flags word starts at
     /// this shift).
     const TYPE_SHIFT: u32 = 48;
+
+    /// Top-byte bit that marks an **array**-valued rep (full-word bit
+    /// 63). Observer-grounded from the Elephant fixture: every rep
+    /// carrying this bit addresses an in-file `[u64 count][elements]`
+    /// (or, with [`Self::is_compressed`], a compressed) value region.
+    pub const FLAG_ARRAY: u16 = 0x8000;
+    /// Top-byte bit that marks an **inline**-valued rep (full-word bit
+    /// 62). When set, [`Self::payload`] holds the value itself rather
+    /// than a file offset (e.g. a bit-cast `float`).
+    pub const FLAG_INLINE: u16 = 0x4000;
+    /// Top-byte bit that marks a **compressed** array value region
+    /// (full-word bit 61). Across the fixture this only ever appears
+    /// in combination with [`Self::FLAG_ARRAY`].
+    pub const FLAG_COMPRESSED: u16 = 0x2000;
 
     /// Split a raw little-endian rep `u64` into its documented
     /// `(type_and_flags, payload)` parts. Total information is
@@ -1931,6 +1969,51 @@ impl ValueRep {
     #[inline]
     pub fn raw(self) -> u64 {
         ((self.type_and_flags as u64) << Self::TYPE_SHIFT) | self.payload
+    }
+
+    /// The raw **type-code byte** (low 8 bits of `type_and_flags`).
+    ///
+    /// Surfaced as an opaque code: the mapping from this byte to a
+    /// named USD value type (`float`, `int`, `token[]`, …) is the
+    /// deferred fact-table extraction (GAP-TRACKER Round B). Two reps
+    /// with the same `type_code` but different flag bits are the
+    /// scalar/array (or inline/offset) forms of the *same* underlying
+    /// type.
+    #[inline]
+    pub fn type_code(self) -> u8 {
+        (self.type_and_flags & 0x00FF) as u8
+    }
+
+    /// The flag byte (high 8 bits of `type_and_flags`). Only bits
+    /// 5/6/7 (`0x20 / 0x40 / 0x80`) are ever set in the fixture; the
+    /// individual flags are exposed by [`Self::is_array`] /
+    /// [`Self::is_inline`] / [`Self::is_compressed`].
+    #[inline]
+    pub fn flag_byte(self) -> u8 {
+        (self.type_and_flags >> 8) as u8
+    }
+
+    /// `true` when the rep's value is an **array** — [`Self::payload`]
+    /// is then a file offset to a `[u64 count][elements]` (or, when
+    /// [`Self::is_compressed`], a compressed) value region.
+    #[inline]
+    pub fn is_array(self) -> bool {
+        self.type_and_flags & Self::FLAG_ARRAY != 0
+    }
+
+    /// `true` when the value is stored **inline** in
+    /// [`Self::payload`] rather than at a file offset.
+    #[inline]
+    pub fn is_inline(self) -> bool {
+        self.type_and_flags & Self::FLAG_INLINE != 0
+    }
+
+    /// `true` when an array rep's value region is **compressed**
+    /// (LZ4 / int-coded) rather than a raw `[count][elements]` blob.
+    /// Only meaningful together with [`Self::is_array`].
+    #[inline]
+    pub fn is_compressed(self) -> bool {
+        self.type_and_flags & Self::FLAG_COMPRESSED != 0
     }
 }
 
@@ -4472,6 +4555,112 @@ mod tests {
         ] {
             assert_eq!(ValueRep::from_raw(raw).raw(), raw, "round-trip {raw:#018x}");
         }
+    }
+
+    #[test]
+    fn value_rep_decomposes_type_code_and_flags() {
+        // Observer-grounded from the Elephant FIELDS reps: the top
+        // byte's bits 5/6/7 are the compressed/inline/array flags; the
+        // low byte of type_and_flags is the (uninterpreted) type code.
+        // 0x4009 = inline float `60.0` scalar.
+        let r = ValueRep::from_raw(0x4009_0000_4270_0000);
+        assert_eq!(r.type_code(), 0x09);
+        assert_eq!(r.flag_byte(), 0x40);
+        assert!(r.is_inline());
+        assert!(!r.is_array());
+        assert!(!r.is_compressed());
+        assert_eq!(f32::from_bits(r.payload as u32), 60.0);
+
+        // 0x0029 = non-inline non-array scalar (offset payload).
+        let r = ValueRep::from_raw(0x0029_0000_000c_2510);
+        assert_eq!(r.type_code(), 0x29);
+        assert_eq!(r.flag_byte(), 0x00);
+        assert!(!r.is_inline());
+        assert!(!r.is_array());
+        assert!(!r.is_compressed());
+
+        // 0x8018 = array (offset to [u64 count][elements]).
+        let r = ValueRep::from_raw(0x8018_0000_000c_27a8);
+        assert_eq!(r.type_code(), 0x18);
+        assert_eq!(r.flag_byte(), 0x80);
+        assert!(r.is_array());
+        assert!(!r.is_inline());
+        assert!(!r.is_compressed());
+
+        // 0xa003 = compressed array (top byte 0x80 | 0x20).
+        let r = ValueRep::from_raw(0xa003_0000_0000_1258);
+        assert_eq!(r.type_code(), 0x03);
+        assert_eq!(r.flag_byte(), 0xa0);
+        assert!(r.is_array());
+        assert!(r.is_compressed());
+        assert!(!r.is_inline());
+    }
+
+    #[test]
+    fn real_fixture_value_rep_flag_invariants_hold() {
+        // The whole point of the observer-grounded flag decode: across
+        // every FIELDS rep in the real fixture, the flag bits behave
+        // exactly as the doc-comment claims.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/3d/usd/fixtures/SoC-ElephantWithMonochord.usdc");
+        if !fixture.exists() {
+            eprintln!("skip: fixture {fixture:?} not present");
+            return;
+        }
+        let bytes = std::fs::read(&fixture).expect("read fixture");
+        let file = UsdcFile::parse(&bytes).expect("parse Elephant USDC");
+        let section = file
+            .section_bytes(SectionName::Fields, &bytes)
+            .expect("FIELDS section present");
+        let sec = FieldsSection::parse(section).expect("parse FIELDS section");
+        let reps = sec.decode_value_reps().expect("value-reps decode");
+        let toc_off = file.bootstrap.toc_offset;
+
+        let mut saw_array = false;
+        let mut saw_inline = false;
+        let mut saw_compressed = false;
+        for r in &reps {
+            // Only bits 5/6/7 of the flag byte are ever set.
+            assert_eq!(
+                r.flag_byte() & !0xE0,
+                0,
+                "rep {:#018x}: flag byte has bits outside 0x20/0x40/0x80",
+                r.raw()
+            );
+            // is-array and is-inline are mutually exclusive.
+            assert!(
+                !(r.is_array() && r.is_inline()),
+                "rep {:#018x}: array and inline both set",
+                r.raw()
+            );
+            // is-compressed only ever rides on is-array.
+            if r.is_compressed() {
+                assert!(
+                    r.is_array(),
+                    "rep {:#018x}: compressed without array",
+                    r.raw()
+                );
+                saw_compressed = true;
+            }
+            // Array reps always address an in-file value region whose
+            // u64 element count is readable.
+            if r.is_array() {
+                saw_array = true;
+                let off = r.payload as usize;
+                assert!(
+                    off >= 0x58 && (off as u64) < toc_off && off + 8 <= bytes.len(),
+                    "rep {:#018x}: array offset {off:#x} not in value region",
+                    r.raw()
+                );
+            }
+            if r.is_inline() {
+                saw_inline = true;
+            }
+        }
+        // The fixture exercises all three flag classes.
+        assert!(saw_array, "fixture has array reps");
+        assert!(saw_inline, "fixture has inline reps");
+        assert!(saw_compressed, "fixture has compressed-array reps");
     }
 
     #[test]

@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- usdc §4.3: observer-grounded **ValueRep flag decomposition**. The
+  rep word's top byte (bits 5/6/7) is now decoded into
+  `ValueRep::is_array` (bit 63), `is_inline` (bit 62) and
+  `is_compressed` (bit 61), and the low byte is surfaced as the raw
+  `type_code()` (its *naming* stays GAP-TRACKER Round B). Bit
+  positions are pinned from the Elephant fixture: across all 157
+  reps the flag byte only ever takes `0x00/0x40/0x80/0xa0`, array and
+  inline are mutually exclusive, compressed only rides on array, and
+  every array rep addresses an in-file `[u64 count][elements]` region
+  — all asserted by a new fixture-grounded invariant test.
 - usdc writer: new `usdc_writer::CrateImage` — a clean-room **USDC
   "Crate" structural writer**. `CrateImage::from_file` decodes the six
   standard sections of a parsed `.usdc` into a content image;
