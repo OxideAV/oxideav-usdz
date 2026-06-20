@@ -141,7 +141,7 @@ Not yet implemented (so USDC files do not fully decode to a scene yet):
   so a caller that knows an element is a 4-byte `float` can read it. What
   remains is the **mapping from the raw `type_code()` byte to a named USD
   value type** (`0x09` → `float`, `0x0f` → `double`, `0x29` → `int[]`,
-  …). That enumeration lives in `crateFile.h` (off-limits source) and is
+  …). That enumeration lives only in the off-limits reference-implementation source and is
   not yet staged in `docs/3d/usd/` — GAP-TRACKER Round B. Without it the
   reader cannot auto-select element widths or build a typed scene from a
   `.usdc` value section.

@@ -1251,7 +1251,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **USDC binary "Crate" format.** OpenUSD publishes no prose spec
   for the wire format — `docs/3d/usd/README.md` documents this
-  explicitly. The C++ source (`pxr/usd/usd/crateFile.{h,cpp}`)
+  explicitly. The reference-implementation C++ source
   is barred under the workspace's no-external-libs rule.
   Loading a `.usdc` Default Layer continues to surface as
   `Error::Unsupported` with a `usdcat -o foo.usda` hint.

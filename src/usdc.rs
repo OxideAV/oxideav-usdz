@@ -1913,7 +1913,7 @@ impl<'a> FieldsSection<'a> {
 /// What stays **uninterpreted** is the *meaning of the type-code byte*
 /// — i.e. "is `0x09` `float`, `0x0b` `int`, `0x29` `int[]`?". That
 /// per-code enumeration is the trace doc's deferred fact-table
-/// extraction (GAP-TRACKER Round B, sourced from `crateFile.h`); this
+/// extraction (GAP-TRACKER Round B, pending a staged type-code table); this
 /// crate surfaces the raw [`ValueRep::type_code`] byte but does not
 /// name it. The flag *bits*, by contrast, are fully observable from
 /// the fixture's value bytes and are decoded here.
