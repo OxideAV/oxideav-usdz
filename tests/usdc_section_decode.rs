@@ -273,3 +273,64 @@ fn paths_section_decodes_to_248_path_elements() {
     assert_eq!(elems[4].jump, 8);
     assert_eq!(elems[12].jump, 123);
 }
+
+#[test]
+fn path_elements_by_slot_and_spec_leaf_names() {
+    let Some(bytes) = elephant_bytes() else {
+        return;
+    };
+    let file = UsdcFile::parse(&bytes).expect("parse Elephant USDC");
+
+    // Slot-ordered view: target_index == position for every element.
+    let by_slot = file
+        .decode_path_elements_by_slot(&bytes)
+        .expect("decode_path_elements_by_slot");
+    assert_eq!(by_slot.len(), 248);
+    for (i, e) in by_slot.iter().enumerate() {
+        assert_eq!(
+            e.target_index as usize, i,
+            "slot {i} holds the element whose target_index is {i}"
+        );
+    }
+
+    // Spec → leaf-name join. The pseudo-root spec (path_index 0,
+    // spec_type 7) carries stage metadata; the first prim specs
+    // (spec_type 6) carry their type/name token as their leaf.
+    let leaves = file
+        .decode_spec_leaf_names(&bytes)
+        .expect("decode_spec_leaf_names");
+    assert_eq!(leaves.len(), 248, "one leaf name per spec row");
+
+    // Row 0 is the pseudo-root (spec_type 7) with its metadata fields.
+    let (root_spec, root_leaf) = &leaves[0];
+    assert_eq!(root_spec.path_index, 0);
+    assert_eq!(root_spec.spec_type, 7, "pseudo-root spec type");
+    assert_eq!(root_leaf, "metersPerUnit");
+    assert!(
+        root_spec.fields.iter().any(|(n, _)| n == "defaultPrim"),
+        "root spec carries defaultPrim metadata"
+    );
+
+    // Every prim spec (spec_type 6) names a non-empty leaf component.
+    for (spec, leaf) in &leaves {
+        if spec.spec_type == 6 {
+            assert!(
+                !leaf.is_empty(),
+                "prim spec at path_index {} has a leaf name",
+                spec.path_index
+            );
+        }
+    }
+
+    // Spot-check the first few prim leaves against the observed bytes.
+    let leaf_at = |pi: i32| -> &str {
+        leaves
+            .iter()
+            .find(|(s, _)| s.path_index == pi)
+            .map(|(_, l)| l.as_str())
+            .unwrap()
+    };
+    assert_eq!(leaf_at(4), "Xform");
+    assert_eq!(leaf_at(5), "Materials");
+    assert_eq!(leaf_at(6), "CharacterAudioSource");
+}

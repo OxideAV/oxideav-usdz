@@ -129,6 +129,15 @@ writer** (`usdc_writer::CrateImage`). Implemented so far:
   is the **jump** offset. The element-token sign + low bit and the
   jump-walk are preserved verbatim and left to the deferred tree
   reconstruction below.
+- The §4.5↔§4.6 PATHS↔SPECS join naming each spec's leaf component.
+  `decode_path_elements_by_slot` puts the path elements into
+  `target_index` order (the index space a SPECS `path_index` addresses,
+  validated as a permutation), and `decode_spec_leaf_names` joins the
+  SPECS table to it so each spec row gets its own path-component token
+  (the pseudo-root spec carries the stage metadata, prim specs get their
+  type/name token — `Xform` / `Materials` / …). This names *what each
+  spec is*; the full ancestor `SdfPath` still needs the deferred
+  jump-walk.
 - **Structural writer** — `usdc_writer::CrateImage` is the inverse of
   the reader at the documented structural layer. `from_bytes` /
   `from_file` decode a `.usdc` into a content image (the six sections'

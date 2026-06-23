@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- usdc §4.5/§5: **PATHS↔SPECS namespace join** giving every spec its
+  leaf component name. `UsdcFile::decode_path_elements_by_slot` reorders
+  the §4.5 path elements into `target_index` (= slot) order — the same
+  index space a §4.6 SPECS row's `path_index` addresses — and validates
+  the permutation (no gap/collision). `UsdcFile::decode_spec_leaf_names`
+  then joins the SPECS table with that slot view: each spec's
+  `path_index` selects the `PathElement` whose `element_token` is the
+  spec's own path component, resolved against the §4.1 TOKENS pool. On
+  the Elephant fixture the pseudo-root spec (`path_index 0`,
+  `spec_type 7`) carries the stage metadata fields, and each prim spec
+  (`spec_type 6`) gets its type/name token (`Xform` / `Materials` /
+  `CharacterAudioSource` / …) as its leaf — all asserted by a new
+  fixture test. This names *what each spec is* (leaf + fields) on
+  grounded footing; the full ancestor path (`/Foo/Bar/leaf`) still needs
+  the deferred jump-walk (gap-tracker §1 / Round B).
+
 - usdc §4.5: **observer-grounded `PATHS` structural join** —
   `PathsSection::decode_path_elements` (+ the file-level
   `UsdcFile::decode_path_elements` convenience) decode the section's

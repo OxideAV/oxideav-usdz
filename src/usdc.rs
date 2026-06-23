@@ -3354,6 +3354,129 @@ impl UsdcFile {
         PathsSection::parse(paths_bytes)?.decode_path_elements()
     }
 
+    /// Index a §4.5 PATHS decode by **target slot**: the returned
+    /// `Vec<PathElement>` is reordered so element `target_index == i`
+    /// sits at position `i`, mirroring the index space a §4.6 SPECS
+    /// row's `path_index` (and [`ResolvedSpec::path_index`]) addresses.
+    ///
+    /// [`decode_path_elements`](Self::decode_path_elements) returns
+    /// elements in **tree-walk order**; this returns them in **slot
+    /// order**, so `result[spec.path_index]` is the [`PathElement`] that
+    /// names a given spec's leaf namespace component. Because
+    /// [`PathElement::target_index`] is an exact permutation of
+    /// `0..numPaths` (verified on the fixture), the reorder is a total
+    /// rearrangement with no gaps or collisions.
+    ///
+    /// `file_bytes` must be the same buffer [`UsdcFile::parse`] was
+    /// called on. The `PATHS` section is decoded once.
+    ///
+    /// Errors:
+    ///
+    /// * [`Error::InvalidData`](crate::Error) propagated from
+    ///   [`decode_path_elements`](Self::decode_path_elements),
+    /// * [`Error::InvalidData`] if the decoded `target_index` values are
+    ///   not a permutation of `0..len` (a duplicate or out-of-range slot
+    ///   — a corrupt buffer 1).
+    pub fn decode_path_elements_by_slot(&self, file_bytes: &[u8]) -> Result<Vec<PathElement>> {
+        let elems = self.decode_path_elements(file_bytes)?;
+        let n = elems.len();
+        let mut slots: Vec<Option<PathElement>> = vec![None; n];
+        for e in elems {
+            let slot = e.target_index as usize;
+            if slot >= n {
+                return Err(invalid(format!(
+                    "USDC §4.5 PATHS: target slot {slot} out of range of the {n}-path table"
+                )));
+            }
+            if slots[slot].is_some() {
+                return Err(invalid(format!(
+                    "USDC §4.5 PATHS: duplicate target slot {slot} (buffer 1 must be a permutation of 0..{n})"
+                )));
+            }
+            slots[slot] = Some(e);
+        }
+        // Every slot must be filled (permutation): no `None` survives.
+        slots
+            .into_iter()
+            .enumerate()
+            .map(|(i, opt)| {
+                opt.ok_or_else(|| {
+                    invalid(format!(
+                        "USDC §4.5 PATHS: target slot {i} unfilled (buffer 1 is not a permutation of 0..{n})"
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    /// Join the §4.6 SPECS table with the §4.5 PATHS elements to give
+    /// every spec row its **leaf namespace-component name** — the one
+    /// segment of its `SdfPath` the bytes pin without the deferred tree
+    /// walk.
+    ///
+    /// Each [`ResolvedSpec::path_index`] (a permutation index into the
+    /// path table) selects exactly one [`PathElement`] via
+    /// [`decode_path_elements_by_slot`](Self::decode_path_elements_by_slot);
+    /// that element's [`element_token`](PathElement::element_token) is
+    /// the spec's own path component (its prim/property name), resolved
+    /// against the §4.1 TOKENS pool. The result pairs each
+    /// [`NamedSpec`] with that leaf name.
+    ///
+    /// This is the furthest the namespace join can go on grounded
+    /// footing: it names *what each spec is* (its leaf component +
+    /// fields), but **not its full ancestor path** — assembling
+    /// `/Foo/Bar/leaf` needs the deferred jump-walk (gap-tracker §1 /
+    /// Round B). On the Elephant fixture the pseudo-root spec
+    /// (`path_index == 0`, `spec_type == 7`) carries the stage metadata
+    /// fields, and each prim spec (`spec_type == 6`) gets its type/name
+    /// token (`Xform`, `Materials`, `CharacterAudioSource`, …) as its
+    /// leaf.
+    ///
+    /// `file_bytes` must be the same buffer [`UsdcFile::parse`] was
+    /// called on. `TOKENS`, the SPECS join, and the PATHS section are
+    /// each decoded once.
+    ///
+    /// Errors:
+    ///
+    /// * [`Error::InvalidData`](crate::Error) propagated from
+    ///   [`decode_named_specs`](Self::decode_named_specs) or
+    ///   [`decode_path_elements_by_slot`](Self::decode_path_elements_by_slot),
+    /// * [`Error::InvalidData`] if a spec's `path_index` is negative or
+    ///   past the end of the path table, or if the selected element's
+    ///   token index is past the TOKENS pool.
+    pub fn decode_spec_leaf_names(&self, file_bytes: &[u8]) -> Result<Vec<(NamedSpec, String)>> {
+        let tokens_bytes = self
+            .section_bytes(SectionName::Tokens, file_bytes)
+            .ok_or_else(|| invalid("USDC §5: TOKENS section absent — cannot name spec leaves"))?;
+        let tokens = TokensSection::parse(tokens_bytes)?.decode()?;
+        let by_slot = self.decode_path_elements_by_slot(file_bytes)?;
+        let specs = self.decode_named_specs(file_bytes)?;
+        let mut out = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let pi = usize::try_from(spec.path_index).map_err(|_| {
+                invalid(format!(
+                    "USDC §5: spec path index {} is negative",
+                    spec.path_index
+                ))
+            })?;
+            let elem = by_slot.get(pi).ok_or_else(|| {
+                invalid(format!(
+                    "USDC §5: spec path index {pi} out of range of the {}-path table",
+                    by_slot.len()
+                ))
+            })?;
+            let leaf = elem.element_token(&tokens).ok_or_else(|| {
+                invalid(format!(
+                    "USDC §5: spec path index {pi} element token {} out of range of the {}-atom TOKENS pool",
+                    elem.element_token_index,
+                    tokens.len()
+                ))
+            })?;
+            out.push((spec, leaf.to_owned()));
+        }
+        Ok(out)
+    }
+
     /// Resolve the §4.2 `STRINGS` pool into its concrete UTF-8 atoms —
     /// the trace doc §5 step-3 "load STRINGS indices" join carried to
     /// its string-resolved form.
