@@ -196,3 +196,80 @@ fn specs_section_joins_248_rows_with_documented_shape() {
         "root prim's eight metadata field names"
     );
 }
+
+#[test]
+fn paths_section_decodes_to_248_path_elements() {
+    let Some(bytes) = elephant_bytes() else {
+        return;
+    };
+    let file = UsdcFile::parse(&bytes).expect("parse Elephant USDC");
+
+    // Token pool for resolving each element's name.
+    let tokens_bytes = file
+        .section_bytes(SectionName::Tokens, &bytes)
+        .expect("TOKENS section present");
+    let tokens = TokensSection::parse(tokens_bytes)
+        .expect("parse TOKENS")
+        .decode()
+        .expect("decode TOKENS blob");
+
+    // Section-level decode and the file-level convenience must agree.
+    let section_bytes = file
+        .section_bytes(SectionName::Paths, &bytes)
+        .expect("PATHS section present");
+    let section = PathsSection::parse(section_bytes).expect("parse PATHS section");
+    let from_section = section
+        .decode_path_elements()
+        .expect("PathsSection::decode_path_elements");
+    let from_file = file
+        .decode_path_elements(&bytes)
+        .expect("UsdcFile::decode_path_elements");
+    assert_eq!(from_section, from_file, "section vs file convenience agree");
+
+    // Trace doc §4.5: numPaths = 248 on the Elephant fixture.
+    let elems = from_file;
+    assert_eq!(elems.len(), 248, "248 path elements");
+
+    // Buffer 1 (`target_index`) is an exact permutation of 0..248 — the
+    // observer-grounded slot map every element fills.
+    let mut targets: Vec<u32> = elems.iter().map(|e| e.target_index).collect();
+    targets.sort_unstable();
+    assert!(
+        targets.iter().enumerate().all(|(i, &v)| v as usize == i),
+        "target_index is a permutation of 0..248"
+    );
+
+    // Buffer 2 (`element_token_index`) is in range of the 192-atom
+    // TOKENS pool for every element — so each resolves to a name.
+    for (i, e) in elems.iter().enumerate() {
+        assert!(
+            (e.element_token_index as usize) < tokens.len(),
+            "path element {i} token index {} out of {}-atom pool",
+            e.element_token_index,
+            tokens.len()
+        );
+        assert!(
+            e.element_token(&tokens).is_some(),
+            "path element {i} resolves to a token string"
+        );
+        // The magnitude/shift relation the decoder applies.
+        assert_eq!(
+            e.element_token_index,
+            e.element_token_word.unsigned_abs() >> 1,
+            "element_token_index == abs(word) >> 1"
+        );
+    }
+
+    // Spot-check three observed first-rows against the fixture bytes
+    // (these are facts the decode is pinned to, not new semantic
+    // claims): row 0's element name token resolves to "metersPerUnit",
+    // row 1 to "defaultPrim", row 4 to "upAxis".
+    assert_eq!(elems[0].element_token(&tokens), Some("metersPerUnit"));
+    assert_eq!(elems[1].element_token(&tokens), Some("defaultPrim"));
+    assert_eq!(elems[4].element_token(&tokens), Some("upAxis"));
+
+    // The jump words observed on the first rows (verbatim from buffer 3).
+    assert_eq!(elems[0].jump, -1);
+    assert_eq!(elems[4].jump, 8);
+    assert_eq!(elems[12].jump, 123);
+}

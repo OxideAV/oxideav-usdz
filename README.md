@@ -118,6 +118,17 @@ writer** (`usdc_writer::CrateImage`). Implemented so far:
   is bounds-checked against the §4.5 PATHS `numPaths`, so a corrupt
   path-index column referencing a non-existent namespace path is rejected
   rather than producing a dangling `SdfPath` reference.
+- The §4.5 PATHS structural join (`decode_path_elements`) — the three
+  parallel buffers are joined into one typed `PathElement` per tree-walk
+  slot. Parsing the fixture bytes pins the per-element buffer roles
+  tighter than the trace doc's column header: buffer 1 is the
+  **target-slot permutation** (an exact permutation of `0..numPaths`),
+  buffer 2 is the **element-token word** whose `abs(word) >> 1` is an
+  in-range §4.1 TOKENS index for all 248 elements (resolving to `Xform` /
+  `Material` / `xformOp:transform` / … via `element_token`), and buffer 3
+  is the **jump** offset. The element-token sign + low bit and the
+  jump-walk are preserved verbatim and left to the deferred tree
+  reconstruction below.
 - **Structural writer** — `usdc_writer::CrateImage` is the inverse of
   the reader at the documented structural layer. `from_bytes` /
   `from_file` decode a `.usdc` into a content image (the six sections'
@@ -146,10 +157,15 @@ Not yet implemented (so USDC files do not fully decode to a scene yet):
   reader cannot auto-select element widths or build a typed scene from a
   `.usdc` value section.
 - **PATHS namespace-tree reconstruction** — the three parallel buffers
-  (path-token indices, element-token indices, jump offsets) decode to
-  their raw integer streams, but the jump-walk that turns them into
-  `SdfPath` strings is not yet documented (the per-element semantics and
-  the jump-offset encoding are not pinned by the staged trace).
+  now decode to a typed `PathElement` join (target-slot permutation,
+  element-token index + name, raw element-token word, jump), but the
+  **jump-walk** that turns those triples into full `SdfPath` strings is
+  not yet documented: how the absolute root is seeded, what the `jump`
+  sign cases (`-1` / `-2` / `0` / positive) mean for has-child /
+  has-sibling descent, and what the element-token sign + low bit
+  distinguish are not pinned by the staged trace (GAP-TRACKER §1 /
+  Round B). The decode stops at the verified parallel-array join so no
+  un-grounded path string is fabricated.
 
 ## Not yet supported
 

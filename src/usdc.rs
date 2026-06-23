@@ -2536,13 +2536,16 @@ impl<'a> PathsSection<'a> {
     ///
     /// Each buffer decodes **exactly** as a `num_paths`-element §3b
     /// stream on the Elephant fixture (zero leftover bytes), so the
-    /// integer streams themselves are recovered. What the integers
-    /// *mean* per element is only partly grounded: the raw
-    /// path-token values exceed the TOKENS pool size on the
-    /// fixture, so the trace doc's per-buffer "holds" column
-    /// (§4.5's table) is not a direct index semantics — the
-    /// tree-walk reconstruction that consumes these three streams
-    /// stays deferred until the trace covers it.
+    /// integer streams themselves are recovered. Their per-element
+    /// roles are pinned by [`PathsSection::decode_path_elements`]
+    /// (buffer 1 = the target-slot permutation, buffer 2 = the
+    /// element-token word, buffer 3 = the jump); what stays deferred is
+    /// only the tree **walk** that joins them into reconstructed
+    /// `SdfPath` strings (gap-tracker §1 / Round B), since the trace doc
+    /// records the buffer structure but not the per-element descent
+    /// arithmetic. These three raw-`Vec<i32>` accessors are the
+    /// pre-join view; [`PathsSection::decode_path_elements`] is the
+    /// typed join.
     fn decode_int_buffer(&self, buffer_bytes: &[u8]) -> Result<Vec<i32>> {
         let count = usize::try_from(self.header.num_paths).map_err(|_| {
             invalid(format!(
@@ -2574,6 +2577,159 @@ impl<'a> PathsSection<'a> {
     /// [`Self::decode_path_token_ints`].
     pub fn decode_jump_ints(&self) -> Result<Vec<i32>> {
         self.decode_int_buffer(self.jumps_buffer_bytes)
+    }
+
+    /// Decode the three §4.5 PATHS buffers and join them into one
+    /// [`PathElement`] per tree-walk slot — the observer-grounded
+    /// structural decode of the section, one step beyond the three raw
+    /// `Vec<i32>` accessors above.
+    ///
+    /// ## What the bytes pin (verifiable against the fixture)
+    ///
+    /// Decoding the Elephant fixture's three buffers and inspecting the
+    /// three parallel `num_paths`-element streams reveals their concrete
+    /// roles, which are **tighter than the trace doc §4.5 "holds"
+    /// column**:
+    ///
+    /// * **Buffer 1** is *not* a token-index array as the trace's column
+    ///   header suggests — it is the **target-slot permutation**: an
+    ///   exact permutation of `0..num_paths` saying which final
+    ///   `SdfPath` slot the i-th tree-walk node fills.
+    ///   [`PathElement::target_index`] carries it. (The doc's caveat that
+    ///   "the raw path-token values exceed the TOKENS pool size" is the
+    ///   symptom of reading this permutation as token indices; it is the
+    ///   *element-token* buffer, below, that indexes TOKENS.)
+    /// * **Buffer 2** is the **element-token word**: a signed value whose
+    ///   magnitude packs `(tokenIndex << 1) | lowFlag`. The recovered
+    ///   `tokenIndex` ([`PathElement::element_token_index`],
+    ///   `abs(word) >> 1`) is in range of the §4.1 TOKENS pool for
+    ///   **all** `num_paths` elements on the fixture (zero out-of-range),
+    ///   so it resolves to a concrete element name — the path component
+    ///   token (`Xform`, `Material`, `xformOp:transform`, …). The raw
+    ///   signed word is preserved verbatim
+    ///   ([`PathElement::element_token_word`]) because its **sign** and
+    ///   **low bit** are two further flags (a prim-vs-property /
+    ///   target-path discriminator) whose exact meaning the trace doc
+    ///   does not pin — see "What stays deferred" below.
+    /// * **Buffer 3** is the **jump** word ([`PathElement::jump`]): the
+    ///   sibling/child tree-walk navigation offset, preserved verbatim.
+    ///
+    /// ## What stays deferred (gap-tracker §1 / Round B)
+    ///
+    /// This method performs the **join and the name resolution**, not
+    /// the tree walk. The exact arithmetic that turns the (target,
+    /// element-token, jump) triples into reconstructed `SdfPath` strings
+    /// — how the absolute root is seeded, how `jump`'s sign cases
+    /// (`-1` / `-2` / `0` / positive) drive the has-child / has-sibling
+    /// descent, and what the element-token sign + low bit ultimately
+    /// distinguish — is **not** grounded by
+    /// `docs/3d/usd/usdc-crate-format-trace.md`; the trace records the
+    /// three-buffer structure and the per-buffer roles but explicitly
+    /// defers per-element tree-walk reconstruction. Decoding stops at
+    /// the verified parallel-array join so no un-grounded path string is
+    /// fabricated.
+    ///
+    /// On the committed Elephant fixture this returns 248
+    /// [`PathElement`]s; [`PathElement::target_index`] across the result
+    /// is an exact permutation of `0..248`, and every
+    /// [`PathElement::element_token_index`] is `< tokens.len()` (192) so
+    /// each resolves against the pool.
+    ///
+    /// Errors:
+    ///
+    /// * [`Error::InvalidData`](crate::Error) propagated from the three
+    ///   buffers' §3a → LZ4 → §3b decode,
+    /// * [`Error::InvalidData`] if any buffer 1 (`target_index`) value is
+    ///   negative (it is a slot index into the path table, so it must be
+    ///   `>= 0`).
+    pub fn decode_path_elements(&self) -> Result<Vec<PathElement>> {
+        let targets = self.decode_path_token_ints()?;
+        let element_words = self.decode_element_token_ints()?;
+        let jumps = self.decode_jump_ints()?;
+        // The three buffers are each decoded as exactly `num_paths`
+        // elements by `decode_int_buffer`, so their lengths agree by
+        // construction; assert it in debug to lock the invariant.
+        debug_assert_eq!(targets.len(), element_words.len());
+        debug_assert_eq!(targets.len(), jumps.len());
+        let mut out = Vec::with_capacity(targets.len());
+        for i in 0..targets.len() {
+            let target = targets[i];
+            let target_index = u32::try_from(target).map_err(|_| {
+                invalid(format!(
+                    "USDC §4.5 PATHS element {i}: target slot index {target} is negative (buffer 1 is a permutation of 0..numPaths)"
+                ))
+            })?;
+            let word = element_words[i];
+            // The element-token index is the magnitude shifted right by
+            // one: the low bit and the sign are separate flags the trace
+            // does not pin, so they are preserved in `element_token_word`
+            // rather than interpreted here.
+            let element_token_index = word.unsigned_abs() >> 1;
+            out.push(PathElement {
+                target_index,
+                element_token_index,
+                element_token_word: word,
+                jump: jumps[i],
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// One node of the §4.5 PATHS namespace tree, as recovered by
+/// [`PathsSection::decode_path_elements`] from the section's three
+/// parallel §3b integer buffers.
+///
+/// A `PathElement` is the **observer-grounded join** of the three
+/// buffers at one tree-walk position — it carries the facts the
+/// Elephant fixture's bytes pin directly, and preserves the raw words
+/// whose finer semantics the trace doc defers (the tree walk itself;
+/// gap-tracker §1 / Round B). See
+/// [`PathsSection::decode_path_elements`] for the buffer-by-buffer
+/// grounding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathElement {
+    /// Buffer-1 value: the final `SdfPath` table slot this tree-walk
+    /// node fills. Across a section these form an exact permutation of
+    /// `0..num_paths` (verified on the fixture), so they map tree-walk
+    /// order onto stable path-table indices — the same indices a §4.6
+    /// SPECS row's `path_index` refers to.
+    pub target_index: u32,
+    /// Buffer-2 value, magnitude-shifted: the §4.1 TOKENS pool index of
+    /// this element's **name** token (`abs(element_token_word) >> 1`).
+    /// In range of the pool for every element on the fixture, so it
+    /// resolves to a concrete path-component string
+    /// (`Xform`, `Material`, `xformOp:transform`, …).
+    pub element_token_index: u32,
+    /// Buffer-2 value, verbatim: the signed element-token word. Its
+    /// **magnitude** packs the token index (see
+    /// [`Self::element_token_index`]); its **sign** and **low bit** are
+    /// two further flags (a prim-vs-property / target-path
+    /// discriminator) whose exact meaning the trace doc does not pin, so
+    /// the raw word is preserved for the eventual tree-walk consumer
+    /// rather than interpreted here.
+    pub element_token_word: i32,
+    /// Buffer-3 value, verbatim: the sibling/child tree-walk navigation
+    /// "jump" offset for this node (`0` is by far the most common on the
+    /// fixture; `-1`, `-2`, and positive offsets also occur). The walk
+    /// that consumes these to reconstruct full `SdfPath` strings is
+    /// deferred (gap-tracker §1 / Round B).
+    pub jump: i32,
+}
+
+impl PathElement {
+    /// Resolve [`Self::element_token_index`] against a §4.1 TOKENS pool
+    /// (e.g. the `Vec<String>` from [`TokensSection::decode`]),
+    /// returning this element's name token, or `None` if the index is
+    /// past the end of `tokens`.
+    ///
+    /// On the Elephant fixture every element resolves (the index is in
+    /// range for all `num_paths` elements), so `None` signals a corrupt
+    /// or mismatched buffer pairing rather than a normal outcome.
+    pub fn element_token<'a>(&self, tokens: &'a [String]) -> Option<&'a str> {
+        tokens
+            .get(self.element_token_index as usize)
+            .map(|s| s.as_str())
     }
 }
 
@@ -3162,6 +3318,40 @@ impl UsdcFile {
             });
         }
         Ok(out)
+    }
+
+    /// Decode the §4.5 `PATHS` section's three parallel buffers into one
+    /// [`PathElement`] per tree-walk slot — the file-level convenience
+    /// that pulls the `PATHS` section bytes out of `self` and forwards
+    /// to [`PathsSection::decode_path_elements`].
+    ///
+    /// This is the structural decode of the namespace-path table: each
+    /// returned [`PathElement`] carries its target slot index (a
+    /// permutation of `0..numPaths`), the §4.1 TOKENS pool index of its
+    /// element-name token, and the raw element-token / jump words the
+    /// (deferred) tree walk consumes. See
+    /// [`PathsSection::decode_path_elements`] for the per-buffer
+    /// observer grounding and the precise deferral boundary.
+    ///
+    /// `file_bytes` must be the same buffer [`UsdcFile::parse`] was
+    /// called on. The `PATHS` section is decoded once.
+    ///
+    /// On the committed Elephant fixture this returns 248 elements whose
+    /// `target_index` values are an exact permutation of `0..248`.
+    ///
+    /// Errors:
+    ///
+    /// * [`Error::InvalidData`](crate::Error) if the `PATHS` section is
+    ///   absent from the TOC or fails to decode,
+    /// * [`Error::InvalidData`] propagated from
+    ///   [`PathsSection::decode_path_elements`].
+    pub fn decode_path_elements(&self, file_bytes: &[u8]) -> Result<Vec<PathElement>> {
+        let paths_bytes = self
+            .section_bytes(SectionName::Paths, file_bytes)
+            .ok_or_else(|| {
+                invalid("USDC §4.5: PATHS section absent — cannot decode path elements")
+            })?;
+        PathsSection::parse(paths_bytes)?.decode_path_elements()
     }
 
     /// Resolve the §4.2 `STRINGS` pool into its concrete UTF-8 atoms —

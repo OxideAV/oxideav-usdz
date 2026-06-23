@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- usdc §4.5: **observer-grounded `PATHS` structural join** —
+  `PathsSection::decode_path_elements` (+ the file-level
+  `UsdcFile::decode_path_elements` convenience) decode the section's
+  three §3b integer buffers into one typed `PathElement` per tree-walk
+  slot. Empirically parsing the committed Elephant fixture's buffers
+  pins their per-element roles, tighter than the trace doc's "holds"
+  column: buffer 1 is the **target-slot permutation** (an exact
+  permutation of `0..numPaths`, *not* token indices — that was the
+  source of the old "values exceed the TOKENS pool" caveat), buffer 2 is
+  the **element-token word** (`abs(word) >> 1` is an in-range §4.1
+  TOKENS index for all 248 elements, resolving to `Xform` / `Material` /
+  `xformOp:transform` / …, with the sign + low bit preserved verbatim as
+  deferred flags), and buffer 3 is the **jump** offset. `PathElement`
+  exposes `target_index`, `element_token_index`, `element_token_word`,
+  `jump`, and an `element_token(&tokens)` resolver. The decode stops at
+  the verified parallel-array join — the tree **walk** that reconstructs
+  full `SdfPath` strings stays deferred (gap-tracker §1 / Round B) since
+  the trace doc does not pin the descent arithmetic, so no un-grounded
+  path string is fabricated. New fixture test asserts 248 elements, the
+  `target_index` permutation, every `element_token_index` in pool range,
+  and three spot-checked element names + jump words.
+
 - usdc §4.3: **typed `ValueRegion` accessors** — `as_f32` / `as_i32` /
   `as_u32` / `as_bool` bit-cast an inline payload, and
   `array_elements_exact(width)` trims an uncompressed array's element
