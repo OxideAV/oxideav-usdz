@@ -383,8 +383,9 @@ fn write_layer_metadata(w: &mut Out, scene: &Scene3D) {
             // line below when a resolution survived.
             continue;
         }
-        let formatted = format_metadata_assignment(k, v);
-        writeln!(w.s, "    {formatted}").unwrap();
+        for formatted in format_metadata_lines(k, v) {
+            writeln!(w.s, "    {formatted}").unwrap();
+        }
     }
     let default_prim = resolved_default_prim.or_else(|| root_names.first().cloned());
     if let Some(name) = default_prim {
@@ -590,7 +591,7 @@ fn extract_composition_arc_lines(
         if matches!(k.as_str(), "variants" | "variantSets") {
             continue;
         }
-        out.push(format_metadata_assignment(k, v));
+        out.extend(format_metadata_lines(k, v));
     }
     out
 }
@@ -801,6 +802,19 @@ fn render_value(v: &crate::usda::Value) -> Option<String> {
         }
         V::AssetWithPath { asset, prim_path } => format!("@{asset}@<{prim_path}>"),
         V::Raw(s) => s.clone(),
+        // A list-edited field has no single literal body; render the
+        // strongest authored sublist as a fallback for callers that
+        // want one value. Multi-operator emission goes through
+        // `format_metadata_lines` instead.
+        V::ListOp(list) => {
+            let sub = list
+                .additive_in_strength_order()
+                .map(|(_, v)| v)
+                .next()
+                .or(list.deleted.as_ref())
+                .or(list.reordered.as_ref())?;
+            return render_value(sub);
+        }
         V::None => return None,
     })
 }
@@ -1834,6 +1848,14 @@ fn format_metadata_value(value: &Value) -> String {
         }
         Value::AssetWithPath { asset, prim_path } => format!("@{asset}@<{prim_path}>"),
         Value::Dict(map) => format_metadata_dict(map),
+        // Single-body fallback (multi-operator emission lives in
+        // `format_metadata_lines`): render the strongest authored
+        // sublist body.
+        Value::ListOp(list) => list
+            .entries()
+            .next()
+            .map(|(_, v)| format_metadata_value(v))
+            .unwrap_or_default(),
         Value::Raw(s) => s.clone(),
         Value::None => String::new(),
     }
@@ -1880,6 +1902,11 @@ fn guess_usda_type(v: &Value) -> &'static str {
         Value::Tuple(_) => "double3",
         Value::Array(_) => "string[]",
         Value::Dict(_) => "dictionary",
+        Value::ListOp(list) => list
+            .entries()
+            .next()
+            .map(|(_, v)| guess_usda_type(v))
+            .unwrap_or("token"),
         Value::Raw(_) | Value::None => "token",
     }
 }
@@ -1900,16 +1927,39 @@ fn escape_usda_string(s: &str) -> String {
     out
 }
 
-/// Build a `KEY = VALUE` assignment line for emission inside a
-/// USDA `( ... )` metadata block.  Honours the round-9
-/// [`PREPEND_LIST_EDIT_KEYS`] convention for composition arcs.
-fn format_metadata_assignment(key: &str, value: &Value) -> String {
+/// Build the metadata assignment line(s) for one `( ... )` block entry.
+///
+/// * A [`Value::ListOp`] emits one `OP key = VALUE` line per populated
+///   sublist — `prepend` / `append` / `delete` / `reorder` — and an
+///   unqualified `key = VALUE` line for the explicit (reset) sublist,
+///   so a `delete references = @x@` round-trips as a *delete* rather
+///   than being silently turned into a `prepend` add.
+/// * A non-list-op value on a composition-arc key still honours the
+///   [`PREPEND_LIST_EDIT_KEYS`] convention (emit with `prepend`) so
+///   pre-existing authored opinions and writer-synthesised arcs keep
+///   the LIVRPS-strength spelling.
+/// * Every other field emits a single bare `key = VALUE` line.
+fn format_metadata_lines(key: &str, value: &Value) -> Vec<String> {
+    if let Value::ListOp(list) = value {
+        let mut lines = Vec::new();
+        for (op, sublist) in list.entries() {
+            let body = format_metadata_value(sublist);
+            match op.keyword() {
+                Some(kw) => lines.push(format!("{kw} {key} = {body}")),
+                None => lines.push(format!("{key} = {body}")),
+            }
+        }
+        if lines.is_empty() {
+            lines.push(format!("{key} = {}", format_metadata_value(value)));
+        }
+        return lines;
+    }
+
     let body = format_metadata_value(value);
-    let prepend = PREPEND_LIST_EDIT_KEYS.contains(&key);
-    if prepend {
-        format!("prepend {key} = {body}")
+    if PREPEND_LIST_EDIT_KEYS.contains(&key) {
+        vec![format!("prepend {key} = {body}")]
     } else {
-        format!("{key} = {body}")
+        vec![format!("{key} = {body}")]
     }
 }
 

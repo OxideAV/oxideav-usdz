@@ -107,12 +107,24 @@ def Xform "Root" (
     let layer = parse(src).expect("parse references arc");
     let root = &layer.prims[0];
     let refs = root.metadata.get("references").expect("references key");
-    match refs {
+    // `prepend references` parses into a list-op whose `prepended`
+    // sublist carries the authored `AssetWithPath`. The operator is no
+    // longer discarded, so the field is a `ListOp` rather than a bare
+    // value.
+    match prepended_sublist(refs) {
         Value::AssetWithPath { asset, prim_path } => {
             assert_eq!(asset, "./asset.usd");
             assert_eq!(prim_path, "/Asset");
         }
         other => panic!("expected AssetWithPath, got {other:?}"),
+    }
+}
+
+/// Pull the `prepended` sublist out of a list-edited metadata field.
+fn prepended_sublist(v: &Value) -> &Value {
+    match v {
+        Value::ListOp(list) => list.prepended.as_ref().expect("prepended sublist present"),
+        other => other,
     }
 }
 
@@ -129,7 +141,7 @@ def Xform "Root" (
     let layer = parse(src).expect("parse payload arc");
     let root = &layer.prims[0];
     let p = root.metadata.get("payload").expect("payload key");
-    match p {
+    match prepended_sublist(p) {
         Value::AssetWithPath { asset, prim_path } => {
             assert_eq!(asset, "./payload.usd");
             assert_eq!(prim_path, "/Inner");
@@ -151,7 +163,7 @@ def Xform "Root" (
     let layer = parse(src).expect("parse asset-only reference");
     let root = &layer.prims[0];
     let refs = root.metadata.get("references").expect("references key");
-    match refs {
+    match prepended_sublist(refs) {
         Value::Asset(s) => assert_eq!(s, "./whole.usd"),
         other => panic!("expected Asset, got {other:?}"),
     }
@@ -341,13 +353,17 @@ over "Model" {
         .metadata
         .get("references")
         .expect("references metadata on asset1");
-    match refs {
+    match prepended_sublist(refs) {
         Value::Asset(s) => assert_eq!(s, "./Asset1.usda"),
         other => panic!("expected Asset, got {other:?}"),
     }
     let asset2 = vset.get("asset2").expect("asset2 variant");
-    match asset2.metadata.get("references") {
-        Some(Value::Asset(s)) => assert_eq!(s, "./Asset2.usda"),
+    let refs2 = asset2
+        .metadata
+        .get("references")
+        .expect("references metadata on asset2");
+    match prepended_sublist(refs2) {
+        Value::Asset(s) => assert_eq!(s, "./Asset2.usda"),
         other => panic!("expected Asset, got {other:?}"),
     }
 }

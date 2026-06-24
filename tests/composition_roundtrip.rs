@@ -36,6 +36,16 @@ use oxideav_usdz::UsdzDecoder;
 
 use oxideav_mesh3d::Mesh3DDecoder;
 
+/// Composition-arc fields (`references` / `payload` / `apiSchemas`)
+/// re-emit with the `prepend` list-edit operator and therefore re-parse
+/// into a list-op. Unwrap the `prepended` sublist for assertions.
+fn prepended_sublist(v: &Value) -> &Value {
+    match v {
+        Value::ListOp(list) => list.prepended.as_ref().expect("prepended sublist present"),
+        other => other,
+    }
+}
+
 fn decode_roundtrip_emit(usda: &str) -> String {
     let archive = build_usdz(&[UsdzEntry {
         name: "scene.usda",
@@ -142,7 +152,7 @@ def Xform "Root" (
         .metadata
         .get("references")
         .expect("references opinion on re-parse");
-    match refs {
+    match prepended_sublist(refs) {
         Value::AssetWithPath { asset, prim_path } => {
             assert_eq!(asset, "./asset.usd");
             assert_eq!(prim_path, "/Asset");
@@ -175,8 +185,12 @@ def Xform "Root" (
         .iter()
         .find(|p| p.name == "Root")
         .expect("Root prim");
-    match root.metadata.get("payload") {
-        Some(Value::Asset(s)) => assert_eq!(s, "./payload.usd"),
+    let payload = root
+        .metadata
+        .get("payload")
+        .expect("payload opinion on re-parse");
+    match prepended_sublist(payload) {
+        Value::Asset(s) => assert_eq!(s, "./payload.usd"),
         other => panic!("expected Asset, got {other:?}"),
     }
 }
@@ -267,7 +281,9 @@ def Xform "Root" (
         .metadata
         .get("apiSchemas")
         .expect("apiSchemas opinion on re-parse");
-    let seq = api.as_seq().expect("apiSchemas is an array");
+    let seq = prepended_sublist(api)
+        .as_seq()
+        .expect("apiSchemas is an array");
     assert_eq!(seq.len(), 1);
     match &seq[0] {
         Value::String(s) => assert_eq!(s, "MaterialBindingAPI"),

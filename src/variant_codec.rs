@@ -310,6 +310,21 @@ fn encode_value(v: &Value) -> JValue {
             JValue::Object(o)
         }
         Value::Raw(s) => tagged("Raw", JValue::String(s.clone())),
+        Value::ListOp(list) => {
+            let mut o = JMap::new();
+            o.insert("t".into(), JValue::String("ListOp".into()));
+            let mut put = |k: &str, sub: &Option<Value>| {
+                if let Some(val) = sub {
+                    o.insert(k.into(), encode_value(val));
+                }
+            };
+            put("prepended", &list.prepended);
+            put("appended", &list.appended);
+            put("deleted", &list.deleted);
+            put("explicit", &list.explicit);
+            put("reordered", &list.reordered);
+            JValue::Object(o)
+        }
         Value::None => {
             let mut o = JMap::new();
             o.insert("t".into(), JValue::String("None".into()));
@@ -338,6 +353,16 @@ fn decode_value(v: &JValue) -> Value {
             prim_path: read_str(obj, "prim_path"),
         },
         "Raw" => Value::Raw(read_str(obj, "v")),
+        "ListOp" => {
+            let sub = |k: &str| obj.get(k).map(decode_value);
+            Value::ListOp(Box::new(crate::usda::ListOp {
+                prepended: sub("prepended"),
+                appended: sub("appended"),
+                deleted: sub("deleted"),
+                explicit: sub("explicit"),
+                reordered: sub("reordered"),
+            }))
+        }
         "None" => Value::None,
         _ => Value::None,
     }

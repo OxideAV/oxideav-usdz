@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- usda: **list-edit-operator-aware composition arcs**. The USDA parser
+  now captures the `prepend` / `append` / `delete` / `add` / `reorder`
+  list-edit operator on composition-arc and list-valued metadata
+  fields (`references`, `payload`, `inherits`, `specializes`,
+  `apiSchemas`, `subLayers`, …) instead of discarding it. Each
+  list-edited field parses into a new `Value::ListOp` that keeps the
+  *prepended* / *appended* / *deleted* / *explicit* / *reordered*
+  sublists separate (mirroring USD's `SdfListOp`), so several authored
+  statements of the same field on one prim merge losslessly. The
+  composition engine flattens the additive sublists in LIVRPS strength
+  order — *prepended* → *explicit* → *appended* — and then removes any
+  `delete`-authored target. A `delete references = @x@` is now an actual
+  **removal** rather than being silently treated as an add, and the
+  writer re-emits the operator the author wrote (multiple operators on
+  one field round-trip as separate lines) rather than forcing every arc
+  to `prepend`. The variant side-channel stash and the JSON extras view
+  preserve the full per-operator structure.
+
 - usdc §4.5/§5: **PATHS↔SPECS namespace join** giving every spec its
   leaf component name. `UsdcFile::decode_path_elements_by_slot` reorders
   the §4.5 path elements into `target_index` (= slot) order — the same

@@ -270,9 +270,9 @@ fn compose_sublayers(
     visited: &mut std::collections::HashSet<String>,
     composed_out: &mut Vec<String>,
 ) -> Result<()> {
-    let raw = match target.metadata.get("subLayers") {
-        Some(Value::Array(items)) => items.clone(),
-        _ => return Ok(()),
+    let raw = match listedited_items(target.metadata.get("subLayers")) {
+        Some(items) => items,
+        None => return Ok(()),
     };
     for item in &raw {
         let path = match item {
@@ -757,9 +757,27 @@ fn collect_class_arc_targets(v: Option<&Value>) -> Vec<String> {
             _ => None,
         }
     }
+    fn flat(v: &Value) -> Vec<String> {
+        match v {
+            Value::Array(items) => items.iter().filter_map(one).collect(),
+            other => one(other).into_iter().collect(),
+        }
+    }
     match v {
-        Some(Value::Array(items)) => items.iter().filter_map(one).collect(),
-        Some(other) => one(other).into_iter().collect(),
+        // `inherits` / `specializes` are list-edited too: flatten the
+        // additive sublists in strength order, then drop deleted paths.
+        Some(Value::ListOp(list)) => {
+            let mut out: Vec<String> = Vec::new();
+            for (_, sublist) in list.additive_in_strength_order() {
+                out.extend(flat(sublist));
+            }
+            if let Some(del) = list.deleted.as_ref() {
+                let deleted = flat(del);
+                out.retain(|p| !deleted.contains(p));
+            }
+            out
+        }
+        Some(other) => flat(other),
         None => Vec::new(),
     }
 }
@@ -781,6 +799,39 @@ fn resolve_in_layer_path<'a>(roots: &'a [Prim], path: &str) -> Option<&'a Prim> 
     Some(cur)
 }
 
+/// Flatten a list-edited array-valued metadata field (e.g.
+/// `subLayers`) to its effective ordered items: the additive sublists
+/// in strength order with any `delete`-authored items removed. A bare
+/// `Array` value passes through; a non-array / absent value yields
+/// `None`.
+fn listedited_items(v: Option<&Value>) -> Option<Vec<Value>> {
+    fn as_items(v: &Value) -> Vec<Value> {
+        match v {
+            Value::Array(items) => items.clone(),
+            other => vec![other.clone()],
+        }
+    }
+    match v {
+        Some(Value::Array(items)) => Some(items.clone()),
+        Some(Value::ListOp(list)) => {
+            let mut out: Vec<Value> = Vec::new();
+            for (_, sublist) in list.additive_in_strength_order() {
+                out.extend(as_items(sublist));
+            }
+            if let Some(del) = list.deleted.as_ref() {
+                let deleted = as_items(del);
+                out.retain(|item| {
+                    !deleted
+                        .iter()
+                        .any(|d| d.as_text().is_some() && d.as_text() == item.as_text())
+                });
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
 /// A single resolved composition-arc target.
 struct ArcTarget {
     /// `@...@` asset path portion.
@@ -791,10 +842,16 @@ struct ArcTarget {
 }
 
 /// Flatten a `references` / `payload` metadata value into an ordered
-/// list of [`ArcTarget`]s. A scalar `Asset` / `AssetWithPath` yields
-/// one target; an `Array` of them yields one per element (USD list
-/// order = strength order). Any other shape (or a bare path-only
-/// arc) yields nothing.
+/// list of [`ArcTarget`]s, honouring USD list-edit semantics.
+///
+/// * A bare `Asset` / `AssetWithPath` (or an `Array` of them) yields
+///   one target per entry, in authoring order (USD list order =
+///   strength order).
+/// * A [`Value::ListOp`] flattens its additive sublists in strength
+///   order — *prepended* (strongest), then *explicit*, then *appended*
+///   — and then removes any target named in the *deleted* sublist.
+///   This makes `delete references = @x@` an actual removal rather
+///   than the round-1 behaviour of treating every list-op the same.
 fn collect_arc_targets(v: Option<&Value>) -> Vec<ArcTarget> {
     fn one(v: &Value) -> Option<ArcTarget> {
         match v {
@@ -809,9 +866,30 @@ fn collect_arc_targets(v: Option<&Value>) -> Vec<ArcTarget> {
             _ => None,
         }
     }
+    fn flat(v: &Value) -> Vec<ArcTarget> {
+        match v {
+            Value::Array(items) => items.iter().filter_map(one).collect(),
+            other => one(other).into_iter().collect(),
+        }
+    }
     match v {
-        Some(Value::Array(items)) => items.iter().filter_map(one).collect(),
-        Some(other) => one(other).into_iter().collect(),
+        Some(Value::ListOp(list)) => {
+            let mut out: Vec<ArcTarget> = Vec::new();
+            for (_, sublist) in list.additive_in_strength_order() {
+                out.extend(flat(sublist));
+            }
+            // Remove any deleted targets (matched on asset + prim_path).
+            if let Some(del) = list.deleted.as_ref() {
+                let deleted = flat(del);
+                out.retain(|t| {
+                    !deleted
+                        .iter()
+                        .any(|d| d.asset == t.asset && d.prim_path == t.prim_path)
+                });
+            }
+            out
+        }
+        Some(other) => flat(other),
         None => Vec::new(),
     }
 }
@@ -2078,6 +2156,20 @@ fn value_to_json(v: &Value) -> Option<serde_json::Value> {
         // for the JSON view; consumers wanting the parts can walk
         // the prim tree directly.
         Value::AssetWithPath { asset, prim_path } => J::String(format!("{asset}<{prim_path}>")),
+        // A list-edited field flattens to a JSON object keyed by
+        // operator so an extras consumer can still see each authored
+        // sublist (`{"prepend": …, "delete": …}`).
+        Value::ListOp(list) => {
+            let mut obj = serde_json::Map::new();
+            for (op, sublist) in list.entries() {
+                if let Some(keyword) = op.keyword().or(Some("explicit")) {
+                    if let Some(j) = value_to_json(sublist) {
+                        obj.insert(keyword.to_string(), j);
+                    }
+                }
+            }
+            J::Object(obj)
+        }
         Value::None => J::Null,
     })
 }

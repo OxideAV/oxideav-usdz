@@ -304,11 +304,176 @@ pub enum Value {
         /// `<...>` portion (empty when omitted).
         prim_path: String,
     },
+    /// A list-edited metadata field — `prepend references = ...`,
+    /// `append references = ...`, `delete references = ...`,
+    /// `add references = ...`, `reorder references = ...`, or an
+    /// *explicit* (unqualified) `references = ...` reset.
+    ///
+    /// USDA composition-arc fields (`references`, `payload`,
+    /// `inherits`, `specializes`, `apiSchemas`, `variantSets`, …) are
+    /// **list-edited**: the same field can be authored several times in
+    /// one prim block with different operators, and each operator
+    /// contributes to a different sublist of the resolved
+    /// `SdfListOp`. The strength order this crate honours is
+    /// *prepended* (strongest) → *explicit* → *appended* → with
+    /// *deleted* entries removed from whatever the additive sublists
+    /// produced. Capturing the operator (instead of discarding it, as
+    /// the round-1 parser did) is what lets composition treat
+    /// `delete references = @x@` as a *removal* rather than an *add*,
+    /// and lets the writer re-emit the operator the author wrote.
+    ///
+    /// The wrapped [`ListOp`] keeps each sublist separate so multiple
+    /// authored operators on the same field merge losslessly.
+    ListOp(Box<ListOp>),
     /// Anything we didn't recognise; preserved verbatim.
     Raw(String),
     /// Empty value — attribute declared but not assigned (`token
     /// outputs:surface`).
     None,
+}
+
+/// A single USD list-edit operator keyword.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListEditOp {
+    /// `prepend` — strongest additive sublist (composes ahead of
+    /// explicit + appended entries).
+    Prepend,
+    /// `append` — weakest additive sublist (composes behind explicit +
+    /// prepended entries).
+    Append,
+    /// `delete` — removes the named targets from whatever the additive
+    /// sublists produced.
+    Delete,
+    /// `add` — the legacy additive operator; treated as an `append`
+    /// for composition (it adds at the back if absent).
+    Add,
+    /// `reorder` — reorders existing entries without adding; carried
+    /// through for round-trip but does not change the composed target
+    /// set.
+    Reorder,
+    /// No operator keyword — an *explicit* (reset) authoring that
+    /// replaces any weaker opinion's list outright.
+    Explicit,
+}
+
+impl ListEditOp {
+    /// Parse the leading keyword of a list-edited field. Returns
+    /// [`ListEditOp::Explicit`] for any non-keyword (the unqualified
+    /// reset form).
+    pub fn from_keyword(word: &str) -> Self {
+        match word {
+            "prepend" => Self::Prepend,
+            "append" => Self::Append,
+            "delete" => Self::Delete,
+            "add" => Self::Add,
+            "reorder" => Self::Reorder,
+            _ => Self::Explicit,
+        }
+    }
+
+    /// The USDA keyword for this operator, or `None` for
+    /// [`ListEditOp::Explicit`] (which is emitted bare).
+    pub fn keyword(self) -> Option<&'static str> {
+        match self {
+            Self::Prepend => Some("prepend"),
+            Self::Append => Some("append"),
+            Self::Delete => Some("delete"),
+            Self::Add => Some("add"),
+            Self::Reorder => Some("reorder"),
+            Self::Explicit => None,
+        }
+    }
+}
+
+/// A list-edited metadata field, mirroring USD's `SdfListOp`: each
+/// operator's authored value is kept in its own sublist so several
+/// operators on the same field (`delete references = @a@` followed by
+/// `prepend references = @b@`) merge losslessly. Entries are stored in
+/// authoring order within each sublist.
+#[derive(Clone, Debug, Default)]
+pub struct ListOp {
+    /// `prepend`-authored value (the strongest additive sublist).
+    pub prepended: Option<Value>,
+    /// `append`/`add`-authored value (the weakest additive sublist).
+    pub appended: Option<Value>,
+    /// `delete`-authored value (targets removed from the additive
+    /// result).
+    pub deleted: Option<Value>,
+    /// Unqualified (explicit reset) authored value.
+    pub explicit: Option<Value>,
+    /// `reorder`-authored value (round-trip only).
+    pub reordered: Option<Value>,
+}
+
+impl ListOp {
+    /// Build a single-operator list-op from one authored value.
+    pub fn single(op: ListEditOp, value: Value) -> Self {
+        let mut out = Self::default();
+        out.set(op, value);
+        out
+    }
+
+    /// Store `value` under `op`'s sublist, merging additively with any
+    /// value already present (multiple authored statements of the same
+    /// operator concatenate, matching USDA's "the field may appear more
+    /// than once" rule).
+    pub fn set(&mut self, op: ListEditOp, value: Value) {
+        let slot = match op {
+            ListEditOp::Prepend => &mut self.prepended,
+            ListEditOp::Append | ListEditOp::Add => &mut self.appended,
+            ListEditOp::Delete => &mut self.deleted,
+            ListEditOp::Explicit => &mut self.explicit,
+            ListEditOp::Reorder => &mut self.reordered,
+        };
+        *slot = Some(match slot.take() {
+            Some(existing) => merge_listop_values(existing, value),
+            None => value,
+        });
+    }
+
+    /// Every populated sublist with its operator, in a stable order
+    /// (prepend, explicit, append, delete, reorder). Used for the JSON
+    /// extras view and round-trip emission.
+    pub fn entries(&self) -> impl Iterator<Item = (ListEditOp, &Value)> {
+        [
+            (ListEditOp::Prepend, self.prepended.as_ref()),
+            (ListEditOp::Explicit, self.explicit.as_ref()),
+            (ListEditOp::Append, self.appended.as_ref()),
+            (ListEditOp::Delete, self.deleted.as_ref()),
+            (ListEditOp::Reorder, self.reordered.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(op, v)| v.map(|val| (op, val)))
+    }
+
+    /// The strength-ordered additive sublists, strongest first:
+    /// prepended, then explicit, then appended. Used by the writer to
+    /// re-emit each authored operator and by composition to flatten the
+    /// list to its resolved target sequence.
+    pub fn additive_in_strength_order(&self) -> impl Iterator<Item = (ListEditOp, &Value)> {
+        [
+            (ListEditOp::Prepend, self.prepended.as_ref()),
+            (ListEditOp::Explicit, self.explicit.as_ref()),
+            (ListEditOp::Append, self.appended.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(op, v)| v.map(|val| (op, val)))
+    }
+}
+
+/// Concatenate two list-op sublist values that share an operator. Two
+/// arrays merge into one array; otherwise the values wrap into an
+/// array preserving authoring order.
+fn merge_listop_values(existing: Value, incoming: Value) -> Value {
+    let mut items = match existing {
+        Value::Array(v) => v,
+        other => vec![other],
+    };
+    match incoming {
+        Value::Array(v) => items.extend(v),
+        other => items.push(other),
+    }
+    Value::Array(items)
 }
 
 impl Value {
@@ -507,10 +672,13 @@ fn parse_metadata_block(t: &mut Tokenizer<'_>) -> Result<BTreeMap<String, Value>
         if t.eof() {
             return Err(invalid("unexpected EOF inside `( ... )` metadata block"));
         }
-        // Skip an optional `prepend` / `append` / `delete` /
-        // `add` / `reorder` modifier. These are USD list-edit
-        // operators and only matter to a composition engine; for
-        // our shallow parse we ignore them.
+        // Read an optional `prepend` / `append` / `delete` / `add` /
+        // `reorder` list-edit operator. These select which sublist of
+        // an `SdfListOp`-style field the authored value contributes to
+        // (a `delete` is a removal, not an add) and must be preserved
+        // so composition resolves the right target set and the writer
+        // re-emits the operator the author wrote.
+        let mut list_edit_op: Option<ListEditOp> = None;
         let saved = t.pos;
         if let Some(word) = peek_ident(t) {
             if matches!(
@@ -519,6 +687,7 @@ fn parse_metadata_block(t: &mut Tokenizer<'_>) -> Result<BTreeMap<String, Value>
             ) {
                 let _ = read_ident(t)?;
                 t.skip_trivia();
+                list_edit_op = Some(ListEditOp::from_keyword(&word));
             } else {
                 t.pos = saved;
             }
@@ -533,7 +702,58 @@ fn parse_metadata_block(t: &mut Tokenizer<'_>) -> Result<BTreeMap<String, Value>
         }
         t.skip_trivia();
         let value = parse_value(t)?;
-        out.insert(name, value);
+        insert_metadata(&mut out, name, list_edit_op, value);
+    }
+}
+
+/// Insert a parsed metadata field into the block map, folding
+/// list-edited fields into a [`Value::ListOp`].
+///
+/// * A field with an explicit list-edit operator (`prepend` / `append`
+///   / `delete` / `add` / `reorder`) is stored as a [`Value::ListOp`].
+///   If the field was already authored in the same block (with any
+///   operator), the new sublist merges into the existing [`ListOp`] so
+///   `delete references = @a@` then `prepend references = @b@` keep
+///   both opinions.
+/// * A field with **no** operator is stored as the bare value, unless
+///   the field already holds a [`Value::ListOp`] — in which case the
+///   unqualified statement is its *explicit* (reset) sublist.
+fn insert_metadata(
+    out: &mut BTreeMap<String, Value>,
+    name: String,
+    op: Option<ListEditOp>,
+    value: Value,
+) {
+    match (op, out.remove(&name)) {
+        // First/only authoring, no operator → plain value.
+        (None, None) => {
+            out.insert(name, value);
+        }
+        // Operator present → fold into a ListOp.
+        (Some(op), prev) => {
+            let mut list = match prev {
+                Some(Value::ListOp(existing)) => *existing,
+                Some(other) => {
+                    // A prior unqualified authoring becomes the
+                    // explicit sublist.
+                    ListOp::single(ListEditOp::Explicit, other)
+                }
+                None => ListOp::default(),
+            };
+            list.set(op, value);
+            out.insert(name, Value::ListOp(Box::new(list)));
+        }
+        // No operator but the field already holds a ListOp → the
+        // unqualified value is the explicit (reset) sublist.
+        (None, Some(Value::ListOp(mut existing))) => {
+            existing.set(ListEditOp::Explicit, value);
+            out.insert(name, Value::ListOp(existing));
+        }
+        // No operator, prior plain value → last write wins (the
+        // round-1 behaviour for non-list-edited keys).
+        (None, Some(_)) => {
+            out.insert(name, value);
+        }
     }
 }
 

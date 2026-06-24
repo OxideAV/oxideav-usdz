@@ -344,7 +344,13 @@ def Xform \"Implicits\" (
         .metadata
         .get(key)
         .unwrap_or_else(|| panic!("expected key {key}; got {:?}", resolved.metadata.keys()));
-    match v {
+    // `prepend references` is preserved as a list-op; the authored
+    // asset lives in the `prepended` sublist.
+    let inner = match v {
+        Value::ListOp(list) => list.prepended.as_ref().expect("prepended sublist"),
+        other => other,
+    };
+    match inner {
         Value::Asset(s) => assert_eq!(s, "./other.usda"),
         other => panic!("expected Value::Asset, got {other:?}"),
     }
