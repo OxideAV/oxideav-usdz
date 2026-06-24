@@ -72,6 +72,21 @@ resolved in the documented strength order. The writer flattens the
 composed tree into a single output layer rather than preserving the
 multi-file or class-hierarchy authoring.
 
+#### List-edit operators
+
+Composition-arc and list-valued metadata fields (`references`,
+`payload`, `inherits`, `specializes`, `apiSchemas`, `subLayers`, …) are
+**list-edited**: the parser captures the `prepend` / `append` /
+`delete` / `add` / `reorder` operator rather than discarding it, and
+several authored statements of the same field on one prim merge
+losslessly into a single `SdfListOp`-style value with separate
+*prepended* / *appended* / *deleted* / *explicit* / *reordered*
+sublists. Composition flattens the additive sublists in LIVRPS strength
+order (*prepended* → *explicit* → *appended*) and then removes any
+`delete`-authored target, so `delete references = @x@` is an actual
+removal rather than being treated as an add. The writer re-emits each
+authored operator on its own line.
+
 ## USDC (binary crate file) — partial reader + structural writer
 
 A clean-room USDC reader is in progress, with a matching **structural
