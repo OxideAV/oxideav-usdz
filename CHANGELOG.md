@@ -25,7 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writer re-emits the operator the author wrote (multiple operators on
   one field round-trip as separate lines) rather than forcing every arc
   to `prepend`. The variant side-channel stash and the JSON extras view
-  preserve the full per-operator structure.
+  preserve the full per-operator structure. A new
+  `tests/listop_composition.rs` pins the operator capture/merge, the
+  `delete`-cancels-`prepend` composition behaviour, and the writer's
+  per-operator re-emission end-to-end.
 
 - usdc §4.5/§5: **PATHS↔SPECS namespace join** giving every spec its
   leaf component name. `UsdcFile::decode_path_elements_by_slot` reorders
