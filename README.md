@@ -26,10 +26,20 @@ let out   = UsdzEncoder::new().encode(&scene)?;
 
 - **PKZIP central-directory walk** — STORED-only entries (the USDZ spec
   rejects any compression method); every payload offset is verified
-  against the 64-byte alignment requirement.
+  against the 64-byte alignment requirement. **ZIP64 is rejected at the
+  boundary** — the EOCD sentinels (`0xFFFF` entry count, `0xFFFFFFFF`
+  central-directory size/offset) surface a precise *"USDZ forbids
+  ZIP64"* error instead of dereferencing a sentinel as a literal offset,
+  and the count of central-directory records walked is validated against
+  the EOCD's declared total.
 - **Writer** emits a byte-faithful archive: STORED entries only, every
   payload offset padded (via the LFH `extra` field) onto a 64-byte
-  boundary, per-entry CRC32, correct central directory + EOCD.
+  boundary, per-entry CRC32, correct central directory + EOCD. The
+  fallible `Writer::try_add_stored` / `try_finish` surface returns
+  `Unsupported` when an entry or the assembled archive would cross the
+  ZIP64 boundary USDZ forbids (a `≥ 2³²`-byte payload/offset or `> 2¹⁶-1`
+  entries) rather than silently truncating to a corrupt archive; the
+  encoder routes through it.
 - **CRC-32 integrity verification** on read.
 - **USDZ → `Scene3D` → USDZ pass-through** — texture and audio assets
   whose source is a `zip-stored` `RawStorage` (exactly what this crate's
@@ -123,9 +133,18 @@ writer** (`usdc_writer::CrateImage`). Implemented so far:
   offset — all bounds-checked against the value region `[0x58,
   toc_offset)`. The fixture's inline `0x4009` rep decodes to the `float`
   `60.0` and its `0x0f` `double[]` array reads back with `1.0` as element
-  0. Only the *naming* of the raw `type_code()` byte (which code is
-  `float`, which is `int[]`) stays deferred — that enumeration is
-  GAP-TRACKER Round B.
+  0. For the **integer** compressed-array class,
+  `UsdcFile::decode_compressed_int_array` runs the documented §3a → LZ4 →
+  §3b path on the compressed region (bounded by `int_coded_max_len`) and
+  returns the `count` recovered `i32`s; `ValueRegion::array_count` /
+  `compressed_region_offset` expose the array shape uniformly. The
+  compressed float/double/half element coding is a *separate* (deferred)
+  encoding — a real-fixture test pins that the Elephant's compressed
+  arrays are not the §3b integer form, and `decode_compressed_int_array`
+  fails cleanly on them rather than fabricating integers (the caller must
+  establish integrality first). Only the *naming* of the raw
+  `type_code()` byte (which code is `float`, which is `int[]`) stays
+  deferred — that enumeration is GAP-TRACKER Round B.
 - The STRINGS → TOKENS and field-name TOKENS pool resolution and the
   full §5 SPECS → FIELDSETS → FIELDS join (`decode_specs` /
   `decode_named_specs`), which materialises all 248 Elephant spec rows
