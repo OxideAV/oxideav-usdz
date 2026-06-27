@@ -57,7 +57,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expose the array shape uniformly. Four new tests round-trip a
   synthesised §3a/§3b region end-to-end through `value_region` +
   `decode_compressed_int_array`, plus the `count == 0`, non-compressed-
-  region-rejected, and accessor cases.
+  region-rejected, and accessor cases. A real-fixture test against the
+  committed Elephant `.usdc` pins the grounded limit: its
+  compressed-array reps are **not** the §3b integer form (the value-
+  region compressed float/double element coding is a separate, deferred
+  Round-B encoding the trace does not document), and
+  `decode_compressed_int_array` correctly *fails cleanly* on them rather
+  than fabricating integers — the empirical backing for the method's
+  caller-obligation contract.
 
 - usda: **list-edit-operator-aware composition arcs**. The USDA parser
   now captures the `prepend` / `append` / `delete` / `add` / `reorder`

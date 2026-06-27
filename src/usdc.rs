@@ -5526,6 +5526,65 @@ mod tests {
     }
 
     #[test]
+    fn real_fixture_compressed_arrays_are_not_3b_integer_form() {
+        // Grounded observation pinned against real bytes: the Elephant
+        // fixture's compressed-array reps are **not** the §3b
+        // integer-coded form. The trace doc §3b documents §3a/§3b only
+        // for the index tables (TOKENS / FIELDS-names / FIELDSETS /
+        // PATHS / SPECS); the value-region compressed *array* element
+        // coding for float/double/half is a separate encoding the trace
+        // does not pin (it is part of the deferred Round-B type work).
+        //
+        // This test confirms that `decode_compressed_int_array` —
+        // applied (as a caller wrongly might) to these non-integer
+        // compressed reps — **fails cleanly** rather than panicking or
+        // fabricating integers. Each rep's region offset is still inside
+        // the value region (`value_region`'s structural framing holds);
+        // it is only the §3b *element coding* assumption that does not
+        // apply, and the decoder rejects it. This is the empirical
+        // backing for `decode_compressed_int_array`'s documented
+        // caller-obligation: establish integrality before calling.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/3d/usd/fixtures/SoC-ElephantWithMonochord.usdc");
+        if !fixture.exists() {
+            eprintln!("skip: fixture {fixture:?} not present");
+            return;
+        }
+        let bytes = std::fs::read(&fixture).expect("read fixture");
+        let file = UsdcFile::parse(&bytes).expect("parse Elephant USDC");
+        let section = file
+            .section_bytes(SectionName::Fields, &bytes)
+            .expect("FIELDS section present");
+        let sec = FieldsSection::parse(section).expect("parse FIELDS section");
+        let reps = sec.decode_value_reps().expect("value-reps decode");
+
+        let toc = file.bootstrap.toc_offset as usize;
+        let mut checked = 0usize;
+        for r in &reps {
+            if !(r.is_array() && r.is_compressed()) {
+                continue;
+            }
+            let region = file.value_region(*r, &bytes).expect("resolve");
+            let off = region
+                .compressed_region_offset()
+                .expect("compressed region offset present");
+            assert!(
+                off >= BOOTSTRAP_SIZE && off < toc,
+                "compressed region offset {off:#x} inside value region",
+            );
+            assert!(region.array_count().is_some(), "array count present");
+            // The §3b integer decoder must reject these non-integer
+            // compressed arrays cleanly — never panic, never truncate.
+            assert!(
+                file.decode_compressed_int_array(region, &bytes).is_err(),
+                "non-integer compressed array at {off:#x} must fail decode_compressed_int_array",
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "fixture has compressed-array reps to check");
+    }
+
+    #[test]
     fn real_fixture_fields_decode_value_reps_splits_first_words() {
         // Trace doc §4.3 / §5: decode the real Elephant FIELDS reps
         // buffer end-to-end, then split each word into its documented
