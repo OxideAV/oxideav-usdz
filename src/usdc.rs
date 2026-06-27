@@ -3612,6 +3612,76 @@ impl UsdcFile {
         let elements = &file_bytes[off + 8..region_end];
         Ok(ValueRegion::Array { count, elements })
     }
+
+    /// Decode a [`ValueRegion::CompressedArray`] whose elements are a
+    /// §3b **integer-coded** stream, returning the `count` recovered
+    /// `i32`s.
+    ///
+    /// ## Grounding and the caller's obligation
+    ///
+    /// The trace doc §3b documents the compressed-integer encoding —
+    /// the §3a LZ4 wrapper around a `[common-delta preamble][control
+    /// stream][payload]` body — as the form **integer** arrays
+    /// (indices, jumps, counts) take on disk. A compressed *float* /
+    /// *double* / *half* array uses a different element coding the trace
+    /// does not pin, so this method is **only** valid when the rep's
+    /// type code is an integral one. That type code is the deferred
+    /// Round-B fact: this method therefore does not (cannot) assert it
+    /// and the caller must establish integrality before calling. Passing
+    /// a compressed non-integer array yields either a decode error (the
+    /// bytes don't satisfy the §3b control/payload invariant) or
+    /// meaningless integers — never a panic or out-of-bounds read.
+    ///
+    /// This decodes the same §3a → LZ4 → §3b path the section readers
+    /// use ([`decode_int_array`]), reusing [`int_coded_max_len`] as the
+    /// decompression-bomb budget. The compressed region runs from
+    /// `region_offset` to the end of the value region (the `tocOffset`);
+    /// the inner LZ4 block is self-terminating, so the trailing
+    /// value-region bytes after the block are never touched.
+    ///
+    /// Errors with [`Error::InvalidData`](crate::Error) if `region` is
+    /// not a [`ValueRegion::CompressedArray`], if its declared `count`
+    /// does not fit in `usize`, or if the §3a/§3b decode of the region
+    /// fails (truncated block, control/payload disagreement, …).
+    pub fn decode_compressed_int_array(
+        &self,
+        region: ValueRegion<'_>,
+        file_bytes: &[u8],
+    ) -> Result<Vec<i32>> {
+        let ValueRegion::CompressedArray {
+            count,
+            region_offset,
+        } = region
+        else {
+            return Err(invalid(
+                "USDC §4.3 decode_compressed_int_array: region is not a CompressedArray",
+            ));
+        };
+        let count = usize::try_from(count).map_err(|_| {
+            invalid(format!(
+                "USDC §4.3 compressed int array: element count {count} does not fit in usize"
+            ))
+        })?;
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        // The compressed buffer begins at `region_offset` and runs to
+        // the end of the value region (the tail TOC). The §3a leading
+        // chunk-count byte + the self-terminating LZ4 block bound the
+        // actual consumption; the slice merely needs to *contain* the
+        // block, so bounding at the TOC offset is safe.
+        let toc = usize::try_from(self.bootstrap.toc_offset).unwrap_or(usize::MAX);
+        let region_end = toc.min(file_bytes.len());
+        if region_offset >= region_end {
+            return Err(invalid(format!(
+                "USDC §4.3 compressed int array: region offset {region_offset:#x} is at or past the value-region end {region_end:#x}",
+            )));
+        }
+        let buffer_bytes = &file_bytes[region_offset..region_end];
+        let decoded =
+            CompressedBuffer::parse(buffer_bytes)?.decompress(int_coded_max_len(count))?;
+        decode_int_array(&decoded, count)
+    }
 }
 
 /// The resolved on-disk form of a §4.3 [`ValueRep`], produced by
@@ -3716,6 +3786,32 @@ impl ValueRegion<'_> {
                     None
                 }
             }
+            _ => None,
+        }
+    }
+
+    /// The declared element `count` for either array variant
+    /// ([`Array`](ValueRegion::Array) or
+    /// [`CompressedArray`](ValueRegion::CompressedArray)). `None` for
+    /// the scalar variants ([`Inline`](ValueRegion::Inline),
+    /// [`ScalarOffset`](ValueRegion::ScalarOffset)).
+    #[inline]
+    pub fn array_count(&self) -> Option<u64> {
+        match self {
+            ValueRegion::Array { count, .. } | ValueRegion::CompressedArray { count, .. } => {
+                Some(*count)
+            }
+            _ => None,
+        }
+    }
+
+    /// The absolute file offset of the compressed element region for a
+    /// [`CompressedArray`](ValueRegion::CompressedArray). `None` for any
+    /// other variant.
+    #[inline]
+    pub fn compressed_region_offset(&self) -> Option<usize> {
+        match self {
+            ValueRegion::CompressedArray { region_offset, .. } => Some(*region_offset),
             _ => None,
         }
     }
@@ -5229,6 +5325,99 @@ mod tests {
         // Out-of-region offset is rejected.
         let bad = ValueRep::from_raw((ValueRep::FLAG_ARRAY as u64) << 48 | (toc_off + 100));
         assert!(file.value_region(bad, &f).is_err());
+    }
+
+    #[test]
+    fn value_region_array_count_and_compressed_offset_accessors() {
+        let bytes = [0u8; 8];
+        let arr = ValueRegion::Array {
+            count: 9,
+            elements: &bytes,
+        };
+        assert_eq!(arr.array_count(), Some(9));
+        assert_eq!(arr.compressed_region_offset(), None);
+
+        let carr = ValueRegion::CompressedArray {
+            count: 11,
+            region_offset: 0x200,
+        };
+        assert_eq!(carr.array_count(), Some(11));
+        assert_eq!(carr.compressed_region_offset(), Some(0x200));
+
+        assert_eq!(ValueRegion::Inline(0).array_count(), None);
+        assert_eq!(ValueRegion::ScalarOffset(0x58).array_count(), None);
+        assert_eq!(ValueRegion::Inline(0).compressed_region_offset(), None);
+    }
+
+    #[test]
+    fn decode_compressed_int_array_round_trips_3b_stream() {
+        // A compressed-int array region is a §3a buffer wrapping a §3b
+        // int-coded stream — the same path the FIELDSETS/PATHS/SPECS
+        // sections decode, exercised here through value_region +
+        // decode_compressed_int_array end-to-end.
+        let elements: [i32; 7] = [0, 1, 2, 3, 100, -5, 65_000];
+        let int_stream = encode_int_coded(&elements);
+        let compressed = encode_compressed_buffer(&int_stream);
+
+        let mut f = vec![0u8; BOOTSTRAP_SIZE];
+        let carr_off = f.len();
+        f.extend_from_slice(&(elements.len() as u64).to_le_bytes()); // count
+        f.extend_from_slice(&compressed); // §3a/§3b compressed region
+        let toc_off = f.len() as u64;
+        f.extend_from_slice(&0u64.to_le_bytes()); // TOC: sectionCount = 0
+
+        f[0..8].copy_from_slice(b"PXR-USDC");
+        f[8..16].copy_from_slice(&[0, 8, 0, 0, 0, 0, 0, 0]); // v0.8.0
+        f[16..24].copy_from_slice(&toc_off.to_le_bytes());
+        let file = UsdcFile::parse(&f).expect("parse synthetic USDC");
+
+        let rep = ValueRep::from_raw(
+            ((ValueRep::FLAG_ARRAY | ValueRep::FLAG_COMPRESSED) as u64) << 48 | carr_off as u64,
+        );
+        let region = file.value_region(rep, &f).unwrap();
+        assert_eq!(region.array_count(), Some(7));
+        let decoded = file
+            .decode_compressed_int_array(region, &f)
+            .expect("decode compressed int array");
+        assert_eq!(decoded, elements);
+    }
+
+    #[test]
+    fn decode_compressed_int_array_empty_count_is_empty() {
+        // count == 0 short-circuits without touching the region bytes.
+        let mut f = vec![0u8; BOOTSTRAP_SIZE];
+        let carr_off = f.len();
+        f.extend_from_slice(&0u64.to_le_bytes()); // count = 0
+        let toc_off = f.len() as u64;
+        f.extend_from_slice(&0u64.to_le_bytes());
+        f[0..8].copy_from_slice(b"PXR-USDC");
+        f[8..16].copy_from_slice(&[0, 8, 0, 0, 0, 0, 0, 0]);
+        f[16..24].copy_from_slice(&toc_off.to_le_bytes());
+        let file = UsdcFile::parse(&f).expect("parse synthetic USDC");
+        let region = ValueRegion::CompressedArray {
+            count: 0,
+            region_offset: carr_off + 8,
+        };
+        assert_eq!(
+            file.decode_compressed_int_array(region, &f).unwrap(),
+            Vec::<i32>::new()
+        );
+    }
+
+    #[test]
+    fn decode_compressed_int_array_rejects_non_compressed_region() {
+        let f = vec![0u8; BOOTSTRAP_SIZE + 16];
+        let mut f = f;
+        f[0..8].copy_from_slice(b"PXR-USDC");
+        f[8..16].copy_from_slice(&[0, 8, 0, 0, 0, 0, 0, 0]);
+        let toc_off = (BOOTSTRAP_SIZE + 8) as u64;
+        f[16..24].copy_from_slice(&toc_off.to_le_bytes());
+        let file = UsdcFile::parse(&f).expect("parse");
+        let region = ValueRegion::Array {
+            count: 3,
+            elements: &[0u8; 12],
+        };
+        assert!(file.decode_compressed_int_array(region, &f).is_err());
     }
 
     #[test]

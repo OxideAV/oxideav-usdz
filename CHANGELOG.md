@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- usdc §4.3/§3b: **compressed-integer array materialisation**. A
+  `ValueRep` whose `is_compressed` flag rides on `is_array` resolves
+  (via `value_region`) to a `ValueRegion::CompressedArray { count,
+  region_offset }`; the new `UsdcFile::decode_compressed_int_array`
+  runs the documented §3a → LZ4 → §3b path on that region (reusing
+  `int_coded_max_len` as the decompression-bomb budget and
+  `decode_int_array` for the control/payload walk) and returns the
+  `count` recovered `i32`s. This closes the previously surfaced-but-
+  unmaterialised compressed-array half of the value region for the
+  **integer** element classes the trace doc §3b grounds (indices,
+  jumps, counts); compressed float/double/half element codings stay
+  deferred (the type code that distinguishes them is Round B), so the
+  method documents the caller's obligation to establish integrality and
+  fails cleanly — never panics — on a non-integer region. New
+  `ValueRegion::array_count` / `compressed_region_offset` accessors
+  expose the array shape uniformly. Four new tests round-trip a
+  synthesised §3a/§3b region end-to-end through `value_region` +
+  `decode_compressed_int_array`, plus the `count == 0`, non-compressed-
+  region-rejected, and accessor cases.
+
 - usda: **list-edit-operator-aware composition arcs**. The USDA parser
   now captures the `prepend` / `append` / `delete` / `add` / `reorder`
   list-edit operator on composition-arc and list-valued metadata
