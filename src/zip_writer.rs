@@ -19,10 +19,22 @@
 //! through with [`Writer::add_stored`] survive bit-identical from
 //! input to output.
 
+use crate::error::unsupported;
+use crate::Result;
+
 const LFH_SIGNATURE: u32 = 0x04034b50;
 const CDIR_SIGNATURE: u32 = 0x02014b50;
 const EOCD_SIGNATURE: u32 = 0x06054b50;
 const USDZ_ALIGNMENT: u64 = 64;
+
+/// Largest value the classic (non-ZIP64) 4-byte size/offset slots can
+/// hold. USDZ forbids ZIP64 (`GAP-TRACKER.md` §3), so a payload, local
+/// header offset, or central-directory offset at or past this needs a
+/// ZIP64 record this writer will not emit.
+const ZIP_U32_LIMIT: u64 = u32::MAX as u64;
+
+/// Largest entry count the classic 2-byte EOCD slot can hold.
+const ZIP_ENTRY_LIMIT: usize = u16::MAX as usize;
 
 /// Streaming USDZ-aware ZIP writer.
 ///
@@ -64,8 +76,39 @@ impl Writer {
     /// The writer pads the local file header so `payload` lands on
     /// the next 64-byte boundary, computes a fresh CRC32, and
     /// records the local-header offset for the central directory.
+    ///
+    /// # Panics
+    ///
+    /// Panics if appending the entry would cross a ZIP64 boundary (a
+    /// payload of `2^32-1` bytes or larger, or a local-header offset at
+    /// or past `2^32-1`). USDZ forbids ZIP64, so a conforming package
+    /// never reaches that size. Callers that may handle untrusted /
+    /// oversized scenes should use [`Writer::try_add_stored`], which
+    /// surfaces the boundary as an `Error::Unsupported` instead.
     pub fn add_stored(&mut self, name: &str, payload: &[u8]) {
+        self.try_add_stored(name, payload)
+            .expect("zip_writer::Writer::add_stored crossed a ZIP64 boundary (payload or offset >= 2^32); use try_add_stored for fallible handling");
+    }
+
+    /// Fallible form of [`Writer::add_stored`]: appends an entry, or
+    /// returns `Error::Unsupported` if doing so would require ZIP64
+    /// (a payload of `2^32-1` bytes or larger, or a local-header offset
+    /// at or past `2^32-1`). USDZ forbids ZIP64 (`GAP-TRACKER.md` §3),
+    /// so this is the boundary at which a package can no longer be
+    /// represented in the classic ZIP slots this writer emits.
+    pub fn try_add_stored(&mut self, name: &str, payload: &[u8]) -> Result<()> {
         let lfh_offset = self.out.len() as u64;
+        if lfh_offset >= ZIP_U32_LIMIT {
+            return Err(unsupported(format!(
+                "USDZ writer: local file header offset {lfh_offset} >= 2^32 would require ZIP64, which USDZ forbids"
+            )));
+        }
+        if payload.len() as u64 >= ZIP_U32_LIMIT {
+            return Err(unsupported(format!(
+                "USDZ writer: entry '{name}' payload of {} bytes >= 2^32 would require ZIP64, which USDZ forbids",
+                payload.len()
+            )));
+        }
         let payload_len = payload.len() as u32;
         let crc32 = crc32(payload);
 
@@ -109,12 +152,44 @@ impl Writer {
             payload_len,
             crc32,
         });
+        Ok(())
     }
 
     /// Append the central directory + EOCD and return the assembled
     /// archive bytes. Consumes the writer so the buffer can be
     /// moved out without copying.
-    pub fn finish(mut self) -> Vec<u8> {
+    ///
+    /// # Panics
+    ///
+    /// Panics if the assembled archive would cross a ZIP64 boundary (a
+    /// central-directory offset at or past `2^32-1`, or more than
+    /// `2^16-1` entries). USDZ forbids ZIP64, so a conforming package
+    /// never reaches that. Use [`Writer::try_finish`] for fallible
+    /// handling.
+    pub fn finish(self) -> Vec<u8> {
+        self.try_finish()
+            .expect("zip_writer::Writer::finish crossed a ZIP64 boundary (central-directory offset >= 2^32 or > 2^16-1 entries); use try_finish for fallible handling")
+    }
+
+    /// Fallible form of [`Writer::finish`]: assembles the central
+    /// directory + EOCD, or returns `Error::Unsupported` if the result
+    /// would require ZIP64 (a central-directory offset at or past
+    /// `2^32-1`, or more than `2^16-1` entries — neither representable
+    /// in the classic EOCD slots, both forbidden by USDZ per
+    /// `GAP-TRACKER.md` §3).
+    pub fn try_finish(mut self) -> Result<Vec<u8>> {
+        if self.records.len() > ZIP_ENTRY_LIMIT {
+            return Err(unsupported(format!(
+                "USDZ writer: {} entries > 2^16-1 would require ZIP64, which USDZ forbids",
+                self.records.len()
+            )));
+        }
+        if self.out.len() as u64 >= ZIP_U32_LIMIT {
+            return Err(unsupported(format!(
+                "USDZ writer: central-directory offset {} >= 2^32 would require ZIP64, which USDZ forbids",
+                self.out.len()
+            )));
+        }
         let cd_offset = self.out.len() as u32;
         for rec in &self.records {
             self.out.extend_from_slice(&CDIR_SIGNATURE.to_le_bytes());
@@ -148,7 +223,7 @@ impl Writer {
         self.out.extend_from_slice(&cd_size.to_le_bytes());
         self.out.extend_from_slice(&cd_offset.to_le_bytes());
         self.out.extend_from_slice(&0u16.to_le_bytes()); // comment_len
-        self.out
+        Ok(self.out)
     }
 }
 
@@ -214,5 +289,46 @@ mod tests {
         let archive = Writer::new().finish();
         let entries = walk(&archive).expect("walk ok");
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn try_surface_roundtrips_through_walker() {
+        let mut w = Writer::new();
+        w.try_add_stored("scene.usda", b"#usda 1.0\n")
+            .expect("add ok");
+        w.try_add_stored("diffuse.png", &[0u8, 1, 2, 3])
+            .expect("add ok");
+        let archive = w.try_finish().expect("finish ok");
+        let entries = walk(&archive).expect("walk ok");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "scene.usda");
+    }
+
+    #[test]
+    fn try_finish_rejects_entry_count_over_zip64_boundary() {
+        // 2^16 entries cannot fit the classic 2-byte EOCD entry-count
+        // slot; USDZ forbids ZIP64, so try_finish must reject rather
+        // than truncate the count to 0. Each entry is tiny (empty
+        // payload) so the archive stays well under the 4 GiB offset
+        // limit — this isolates the entry-count boundary.
+        let mut w = Writer::new();
+        for i in 0..=ZIP_ENTRY_LIMIT {
+            // Distinct short names keep each LFH small.
+            w.try_add_stored(&format!("{i}"), b"").expect("add ok");
+        }
+        assert_eq!(w.records.len(), ZIP_ENTRY_LIMIT + 1);
+        let err = w.try_finish().unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("ZIP64"), "got: {msg}");
+    }
+
+    #[test]
+    fn add_stored_still_infallible_for_conforming_sizes() {
+        // The infallible wrapper must keep working for normal-size
+        // payloads (the panic path is unreachable for conforming USDZ).
+        let mut w = Writer::new();
+        w.add_stored("a.usda", b"#usda 1.0\n");
+        let archive = w.finish();
+        assert_eq!(walk(&archive).expect("walk").len(), 1);
     }
 }

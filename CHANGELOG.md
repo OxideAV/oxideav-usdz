@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- zip: **fallible writer surface guarding the ZIP64 boundary**. The USDZ
+  writer gains `Writer::try_add_stored` and `Writer::try_finish`, which
+  return `Error::Unsupported` when an entry or the assembled archive
+  would cross the ZIP64 boundary USDZ forbids (`GAP-TRACKER.md` §3): a
+  payload of `2^32-1` bytes or more, a local-header / central-directory
+  offset at or past `2^32-1`, or more than `2^16-1` entries. Previously
+  those cases silently truncated `payload.len() as u32` /
+  `records.len() as u16` / `offset as u32` and emitted a corrupt
+  archive. The infallible `add_stored` / `finish` remain (delegating to
+  the `try_*` forms and documented to panic on the boundary — a
+  conforming USDZ never reaches it); `UsdzEncoder::encode_with_report`
+  now routes through the `try_*` surface so an oversized scene surfaces
+  cleanly as an error. Three new tests: the `try_*` round-trip, the
+  `2^16`-entry rejection, and the infallible wrapper for conforming
+  sizes.
+
 - zip: **ZIP64-sentinel rejection + central-directory entry-count
   validation**. The USDZ container walker now detects the ZIP64
   sentinels in the End-of-Central-Directory record (`0xFFFF` total-entry

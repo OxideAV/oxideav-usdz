@@ -68,14 +68,17 @@ impl UsdzEncoder {
         let mut writer = Writer::new();
         // Default Layer must be the first archive entry per the
         // USDZ spec — the reader picks the first `.usd*` file as
-        // the layer to load.
-        writer.add_stored("scene.usda", usda.as_bytes());
+        // the layer to load. The fallible `try_*` writer surface is
+        // used throughout so an oversized scene (a payload or archive
+        // crossing the ZIP64 boundary USDZ forbids) surfaces as an
+        // `Error::Unsupported` rather than panicking.
+        writer.try_add_stored("scene.usda", usda.as_bytes())?;
 
         let mut pass_through_textures = 0usize;
         let mut reencoded_textures = 0usize;
         let mut texture_names = Vec::with_capacity(assets.len());
         for asset in &assets {
-            writer.add_stored(&asset.name, &asset.bytes);
+            writer.try_add_stored(&asset.name, &asset.bytes)?;
             if asset.from_pass_through {
                 pass_through_textures += 1;
             } else {
@@ -88,7 +91,7 @@ impl UsdzEncoder {
         let mut reencoded_audio = 0usize;
         let mut audio_names = Vec::with_capacity(audio_assets.len());
         for asset in &audio_assets {
-            writer.add_stored(&asset.name, &asset.bytes);
+            writer.try_add_stored(&asset.name, &asset.bytes)?;
             if asset.from_pass_through {
                 pass_through_audio += 1;
             } else {
@@ -98,7 +101,7 @@ impl UsdzEncoder {
         }
 
         Ok(EncodeReport {
-            bytes: writer.finish(),
+            bytes: writer.try_finish()?,
             usda,
             texture_names,
             pass_through_textures,
