@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- zip: **ZIP64-sentinel rejection + central-directory entry-count
+  validation**. The USDZ container walker now detects the ZIP64
+  sentinels in the End-of-Central-Directory record (`0xFFFF` total-entry
+  count, `0xFFFFFFFF` central-directory size/offset — APPNOTE.TXT
+  §4.3.14/§4.4) and rejects the archive with a precise *"USDZ forbids
+  ZIP64"* diagnostic instead of dereferencing the sentinel as a literal
+  offset (which previously failed with a baffling downstream "extends
+  past EOF"). It also validates that the number of central-directory
+  records actually walked equals the EOCD's declared total-entry count,
+  catching a truncated directory or a mis-sized variable-length field at
+  the container boundary rather than silently returning a short entry
+  list. Three new tests cover the entry-count sentinel, the
+  central-directory-offset sentinel, and the count-mismatch case.
+
 - usdc §4.3/§3b: **compressed-integer array materialisation**. A
   `ValueRep` whose `is_compressed` flag rides on `is_array` resolves
   (via `value_region`) to a `ValueRegion::CompressedArray { count,

@@ -69,9 +69,29 @@ pub struct ZipEntry {
 /// violation returns `Error::InvalidData`.
 pub fn walk(archive: &[u8]) -> Result<Vec<ZipEntry>> {
     let eocd = find_eocd(archive)?;
-    let cd_size = u32::from_le_bytes(read4(archive, eocd + 12)?) as u64;
-    let cd_offset = u32::from_le_bytes(read4(archive, eocd + 16)?) as u64;
-    let total_entries = u16::from_le_bytes(read2(archive, eocd + 10)?) as usize;
+    let cd_size_raw = u32::from_le_bytes(read4(archive, eocd + 12)?);
+    let cd_offset_raw = u32::from_le_bytes(read4(archive, eocd + 16)?);
+    let total_entries_raw = u16::from_le_bytes(read2(archive, eocd + 10)?);
+
+    // ZIP64 sentinel detection. APPNOTE.TXT §4.4 records that when a
+    // count/size/offset field cannot fit the classic 16-/32-bit EOCD
+    // slot, the writer stores the all-ones sentinel (`0xFFFF` for the
+    // 2-byte entry count, `0xFFFFFFFF` for the 4-byte size/offset) and
+    // moves the true value into a ZIP64 end-of-central-directory record
+    // (APPNOTE §4.3.14). USDZ forbids ZIP64 (`GAP-TRACKER.md` §3), so
+    // rather than read the sentinel as a literal — which would point the
+    // central-directory walk at offset `0xFFFFFFFF` and fail with a
+    // baffling "extends past EOF" — detect it up front and reject with a
+    // precise diagnostic.
+    if total_entries_raw == 0xFFFF || cd_size_raw == 0xFFFF_FFFF || cd_offset_raw == 0xFFFF_FFFF {
+        return Err(unsupported(
+            "USDZ forbids ZIP64; EOCD carries a ZIP64 sentinel (0xFFFF entry count or 0xFFFFFFFF central-directory size/offset)",
+        ));
+    }
+
+    let cd_size = cd_size_raw as u64;
+    let cd_offset = cd_offset_raw as u64;
+    let total_entries = total_entries_raw as usize;
 
     if cd_offset.saturating_add(cd_size) as usize > archive.len() {
         return Err(invalid("ZIP central directory extends past archive end"));
@@ -158,6 +178,20 @@ pub fn walk(archive: &[u8]) -> Result<Vec<ZipEntry>> {
         });
 
         p = name_end + extra_len + comment_len;
+    }
+
+    // The EOCD declares how many central-directory records the archive
+    // carries (APPNOTE.TXT §4.4.16 "total number of entries in the
+    // central directory"). A walk that recovered a different count means
+    // the directory was truncated, an inner record's variable-length
+    // fields were mis-sized, or a stray non-CDIR signature halted the
+    // walk early — a malformed archive either way, surfaced here instead
+    // of silently returning a short entry list.
+    if entries.len() != total_entries {
+        return Err(invalid(format!(
+            "ZIP central directory entry count mismatch: EOCD declares {total_entries}, walk recovered {}",
+            entries.len()
+        )));
     }
 
     Ok(entries)
@@ -330,6 +364,48 @@ mod tests {
         let err = walk(&zip).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("CRC-32"), "got: {msg}");
+    }
+
+    #[test]
+    fn rejects_zip64_entry_count_sentinel() {
+        // EOCD `total entries` == 0xFFFF is the ZIP64 sentinel; USDZ
+        // forbids ZIP64, so the walk must reject it cleanly rather than
+        // try to enumerate 65535 phantom records.
+        let mut zip = build_aligned_zip("hello.usda", b"#usda 1.0\n", 64);
+        let eocd = find_eocd(&zip).unwrap();
+        // EOCD offset+10 = total-entries (2 bytes).
+        zip[eocd + 10] = 0xFF;
+        zip[eocd + 11] = 0xFF;
+        let err = walk(&zip).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("ZIP64"), "got: {msg}");
+    }
+
+    #[test]
+    fn rejects_zip64_cd_offset_sentinel() {
+        // EOCD `central-directory offset` == 0xFFFFFFFF is the ZIP64
+        // sentinel for an offset that overflowed the 4-byte slot.
+        let mut zip = build_aligned_zip("hello.usda", b"#usda 1.0\n", 64);
+        let eocd = find_eocd(&zip).unwrap();
+        // EOCD offset+16 = central-directory offset (4 bytes).
+        zip[eocd + 16..eocd + 20].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        let err = walk(&zip).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("ZIP64"), "got: {msg}");
+    }
+
+    #[test]
+    fn rejects_entry_count_mismatch() {
+        // EOCD over-declaring the entry count (2 entries, archive has 1)
+        // must be rejected, not silently returning the short list.
+        let mut zip = build_aligned_zip("hello.usda", b"#usda 1.0\n", 64);
+        let eocd = find_eocd(&zip).unwrap();
+        // Bump total-entries from 1 to 2.
+        zip[eocd + 10] = 0x02;
+        zip[eocd + 11] = 0x00;
+        let err = walk(&zip).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("entry count mismatch"), "got: {msg}");
     }
 
     #[test]
