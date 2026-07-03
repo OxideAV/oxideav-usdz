@@ -1,5 +1,7 @@
 # oxideav-usdz
 
+[![CI](https://github.com/OxideAV/oxideav-usdz/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-usdz/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-usdz.svg)](https://crates.io/crates/oxideav-usdz) [![docs.rs](https://docs.rs/oxideav-usdz/badge.svg)](https://docs.rs/oxideav-usdz) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust **USDZ** (Universal Scene Description, zipped) reader **and
 writer**. USDZ is the USD container for shipping ready-to-go assets — an
 uncompressed, 64-byte-aligned ZIP archive whose first entry is a
