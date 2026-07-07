@@ -70,6 +70,16 @@ Full reader and symmetric writer for the `#usda 1.0` text format:
   millimetres / inches / feet / yards), and `defaultPrim`.
 - **Diagnostics** — line/column error reporting from the tokenizer.
 
+The reader/writer pair is a **round-trip fixed point**: encode → decode
+→ encode is stable (a decoded scene re-serialises identically), with no
+node-tree drift. The `roundtrip_fidelity` test suite measures this over
+a matrix of base colour, metallic/roughness, emissive, normals + UVs,
+texture binding, transforms, up-axis/unit, and deep hierarchy — 8/8
+channels round-trip cleanly — and guards two subtle asymmetries: the
+top-level `def Scope "Materials"` no longer decodes into a phantom empty
+root, and a node that directly carries a same-named mesh no longer gains
+a redundant `def Xform` wrapper on each cycle.
+
 ### Composition
 
 The read path evaluates USD composition arcs:

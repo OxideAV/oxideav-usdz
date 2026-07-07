@@ -458,6 +458,41 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
     let prim_metadata_lines =
         build_prim_metadata_lines(&variant_sets, &selection, &composition_lines);
 
+    // Bare-mesh-carrier collapse. The decoder turns an inner
+    // `def Mesh "M"` into a *standalone* mesh-carrier node named `M`
+    // (mesh set, identity transform, no other content). Re-emitting
+    // such a node as `def Xform "M" { def Mesh "M" }` would wrap the
+    // geometry in a redundant Xform level — and because the decoder
+    // then re-externalises that inner mesh again on the next read, the
+    // structure grows by one Xform every encode→decode cycle (an
+    // unbounded round-trip drift). When a node is a pure mesh carrier
+    // whose own name already equals its mesh's prim name — exactly the
+    // shape the decoder produces — emit the mesh prim(s) directly at
+    // this level, skipping the wrapper. Nodes whose name differs from
+    // the mesh (a genuine Xform locator wrapping a differently-named
+    // mesh) keep the Xform and are unaffected, so hand-authored layers
+    // round-trip byte-for-byte as before. This makes the round-trip a
+    // fixed point instead of a monotonically-growing tree.
+    if prim_metadata_lines.is_empty() {
+        if let Some(mesh_id) = node.mesh {
+            if node.children.is_empty()
+                && node.audio_emitter.is_none()
+                && node.camera.is_none()
+                && node.light.is_none()
+                && node.skin.is_none()
+                && is_identity(&node.transform)
+            {
+                if let Some(mesh) = scene.mesh(mesh_id) {
+                    let mesh_name = sanitize_prim_name(mesh.name.as_deref().unwrap_or("Mesh"));
+                    if mesh_name == safe_name {
+                        write_mesh(w, scene, mesh, mesh_id, parent_path);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     // We always emit `Xform` for now — meshes hang off as inner
     // `def Mesh` children rather than collapsing into the node's
     // own prim type. Round-3 work: also synthesise `Camera` /

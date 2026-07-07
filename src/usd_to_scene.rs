@@ -1143,6 +1143,21 @@ fn build_node(ctx: &mut Ctx, parent: &str, prim: &Prim) -> Result<Option<oxideav
             }
             node.children = child_ids;
             stash_extras(&mut node.extras, prim);
+            // A USD `Scope` is a pure namespace container — it is
+            // *non-transformable* and holds no geometry of its own. When
+            // such a scope contributed no scene-graph children it adds
+            // nothing to the render graph; the canonical case is the
+            // top-level `def Scope "Materials"` the writer emits, whose
+            // `Material` children are indexed into `scene.materials`
+            // separately (via `index_materials`) and never become nodes.
+            // Emitting an empty node for it would inject a spurious extra
+            // root on every encode→decode cycle (breaking round-trip
+            // symmetry: a one-root scene came back with two roots). Drop
+            // it. Empty `Xform`s are *kept* — an Xform carries a
+            // transform and may be a meaningful locator/anchor.
+            if prim.type_name == "Scope" && node.children.is_empty() {
+                return Ok(None);
+            }
             let id = ctx.scene.add_node(node);
             Ok(Some(id))
         }

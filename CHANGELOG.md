@@ -7,7 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **round-trip drift: bare-mesh-carrier collapse.** A `Scene3D` whose
+  geometry is attached directly to a node (`Node::mesh`) round-tripped
+  through USDA into a *monotonically growing* tree: the writer emitted
+  the node as `def Xform "N" { def Mesh "M" }`, and the reader then
+  re-externalised that inner `def Mesh` into a *standalone* mesh-carrier
+  child node — so the next encode wrapped it in yet another `def Xform`,
+  adding one namespace level (~58 bytes) on *every* encode→decode cycle
+  without bound. The writer now recognises the exact shape the reader
+  produces — a node that is a pure mesh carrier (mesh set, identity
+  transform, no children / camera / light / skin / audio / variant /
+  composition metadata) *whose own name already equals its mesh's prim
+  name* — and emits the mesh prim(s) directly at that level instead of
+  re-wrapping them in a redundant `def Xform`. The round-trip is now a
+  fixed point (stable after at most one cycle). Nodes whose name differs
+  from the mesh (a genuine Xform locator over a differently-named mesh)
+  keep the Xform, so hand-authored layers still round-trip byte-for-byte.
+
+- **spurious empty `Materials` root on every material round-trip.** The
+  writer emits materials under a top-level `def Scope "Materials"`; on
+  decode that scope became an empty, childless scene-graph node and was
+  pushed onto `Scene3D::roots` — so a one-root scene came back with *two*
+  roots (the geometry root plus a phantom `Materials` node). A USD
+  `Scope` is a non-transformable namespace container; when it contributes
+  no scene-graph children (its `Material` children are indexed separately
+  into `Scene3D::materials`) it is now dropped rather than emitted as a
+  node. Empty `Xform`s are still kept — an Xform carries a transform and
+  may be a meaningful locator/anchor.
+
 ### Added
+
+- tests: **`roundtrip_fidelity` harness** — a decode→encode→decode
+  matrix over base-colour, metallic/roughness, emissive, normals+UVs,
+  texture binding, transforms, up-axis/unit, and deep hierarchy that
+  reports a measured pass-count (8/8 channels), plus fixed-point /
+  single-root regression guards for the two fixes above.
 
 - zip: **fallible writer surface guarding the ZIP64 boundary**. The USDZ
   writer gains `Writer::try_add_stored` and `Writer::try_finish`, which
