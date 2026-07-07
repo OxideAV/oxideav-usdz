@@ -1512,10 +1512,29 @@ fn read_matrix4(v: &Value) -> Option<[[f32; 4]; 4]> {
     Some(out)
 }
 
+/// Prim-metadata keys that are the *writer's own* geometry-recovery
+/// hints. The decoder consumes each of these into `Primitive::extras`
+/// (see [`apply_mesh_metadata_to_primitive`]) and the mesh writer
+/// re-emits them directly on the `def Mesh` / `def BasisCurves` /
+/// `def Points` prim from that Primitive. Stashing them a *second* time
+/// onto the carrier node's extras would (a) double-emit them (once on
+/// the mesh prim, once on the enclosing Xform) and (b) leave the carrier
+/// node with non-empty prim-metadata, which defeats the bare-mesh
+/// collapse in the writer and makes the round-trip grow an extra Xform
+/// level per cycle. They are never authored on non-geometry (`Xform` /
+/// `Scope`) prims, so filtering them unconditionally is safe.
+const GEOMETRY_HINT_METADATA_KEYS: &[&str] = &["usd:original_topology", "usd:no_fold"];
+
 fn stash_extras(extras: &mut HashMap<String, serde_json::Value>, prim: &Prim) {
-    if !prim.metadata.is_empty() {
+    let filtered: BTreeMap<String, Value> = prim
+        .metadata
+        .iter()
+        .filter(|(k, _)| !GEOMETRY_HINT_METADATA_KEYS.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    if !filtered.is_empty() {
         let mut obj = serde_json::Map::new();
-        for (k, v) in &prim.metadata {
+        for (k, v) in &filtered {
             if let Some(j) = value_to_json(v) {
                 obj.insert(k.clone(), j);
             }
@@ -1527,7 +1546,7 @@ fn stash_extras(extras: &mut HashMap<String, serde_json::Value>, prim: &Prim) {
         // Asset vs AssetWithPath vs Path).  The untagged `usd:metadata`
         // entry above stays for callers that consume the JSON
         // directly without going back through the writer.
-        let tagged = crate::variant_codec::encode_btree_value(&prim.metadata);
+        let tagged = crate::variant_codec::encode_btree_value(&filtered);
         extras.insert(crate::usda_writer::PRIM_METADATA_EXTRAS_KEY.into(), tagged);
     }
     // Round 8: stash the prim's structured `variant_sets` block on

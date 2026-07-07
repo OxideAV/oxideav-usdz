@@ -25,6 +25,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fixed point (stable after at most one cycle). Nodes whose name differs
   from the mesh (a genuine Xform locator over a differently-named mesh)
   keep the Xform, so hand-authored layers still round-trip byte-for-byte.
+  The same drift affected `BasisCurves` / `Points` and the strip/fan
+  topologies: the writer's own geometry-recovery hints
+  (`usd:original_topology`, `usd:no_fold`) were being mirrored onto the
+  carrier node's extras — as well as onto the geometry prim they belong
+  on — which left the node's prim-metadata non-empty (defeating the
+  collapse) and double-emitted the hint on the enclosing Xform. The
+  decoder no longer stashes those geometry-only hints on the node; they
+  continue to round-trip via `Primitive::extras`, which is where the
+  mesh writer reads them.
 
 - **spurious empty `Materials` root on every material round-trip.** The
   writer emits materials under a top-level `def Scope "Materials"`; on

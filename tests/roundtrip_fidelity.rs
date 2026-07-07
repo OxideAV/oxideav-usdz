@@ -372,3 +372,58 @@ fn mesh_carrier_child_does_not_grow() {
     assert_eq!(u2, u3, "cycle 2→3 drifted (unbounded growth)");
     assert_eq!(u3, u4, "cycle 3→4 drifted (unbounded growth)");
 }
+
+#[test]
+fn curves_points_strips_reach_fixed_point() {
+    // Non-triangle geometry (BasisCurves / Points) and the strip/fan
+    // topologies that expand to triangle lists must also round-trip to
+    // a fixed point. Regression for the geometry-hint stash leak: the
+    // writer's own `usd:original_topology` hint was being mirrored onto
+    // the carrier node's extras (as well as the mesh prim), so the node
+    // never collapsed and the tree grew an Xform level per cycle.
+    let mut lines = Scene3D::new();
+    let mut lp = Primitive::new(Topology::Lines);
+    lp.positions = vec![
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+    ];
+    lp.indices = Some(Indices::U16(vec![0, 1, 2, 3]));
+    let lm = lines.add_mesh(Mesh::new(Some("Curve".into())).with_primitive(lp));
+    let ln = lines.add_node(Node::new().with_name("Root").with_mesh(lm));
+    lines.add_root(ln);
+
+    let mut points = Scene3D::new();
+    let mut pp = Primitive::new(Topology::Points);
+    pp.positions = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]];
+    pp.indices = Some(Indices::U16(vec![0, 1]));
+    let pm = points.add_mesh(Mesh::new(Some("Pts".into())).with_primitive(pp));
+    let pn = points.add_node(Node::new().with_name("Root").with_mesh(pm));
+    points.add_root(pn);
+
+    let mut strip = Scene3D::new();
+    let mut sp = Primitive::new(Topology::TriangleStrip);
+    sp.positions = vec![
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [1.0, 1.0, 0.0],
+    ];
+    sp.indices = Some(Indices::U16(vec![0, 1, 2, 3]));
+    let sm = strip.add_mesh(Mesh::new(Some("Strip".into())).with_primitive(sp));
+    let sn = strip.add_node(Node::new().with_name("Root").with_mesh(sm));
+    strip.add_root(sn);
+
+    for (name, scene) in [("lines", lines), ("points", points), ("strip", strip)] {
+        // After at most one cycle the USDA is a stable fixed point.
+        let s2 = round_trip(&scene);
+        let u2 = usda_of(&s2);
+        let s3 = round_trip(&s2);
+        let u3 = usda_of(&s3);
+        let s4 = round_trip(&s3);
+        let u4 = usda_of(&s4);
+        assert_eq!(u2, u3, "{name}: cycle 2→3 drifted");
+        assert_eq!(u3, u4, "{name}: cycle 3→4 drifted");
+    }
+}
