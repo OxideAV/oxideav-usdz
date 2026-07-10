@@ -1109,6 +1109,23 @@ fn write_one_mesh_prim(
         write_node_transform(w, &t);
     }
     write_triangle_mesh(w, prim);
+    // §2.5 `doubleSided` — the decoder's extras flag is authoritative
+    // (round-trip); a bound material's `double_sided` covers scenes
+    // authored directly through the typed model.
+    let double_sided = prim
+        .extras
+        .get("usd:doubleSided")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || prim
+            .material
+            .and_then(|id| scene.materials.get(id.0 as usize))
+            .map(|m| m.double_sided)
+            .unwrap_or(false);
+    if double_sided {
+        w.write_indent();
+        writeln!(w.s, "uniform bool doubleSided = 1").unwrap();
+    }
     if let Some(mat_id) = prim.material {
         if let Some(mat) = scene.materials.get(mat_id.0 as usize) {
             let mat_name = material_prim_name(mat, mat_id.0 as usize);
@@ -1663,11 +1680,22 @@ fn write_triangle_mesh(w: &mut Out, prim: &Primitive) {
         writeln!(w.s, "]").unwrap();
     }
 
-    // First UV set (optional).
-    if let Some(uv0) = prim.uvs.first() {
+    // UV sets: the first is `primvars:st`, additional sets follow the
+    // §2.5 multi-UV convention `primvars:st1`, `primvars:st2`, ...
+    // (a `UsdPrimvarReader_float2` selects one by `varname`). Empty
+    // sets (padding for authoring gaps) emit nothing.
+    for (set_idx, uv_set) in prim.uvs.iter().enumerate() {
+        if uv_set.is_empty() {
+            continue;
+        }
+        let name = if set_idx == 0 {
+            "primvars:st".to_string()
+        } else {
+            format!("primvars:st{set_idx}")
+        };
         w.write_indent();
-        write!(w.s, "texCoord2f[] primvars:st = [").unwrap();
-        for (i, uv) in uv0.iter().enumerate() {
+        write!(w.s, "texCoord2f[] {name} = [").unwrap();
+        for (i, uv) in uv_set.iter().enumerate() {
             if i > 0 {
                 w.s.push_str(", ");
             }
@@ -1680,6 +1708,77 @@ fn write_triangle_mesh(w: &mut Out, prim: &Primitive) {
             .unwrap();
         }
         writeln!(w.s, "]").unwrap();
+    }
+
+    // §2.5 display primvars. A per-vertex colour set emits
+    // `primvars:displayColor` (+ `displayOpacity` when any alpha
+    // departs from 1); a constant/uniform set preserved on extras
+    // re-emits the authored shape.
+    if let Some(colors) = prim.colors.first() {
+        w.write_indent();
+        write!(w.s, "color3f[] primvars:displayColor = [").unwrap();
+        for (i, c) in colors.iter().enumerate() {
+            if i > 0 {
+                w.s.push_str(", ");
+            }
+            write!(
+                w.s,
+                "({}, {}, {})",
+                format_float(c[0] as f64),
+                format_float(c[1] as f64),
+                format_float(c[2] as f64)
+            )
+            .unwrap();
+        }
+        writeln!(w.s, "]").unwrap();
+        if colors.iter().any(|c| c[3] != 1.0) {
+            w.write_indent();
+            write!(w.s, "float[] primvars:displayOpacity = [").unwrap();
+            for (i, c) in colors.iter().enumerate() {
+                if i > 0 {
+                    w.s.push_str(", ");
+                }
+                write!(w.s, "{}", format_float(c[3] as f64)).unwrap();
+            }
+            writeln!(w.s, "]").unwrap();
+        }
+    } else if let Some(dc) = prim
+        .extras
+        .get("usd:displayColor")
+        .and_then(|v| v.as_array())
+    {
+        w.write_indent();
+        write!(w.s, "color3f[] primvars:displayColor = [").unwrap();
+        for (i, c) in dc.iter().enumerate() {
+            if i > 0 {
+                w.s.push_str(", ");
+            }
+            let comp = |j: usize| c.get(j).and_then(|x| x.as_f64()).unwrap_or(0.0);
+            write!(
+                w.s,
+                "({}, {}, {})",
+                format_float(comp(0)),
+                format_float(comp(1)),
+                format_float(comp(2))
+            )
+            .unwrap();
+        }
+        writeln!(w.s, "]").unwrap();
+        if let Some(op) = prim
+            .extras
+            .get("usd:displayOpacity")
+            .and_then(|v| v.as_array())
+        {
+            w.write_indent();
+            write!(w.s, "float[] primvars:displayOpacity = [").unwrap();
+            for (i, x) in op.iter().enumerate() {
+                if i > 0 {
+                    w.s.push_str(", ");
+                }
+                write!(w.s, "{}", format_float(x.as_f64().unwrap_or(1.0))).unwrap();
+            }
+            writeln!(w.s, "]").unwrap();
+        }
     }
 
     // Subdivision scheme — every USDZ exporter sets this to "none"
@@ -1908,6 +2007,14 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
         };
         let shader_name = texture_shader_name(tref.texture.0);
         let asset_name = texture_filename(tex, tref.texture.0 as usize);
+        // §2.2 no-typed-slot inputs preserved by the decoder on the
+        // scene-level stash (wrapS/wrapT exact tokens, scale, bias,
+        // fallback, sourceColorSpace, non-standard varname).
+        let stash = scene
+            .extras
+            .get(&format!("usd:uvtexture:{}", tref.texture.0))
+            .and_then(|v| v.as_object());
+        let stash_str = |key: &str| stash.and_then(|s| s.get(key)).and_then(|v| v.as_str());
         w.write_indent();
         writeln!(w.s, "def Shader \"{shader_name}\" {{").unwrap();
         w.indent += 1;
@@ -1915,6 +2022,62 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
         writeln!(w.s, "uniform token info:id = \"UsdUVTexture\"").unwrap();
         w.write_indent();
         writeln!(w.s, "asset inputs:file = @{asset_name}@").unwrap();
+        // Wrap modes: the stash carries the authored spelling
+        // (including `black` / `useMetadata`, which have no typed
+        // Sampler equivalent); a typed-model-only scene falls back to
+        // the Sampler mapping, skipping the schema-default-adjacent
+        // `repeat`.
+        for (key, sampler_wrap) in [("wrapS", tex.sampler.wrap_s), ("wrapT", tex.sampler.wrap_t)] {
+            if let Some(tok) = stash_str(key) {
+                w.write_indent();
+                writeln!(w.s, "token inputs:{key} = \"{tok}\"").unwrap();
+            } else {
+                let tok = match sampler_wrap {
+                    oxideav_mesh3d::WrapMode::ClampToEdge => Some("clamp"),
+                    oxideav_mesh3d::WrapMode::MirroredRepeat => Some("mirror"),
+                    oxideav_mesh3d::WrapMode::Repeat => None,
+                };
+                if let Some(tok) = tok {
+                    w.write_indent();
+                    writeln!(w.s, "token inputs:{key} = \"{tok}\"").unwrap();
+                }
+            }
+        }
+        for key in ["scale", "bias", "fallback"] {
+            if let Some(v4) = stash.and_then(|s| s.get(key)).and_then(|v| v.as_array()) {
+                if v4.len() == 4 {
+                    let c = |i: usize| v4[i].as_f64().unwrap_or(0.0);
+                    w.write_indent();
+                    writeln!(
+                        w.s,
+                        "float4 inputs:{key} = ({}, {}, {}, {})",
+                        format_float(c(0)),
+                        format_float(c(1)),
+                        format_float(c(2)),
+                        format_float(c(3))
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        if let Some(cs) = stash_str("sourceColorSpace") {
+            w.write_indent();
+            writeln!(w.s, "token inputs:sourceColorSpace = \"{cs}\"").unwrap();
+        }
+        // §2.3 UsdPrimvarReader wiring: a texture sampling a UV set
+        // other than `st` (or a non-standard primvar name) gets an
+        // explicit `st` connection to a reader sibling emitted below.
+        let varname = stash_str("varname")
+            .map(str::to_owned)
+            .or_else(|| (tref.uv_set > 0).then(|| format!("st{}", tref.uv_set)));
+        if varname.is_some() {
+            w.write_indent();
+            writeln!(
+                w.s,
+                "float2 inputs:st.connect = <{mat_path}/{shader_name}_stReader.outputs:result>"
+            )
+            .unwrap();
+        }
         w.write_indent();
         writeln!(w.s, "float3 outputs:rgb").unwrap();
         w.write_indent();
@@ -1922,6 +2085,21 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
         w.indent -= 1;
         w.write_indent();
         writeln!(w.s, "}}").unwrap();
+
+        if let Some(varname) = varname {
+            w.write_indent();
+            writeln!(w.s, "def Shader \"{shader_name}_stReader\" {{").unwrap();
+            w.indent += 1;
+            w.write_indent();
+            writeln!(w.s, "uniform token info:id = \"UsdPrimvarReader_float2\"").unwrap();
+            w.write_indent();
+            writeln!(w.s, "string inputs:varname = \"{varname}\"").unwrap();
+            w.write_indent();
+            writeln!(w.s, "float2 outputs:result").unwrap();
+            w.indent -= 1;
+            w.write_indent();
+            writeln!(w.s, "}}").unwrap();
+        }
     }
 
     w.indent -= 1;

@@ -958,7 +958,7 @@ struct Ctx {
     materials_by_path: HashMap<String, oxideav_mesh3d::MaterialId>,
     /// Cache so two materials referencing the same shader's texture
     /// share one `TextureId` instead of duplicating the asset.
-    textures_by_path: HashMap<String, oxideav_mesh3d::TextureId>,
+    textures_by_path: HashMap<String, TextureRef>,
 }
 
 fn apply_layer_metadata(scene: &mut Scene3D, meta: &BTreeMap<String, Value>) {
@@ -1655,6 +1655,105 @@ fn build_triangle_primitive(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Pr
             prim_out.uvs.push(arr);
         }
     }
+    // §2.5 multi-UV: additional `primvars:st1`, `primvars:st2`, ...
+    // sets land on `uvs[1]`, `uvs[2]`, ... (a `UsdPrimvarReader_float2`
+    // selects one by `varname` — see `resolve_uv_set`). The walk stops
+    // at the first missing index so authoring gaps don't shift sets.
+    let mut uv_n = 1u32;
+    while let Some(extra) = prim.attrs.get(&format!("primvars:st{uv_n}")) {
+        // Pad any skipped set (uvs[0] missing but st1 authored) so
+        // indices line up with the primvar names.
+        if let Some(arr) = read_vec2_array(&extra.value) {
+            while prim_out.uvs.len() < uv_n as usize {
+                prim_out.uvs.push(Vec::new());
+            }
+            prim_out.uvs.push(arr);
+        }
+        uv_n += 1;
+    }
+
+    // §2.5 `doubleSided` (UsdGeomGprim): disable back-face culling.
+    // The typed model carries the flag on the *material* (glTF
+    // convention), so a bound material picks it up below; the
+    // primitive-level extras flag is the round-trip authority.
+    let double_sided = prim
+        .attrs
+        .get("doubleSided")
+        .map(|a| match &a.value {
+            Value::Bool(b) => *b,
+            Value::Float(f) => *f != 0.0,
+            Value::Token(s) | Value::String(s) => matches!(s.as_str(), "true" | "1"),
+            _ => false,
+        })
+        .unwrap_or(false);
+    if double_sided {
+        prim_out
+            .extras
+            .insert("usd:doubleSided".into(), serde_json::Value::Bool(true));
+    }
+
+    // §2.5 display primvars: a per-vertex `primvars:displayColor`
+    // (one color3f per point) lands on the first vertex-colour set,
+    // with `primvars:displayOpacity` supplying the alpha channel.
+    // Constant / non-vertex interpolations have no typed slot and
+    // ride on extras verbatim.
+    if let Some(dc) = prim.attrs.get("primvars:displayColor") {
+        if let Some(colors) = read_vec3_array(&dc.value) {
+            let opacity: Option<Vec<f32>> = prim
+                .attrs
+                .get("primvars:displayOpacity")
+                .and_then(|a| a.value.as_seq())
+                .map(|seq| seq.iter().filter_map(|v| v.as_f32()).collect());
+            if colors.len() == prim_out.positions.len() {
+                let rgba: Vec<[f32; 4]> = colors
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let a = opacity
+                            .as_ref()
+                            .and_then(|o| o.get(i).copied())
+                            .unwrap_or(1.0);
+                        [c[0], c[1], c[2], a]
+                    })
+                    .collect();
+                prim_out.colors.push(rgba);
+            } else {
+                // Constant / uniform interpolation — preserve on
+                // extras so the writer re-emits the authored shape.
+                prim_out.extras.insert(
+                    "usd:displayColor".into(),
+                    serde_json::Value::Array(
+                        colors
+                            .iter()
+                            .map(|c| {
+                                serde_json::Value::Array(
+                                    c.iter()
+                                        .filter_map(|x| {
+                                            serde_json::Number::from_f64(*x as f64)
+                                                .map(serde_json::Value::Number)
+                                        })
+                                        .collect(),
+                                )
+                            })
+                            .collect(),
+                    ),
+                );
+                if let Some(o) = opacity {
+                    prim_out.extras.insert(
+                        "usd:displayOpacity".into(),
+                        serde_json::Value::Array(
+                            o.iter()
+                                .filter_map(|x| {
+                                    serde_json::Number::from_f64(*x as f64)
+                                        .map(serde_json::Value::Number)
+                                })
+                                .collect(),
+                        ),
+                    );
+                }
+            }
+        }
+    }
 
     if let Some(rel) = prim
         .attrs
@@ -1663,6 +1762,11 @@ fn build_triangle_primitive(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Pr
     {
         if let Some(&mid) = ctx.materials_by_path.get(rel) {
             prim_out.material = Some(mid);
+            if double_sided {
+                if let Some(mat) = ctx.scene.materials.get_mut(mid.0 as usize) {
+                    mat.double_sided = true;
+                }
+            }
         }
     }
 
@@ -2273,6 +2377,28 @@ fn texref_to_json(tref: TextureRef) -> serde_json::Value {
 /// Resolve an `inputs:foo.connect = </path/Tex.outputs:rgb>`
 /// statement into a `TextureRef`, materialising the underlying
 /// `Texture` (and its `ZipStoredAsset`) on first sight.
+///
+/// Full §2.2 `UsdUVTexture` input coverage (staged schema tables):
+///
+/// * `file` — the in-archive texture asset (round 1).
+/// * `wrapS` / `wrapT` — mapped onto the typed
+///   [`Sampler`](oxideav_mesh3d::Sampler) wrap modes (`repeat` /
+///   `clamp` / `mirror`). `black` and `useMetadata` have no typed
+///   equivalent and keep the default `Repeat`; the authored token
+///   always rides on the scene-level stash (below) so the writer
+///   re-emits the exact spelling.
+/// * `st` — when connected to a `UsdPrimvarReader_float2` (§2.3),
+///   the reader's `varname` selects the UV set: `st` → set 0,
+///   `st1` → set 1, `st<N>` → set N. Any other primvar name keeps
+///   set 0 and is preserved on the stash under `"varname"`.
+/// * `scale` / `bias` / `fallback` (`float4`) and
+///   `sourceColorSpace` (token) — no typed slot; preserved on the
+///   stash.
+///
+/// The stash lives on
+/// `Scene3D::extras["usd:uvtexture:<TextureId>"]` as a JSON object
+/// of the authored inputs, and the writer replays each entry onto
+/// the emitted `UsdUVTexture` shader.
 fn resolve_texture_connect(
     ctx: &mut Ctx,
     parent_path: &str,
@@ -2289,8 +2415,8 @@ fn resolve_texture_connect(
         Some(i) => &p[..i],
         None => p.as_str(),
     };
-    if let Some(&tex_id) = ctx.textures_by_path.get(prim_path) {
-        return Ok(Some(TextureRef::new(tex_id)));
+    if let Some(&tref) = ctx.textures_by_path.get(prim_path) {
+        return Ok(Some(tref));
     }
     // Locate the shader prim under the enclosing material.
     let Some(rel) = prim_path.strip_prefix(&format!("{parent_path}/")) else {
@@ -2337,15 +2463,123 @@ fn resolve_texture_connect(
         entry.payload_len,
         mime,
     );
+
+    // §2.2 wrap modes → typed sampler. `black` / `useMetadata` have
+    // no Sampler equivalent; the stash below preserves the token.
+    let wrap_token = |name: &str| shader.attrs.get(name).and_then(|a| a.value.as_text());
+    let map_wrap = |tok: Option<&str>| match tok {
+        Some("clamp") => oxideav_mesh3d::WrapMode::ClampToEdge,
+        Some("mirror") => oxideav_mesh3d::WrapMode::MirroredRepeat,
+        // `repeat` explicit, `black`, `useMetadata`, or unauthored.
+        _ => oxideav_mesh3d::WrapMode::Repeat,
+    };
+    let mut sampler = oxideav_mesh3d::Sampler::default_sampler();
+    sampler.wrap_s = map_wrap(wrap_token("inputs:wrapS"));
+    sampler.wrap_t = map_wrap(wrap_token("inputs:wrapT"));
+
+    // §2.3 UsdPrimvarReader wiring: the `st` connection's `varname`
+    // picks which UV set this texture samples.
+    let (uv_set, nonstandard_varname) = resolve_uv_set(parent_path, parent, shader);
+
+    // Stash the no-typed-slot inputs for the writer's replay.
+    let mut stash = serde_json::Map::new();
+    for key in ["wrapS", "wrapT", "sourceColorSpace"] {
+        if let Some(tok) = wrap_token(&format!("inputs:{key}")) {
+            stash.insert(key.into(), serde_json::Value::String(tok.to_string()));
+        }
+    }
+    for key in ["scale", "bias", "fallback"] {
+        if let Some(v4) = shader
+            .attrs
+            .get(&format!("inputs:{key}"))
+            .and_then(|a| a.value.as_floatn::<4>())
+        {
+            stash.insert(
+                key.into(),
+                serde_json::Value::Array(
+                    v4.iter()
+                        .filter_map(|c| {
+                            serde_json::Number::from_f64(*c as f64).map(serde_json::Value::Number)
+                        })
+                        .collect(),
+                ),
+            );
+        }
+    }
+    if let Some(varname) = nonstandard_varname {
+        stash.insert("varname".into(), serde_json::Value::String(varname));
+    }
+
     let asset_arc: Arc<dyn AssetSource> = Arc::new(asset);
     let texture = Texture {
         name: Some(rel.to_string()),
         image: ImageData::Source(asset_arc),
-        sampler: oxideav_mesh3d::Sampler::default_sampler(),
+        sampler,
     };
     let tex_id = ctx.scene.add_texture(texture);
-    ctx.textures_by_path.insert(prim_path.to_string(), tex_id);
-    Ok(Some(TextureRef::new(tex_id)))
+    if !stash.is_empty() {
+        ctx.scene.extras.insert(
+            format!("usd:uvtexture:{}", tex_id.0),
+            serde_json::Value::Object(stash),
+        );
+    }
+    let tref = TextureRef {
+        texture: tex_id,
+        uv_set,
+    };
+    ctx.textures_by_path.insert(prim_path.to_string(), tref);
+    Ok(Some(tref))
+}
+
+/// Follow a `UsdUVTexture`'s `inputs:st.connect` to its
+/// `UsdPrimvarReader_float2` sibling and map the reader's `varname`
+/// onto a UV-set index: `st` → 0, `st1` → 1, `st<N>` → N (§2.5's
+/// multi-UV convention). Returns `(uv_set, nonstandard_varname)` —
+/// the second slot carries a primvar name outside the `st<N>` family
+/// so the caller can preserve the exact spelling.
+fn resolve_uv_set(parent_path: &str, parent: &Prim, shader: &Prim) -> (u32, Option<String>) {
+    let Some(Value::Path(p)) = shader.attrs.get("inputs:st.connect").map(|a| &a.value) else {
+        return (0, None);
+    };
+    let reader_path = match p.find('.') {
+        Some(i) => &p[..i],
+        None => p.as_str(),
+    };
+    let Some(rel) = reader_path.strip_prefix(&format!("{parent_path}/")) else {
+        return (0, None);
+    };
+    let Some(reader) = find_child_by_name(parent, rel) else {
+        return (0, None);
+    };
+    let info_id = reader
+        .attrs
+        .get("info:id")
+        .and_then(|a| a.value.as_text())
+        .unwrap_or_default();
+    if !info_id.starts_with("UsdPrimvarReader") {
+        return (0, None);
+    }
+    let Some(varname) = reader
+        .attrs
+        .get("inputs:varname")
+        .and_then(|a| a.value.as_text())
+    else {
+        return (0, None);
+    };
+    match uv_set_from_varname(varname) {
+        Some(n) => (n, None),
+        None => (0, Some(varname.to_string())),
+    }
+}
+
+/// `st` → 0, `st1` → 1, `st2` → 2, ... `None` for any name outside
+/// the `st<N>` family.
+fn uv_set_from_varname(varname: &str) -> Option<u32> {
+    let rest = varname.strip_prefix("st")?;
+    if rest.is_empty() {
+        return Some(0);
+    }
+    rest.parse::<u32>().ok()
 }
 
 fn find_child_by_name<'a>(parent: &'a Prim, name: &str) -> Option<&'a Prim> {

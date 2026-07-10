@@ -43,6 +43,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   input and connection, and the encode → decode → encode cycle is a
   fixed point (covered by `tests/preview_surface_expanded.rs`).
 
+- **Expanded `UsdUVTexture` + `UsdPrimvarReader` + gprim display
+  attributes (staged schema §2.2 / §2.3 / §2.5).** `wrapS` / `wrapT`
+  map onto the typed sampler wrap modes (`clamp` / `mirror` /
+  `repeat`; `black` and `useMetadata` keep the default and their
+  authored spelling). `scale`, `bias`, `fallback`, and
+  `sourceColorSpace` are preserved on
+  `Scene3D::extras["usd:uvtexture:<id>"]` and replayed by the writer.
+  A texture's `st` connection is followed to its
+  `UsdPrimvarReader_float2` and the reader's `varname` selects the
+  UV set (`st` → 0, `st<N>` → N; non-standard primvar names are
+  preserved); the writer emits the reader back for any non-zero UV
+  set. Meshes now read/write multi-UV `primvars:st1`, `st2`, ... into
+  `Primitive::uvs[N]`, `doubleSided` lands on the primitive extras +
+  the bound material's `double_sided`, and per-vertex
+  `primvars:displayColor` / `displayOpacity` land on the first
+  vertex-colour set (constant/uniform interpolations preserved on
+  extras). Covered by `tests/uvtexture_primvar_reader.rs`.
+
 ### Fixed
 
 - **round-trip drift: bare-mesh-carrier collapse.** A `Scene3D` whose
