@@ -18,8 +18,8 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 
 use oxideav_mesh3d::{
-    AudioData, AudioEmitter, AudioSource, AuralMode, Axis, ImageData, Indices, Material, Mesh,
-    MeshId, NodeId, Primitive, Scene3D, Texture, TextureRef, Topology, Transform, Unit,
+    AlphaMode, AudioData, AudioEmitter, AudioSource, AuralMode, Axis, ImageData, Indices, Material,
+    Mesh, MeshId, NodeId, Primitive, Scene3D, Texture, TextureRef, Topology, Transform, Unit,
 };
 
 use crate::usda::Value;
@@ -1741,6 +1741,88 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
         )
         .unwrap();
     }
+
+    // §2.1 expanded inputs — alpha coverage, specular workflow,
+    // clearcoat lobe, IOR, occlusion multiplier, and the no-typed-slot
+    // constants preserved on extras.
+    if let AlphaMode::Mask { cutoff } = mat.alpha_mode {
+        w.write_indent();
+        writeln!(
+            w.s,
+            "float inputs:opacityThreshold = {}",
+            format_float(cutoff as f64)
+        )
+        .unwrap();
+    }
+    if let Some(spec) = &mat.ext.specular {
+        w.write_indent();
+        writeln!(w.s, "int inputs:useSpecularWorkflow = 1").unwrap();
+        w.write_indent();
+        writeln!(
+            w.s,
+            "color3f inputs:specularColor = ({}, {}, {})",
+            format_float(spec.color_factor[0] as f64),
+            format_float(spec.color_factor[1] as f64),
+            format_float(spec.color_factor[2] as f64)
+        )
+        .unwrap();
+    }
+    if let Some(cc) = &mat.ext.clearcoat {
+        w.write_indent();
+        writeln!(
+            w.s,
+            "float inputs:clearcoat = {}",
+            format_float(cc.factor as f64)
+        )
+        .unwrap();
+        w.write_indent();
+        writeln!(
+            w.s,
+            "float inputs:clearcoatRoughness = {}",
+            format_float(cc.roughness as f64)
+        )
+        .unwrap();
+    }
+    if let Some(ior) = mat.ext.ior {
+        w.write_indent();
+        writeln!(w.s, "float inputs:ior = {}", format_float(ior as f64)).unwrap();
+    }
+    if mat.occlusion_strength != 1.0 {
+        w.write_indent();
+        writeln!(
+            w.s,
+            "float inputs:occlusion = {}",
+            format_float(mat.occlusion_strength as f64)
+        )
+        .unwrap();
+    }
+    if let Some(d) = mat
+        .extras
+        .get("usd:inputs:displacement")
+        .and_then(|v| v.as_f64())
+    {
+        w.write_indent();
+        writeln!(w.s, "float inputs:displacement = {}", format_float(d)).unwrap();
+    }
+    if let Some(nrm) = mat
+        .extras
+        .get("usd:inputs:normal")
+        .and_then(|v| v.as_array())
+    {
+        if nrm.len() == 3 {
+            let c = |i: usize| nrm[i].as_f64().unwrap_or(0.0);
+            w.write_indent();
+            writeln!(
+                w.s,
+                "normal3f inputs:normal = ({}, {}, {})",
+                format_float(c(0)),
+                format_float(c(1)),
+                format_float(c(2))
+            )
+            .unwrap();
+        }
+    }
+
     if let Some(tref) = mat.base_color_texture {
         write_tex_connect(w, &mat_path, "diffuseColor", tref, "rgb");
     }
@@ -1753,6 +1835,45 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
     if let Some(tref) = mat.occlusion_texture {
         write_tex_connect(w, &mat_path, "occlusion", tref, "r");
     }
+    // Packed metallic/roughness slot → re-emit exactly the inputs the
+    // decoder recorded on `usd:mr_connect` ("both" when the source
+    // wired one texture into both inputs; default "both" for scenes
+    // authored directly through the typed model). Channel wiring
+    // follows the packed-map convention the typed slot documents:
+    // roughness = G, metallic = B.
+    if let Some(tref) = mat.metallic_roughness_texture {
+        let which = mat
+            .extras
+            .get("usd:mr_connect")
+            .and_then(|v| v.as_str())
+            .unwrap_or("both");
+        if which == "metallic" || which == "both" {
+            write_tex_connect(w, &mat_path, "metallic", tref, "b");
+        }
+        if which == "roughness" || which == "both" {
+            write_tex_connect(w, &mat_path, "roughness", tref, "g");
+        }
+    }
+    if let Some(spec) = &mat.ext.specular {
+        if let Some(tref) = spec.color_texture {
+            write_tex_connect(w, &mat_path, "specularColor", tref, "rgb");
+        }
+    }
+    if let Some(cc) = &mat.ext.clearcoat {
+        if let Some(tref) = cc.factor_texture {
+            write_tex_connect(w, &mat_path, "clearcoat", tref, "r");
+        }
+        if let Some(tref) = cc.roughness_texture {
+            write_tex_connect(w, &mat_path, "clearcoatRoughness", tref, "g");
+        }
+    }
+    // No-typed-slot texture inputs preserved on extras
+    // (`usd:tex:<input>` → {"texture": N, "uv_set": M}).
+    for (input, channel) in [("opacity", "a"), ("displacement", "r"), ("roughness", "g")] {
+        if let Some(tref) = texref_from_extras(&mat.extras, input) {
+            write_tex_connect(w, &mat_path, input, tref, channel);
+        }
+    }
     w.write_indent();
     writeln!(w.s, "token outputs:surface").unwrap();
     w.indent -= 1;
@@ -1760,14 +1881,23 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
     writeln!(w.s, "}}").unwrap();
 
     // One UsdUVTexture child per bound texture (deduped on TextureId).
+    let extras_texrefs: Vec<Option<TextureRef>> = ["opacity", "displacement", "roughness"]
+        .iter()
+        .map(|input| texref_from_extras(&mat.extras, input))
+        .collect();
     let mut emitted = std::collections::BTreeSet::new();
     for tref in [
         mat.base_color_texture,
         mat.normal_texture,
         mat.emissive_texture,
         mat.occlusion_texture,
+        mat.metallic_roughness_texture,
+        mat.ext.specular.as_ref().and_then(|s| s.color_texture),
+        mat.ext.clearcoat.as_ref().and_then(|c| c.factor_texture),
+        mat.ext.clearcoat.as_ref().and_then(|c| c.roughness_texture),
     ]
     .into_iter()
+    .chain(extras_texrefs)
     .flatten()
     {
         if !emitted.insert(tref.texture.0) {
@@ -1818,11 +1948,28 @@ fn write_tex_connect(w: &mut Out, mat_path: &str, slot: &str, tref: TextureRef, 
 /// connection statement needs.
 fn type_for_slot(slot: &str) -> &'static str {
     match slot {
-        "diffuseColor" | "emissiveColor" => "color3f",
+        "diffuseColor" | "emissiveColor" | "specularColor" => "color3f",
         "normal" => "normal3f",
-        "occlusion" => "float",
+        "occlusion" | "metallic" | "roughness" | "clearcoat" | "clearcoatRoughness" | "opacity"
+        | "displacement" => "float",
         _ => "color3f",
     }
+}
+
+/// Decode a `usd:tex:<input>` extras entry back into a [`TextureRef`]
+/// (`{"texture": N, "uv_set": M}` — the shape the decoder stashes for
+/// shader inputs without a typed texture slot).
+fn texref_from_extras(
+    extras: &std::collections::HashMap<String, serde_json::Value>,
+    input: &str,
+) -> Option<TextureRef> {
+    let v = extras.get(&format!("usd:tex:{input}"))?;
+    let texture = v.get("texture")?.as_u64()? as u32;
+    let uv_set = v.get("uv_set").and_then(|u| u.as_u64()).unwrap_or(0) as u32;
+    Some(TextureRef {
+        texture: oxideav_mesh3d::TextureId(texture),
+        uv_set,
+    })
 }
 
 fn material_prim_name(mat: &Material, idx: usize) -> String {

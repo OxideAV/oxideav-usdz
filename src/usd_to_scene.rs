@@ -1974,6 +1974,42 @@ fn build_material(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Material> {
 }
 
 /// Pull `UsdPreviewSurface` inputs into the `Material` PBR slots.
+///
+/// Full §2.1 input coverage (staged schema tables,
+/// `docs/3d/usd/usdskel-usdpreviewsurface-schema.md`):
+///
+/// * `diffuseColor` / `emissiveColor` / `metallic` / `roughness` /
+///   `opacity` — the round-1 core set, mapped onto the matching
+///   [`Material`] factor slots.
+/// * `opacityThreshold` — `> 0` selects cutout semantics: fragments
+///   with `opacity < threshold` are discarded, the rest render
+///   opaque. Maps onto [`AlphaMode::Mask`] with the threshold as
+///   `cutoff`. `0` (the default) disables cutout; an authored
+///   `opacity < 1` then selects [`AlphaMode::Blend`].
+/// * `useSpecularWorkflow = 1` + `specularColor` — the specular
+///   workflow's normal-incidence reflectivity color, mapped onto
+///   `Material::ext.specular` (the typed specular extension slot).
+///   The workflow selector round-trips via
+///   `extras["usd:useSpecularWorkflow"]`.
+/// * `clearcoat` / `clearcoatRoughness` — second specular lobe,
+///   mapped onto `Material::ext.clearcoat`. Schema defaults fill the
+///   unauthored half (`0.0` strength / `0.01` roughness).
+/// * `ior` — dielectric index of refraction, `Material::ext.ior`.
+/// * `occlusion` — constant ambient-occlusion multiplier, mapped
+///   onto [`Material::occlusion_strength`].
+/// * `displacement` / constant (non-default) `normal` — no typed
+///   model slot; preserved on `extras["usd:inputs:displacement"]` /
+///   `extras["usd:inputs:normal"]`.
+///
+/// Texture connections resolve for every input; slots without a
+/// typed texture home (opacity / displacement / a roughness map
+/// that differs from the metallic map) round-trip through
+/// `extras["usd:tex:<input>"] = {"texture": N, "uv_set": M}`.
+/// `metallic.connect` / `roughness.connect` share the glTF-packed
+/// [`Material::metallic_roughness_texture`] slot; which of the two
+/// inputs was authored is recorded on `extras["usd:mr_connect"]`
+/// (`"metallic"` / `"roughness"` / `"both"`) so the writer re-emits
+/// exactly the authored connections.
 fn apply_preview_surface(
     ctx: &mut Ctx,
     mat: &mut Material,
@@ -1981,18 +2017,18 @@ fn apply_preview_surface(
     parent: &Prim,
     surface: &Prim,
 ) -> Result<()> {
-    if let Some(c) = surface
-        .attrs
-        .get("inputs:diffuseColor")
-        .and_then(|a| a.value.as_floatn::<3>())
-    {
+    let scalar = |name: &str| surface.attrs.get(name).and_then(|a| a.value.as_f32());
+    let color = |name: &str| {
+        surface
+            .attrs
+            .get(name)
+            .and_then(|a| a.value.as_floatn::<3>())
+    };
+
+    if let Some(c) = color("inputs:diffuseColor") {
         mat.base_color = [c[0], c[1], c[2], mat.base_color[3]];
     }
-    if let Some(f) = surface
-        .attrs
-        .get("inputs:metallic")
-        .and_then(|a| a.value.as_f32())
-    {
+    if let Some(f) = scalar("inputs:metallic") {
         mat.metallic = f;
     } else {
         // USDPreviewSurface defaults to non-metallic — override the
@@ -2000,28 +2036,121 @@ fn apply_preview_surface(
         // is in play.
         mat.metallic = 0.0;
     }
-    if let Some(f) = surface
-        .attrs
-        .get("inputs:roughness")
-        .and_then(|a| a.value.as_f32())
-    {
+    if let Some(f) = scalar("inputs:roughness") {
         mat.roughness = f;
     } else {
         mat.roughness = 0.5;
     }
-    if let Some(c) = surface
-        .attrs
-        .get("inputs:emissiveColor")
-        .and_then(|a| a.value.as_floatn::<3>())
-    {
+    if let Some(c) = color("inputs:emissiveColor") {
         mat.emissive_factor = c;
     }
-    if let Some(f) = surface
-        .attrs
-        .get("inputs:opacity")
-        .and_then(|a| a.value.as_f32())
-    {
+    if let Some(f) = scalar("inputs:opacity") {
         mat.base_color[3] = f;
+    }
+
+    // Alpha-coverage mode. Schema §2.1: `opacityThreshold > 0` is
+    // cutout — fragments below the threshold are discarded, the
+    // rest stay opaque (mask). With cutout disabled, a sub-1
+    // opacity is a straight blend.
+    let threshold = scalar("inputs:opacityThreshold").unwrap_or(0.0);
+    if threshold > 0.0 {
+        mat.alpha_mode = oxideav_mesh3d::AlphaMode::Mask { cutoff: threshold };
+    } else if mat.base_color[3] < 1.0 {
+        mat.alpha_mode = oxideav_mesh3d::AlphaMode::Blend;
+    }
+
+    // Specular workflow (`useSpecularWorkflow = 1`): `specularColor`
+    // is the reflectivity at normal incidence. The typed model's
+    // specular extension carries it; the selector int itself rides
+    // on extras so the writer can re-author the exact input.
+    let use_specular = scalar("inputs:useSpecularWorkflow")
+        .map(|f| f as i32)
+        .unwrap_or(0);
+    let specular_color_tex = resolve_texture_connect(
+        ctx,
+        parent_path,
+        parent,
+        surface.attrs.get("inputs:specularColor.connect"),
+    )?;
+    if use_specular == 1 {
+        let mut spec = oxideav_mesh3d::Specular {
+            // Schema default when unauthored: black F0 (USD's
+            // `specularColor` default is (0, 0, 0)).
+            color_factor: color("inputs:specularColor").unwrap_or([0.0, 0.0, 0.0]),
+            ..oxideav_mesh3d::Specular::default()
+        };
+        spec.color_texture = specular_color_tex;
+        mat.ext.specular = Some(spec);
+        mat.extras.insert(
+            "usd:useSpecularWorkflow".into(),
+            serde_json::Value::Number(1.into()),
+        );
+    }
+
+    // Clearcoat lobe — materialise the typed extension when either
+    // input (or either texture connection) is authored.
+    let cc_factor = scalar("inputs:clearcoat");
+    let cc_rough = scalar("inputs:clearcoatRoughness");
+    let cc_factor_tex = resolve_texture_connect(
+        ctx,
+        parent_path,
+        parent,
+        surface.attrs.get("inputs:clearcoat.connect"),
+    )?;
+    let cc_rough_tex = resolve_texture_connect(
+        ctx,
+        parent_path,
+        parent,
+        surface.attrs.get("inputs:clearcoatRoughness.connect"),
+    )?;
+    if cc_factor.is_some()
+        || cc_rough.is_some()
+        || cc_factor_tex.is_some()
+        || cc_rough_tex.is_some()
+    {
+        mat.ext.clearcoat = Some(oxideav_mesh3d::Clearcoat {
+            factor: cc_factor.unwrap_or(0.0),
+            factor_texture: cc_factor_tex,
+            // USD's schema default is 0.01 (unlike glTF's 0.0).
+            roughness: cc_rough.unwrap_or(0.01),
+            roughness_texture: cc_rough_tex,
+            normal_texture: None,
+            normal_scale: 1.0,
+        });
+    }
+
+    if let Some(i) = scalar("inputs:ior") {
+        mat.ext.ior = Some(i);
+    }
+    if let Some(o) = scalar("inputs:occlusion") {
+        mat.occlusion_strength = o;
+    }
+    if let Some(d) = scalar("inputs:displacement") {
+        if let Some(n) = serde_json::Number::from_f64(d as f64) {
+            mat.extras.insert(
+                "usd:inputs:displacement".into(),
+                serde_json::Value::Number(n),
+            );
+        }
+    }
+    // A constant (unconnected) normal opinion other than the
+    // unperturbed default (0, 0, 1) has no typed slot — preserve it.
+    if surface.attrs.get("inputs:normal.connect").is_none() {
+        if let Some(nrm) = color("inputs:normal") {
+            if nrm != [0.0, 0.0, 1.0] {
+                mat.extras.insert(
+                    "usd:inputs:normal".into(),
+                    serde_json::Value::Array(
+                        nrm.iter()
+                            .filter_map(|c| {
+                                serde_json::Number::from_f64(*c as f64)
+                                    .map(serde_json::Value::Number)
+                            })
+                            .collect(),
+                    ),
+                );
+            }
+        }
     }
 
     // Texture connections — `inputs:diffuseColor.connect = </path/to/Tex.outputs:rgb>`.
@@ -2057,7 +2186,88 @@ fn apply_preview_surface(
     )? {
         mat.occlusion_texture = Some(tex_ref);
     }
+
+    // `metallic` / `roughness` maps share the glTF-packed slot; the
+    // authored-input record lets the writer re-emit exactly what the
+    // source wired.
+    let metallic_tex = resolve_texture_connect(
+        ctx,
+        parent_path,
+        parent,
+        surface.attrs.get("inputs:metallic.connect"),
+    )?;
+    let roughness_tex = resolve_texture_connect(
+        ctx,
+        parent_path,
+        parent,
+        surface.attrs.get("inputs:roughness.connect"),
+    )?;
+    match (metallic_tex, roughness_tex) {
+        (Some(m), Some(r)) if m == r => {
+            mat.metallic_roughness_texture = Some(m);
+            mat.extras.insert(
+                "usd:mr_connect".into(),
+                serde_json::Value::String("both".into()),
+            );
+        }
+        (Some(m), Some(r)) => {
+            // Two *different* textures — keep the metallic map in the
+            // typed slot, preserve the roughness map on extras.
+            mat.metallic_roughness_texture = Some(m);
+            mat.extras.insert(
+                "usd:mr_connect".into(),
+                serde_json::Value::String("metallic".into()),
+            );
+            mat.extras
+                .insert("usd:tex:roughness".into(), texref_to_json(r));
+        }
+        (Some(m), None) => {
+            mat.metallic_roughness_texture = Some(m);
+            mat.extras.insert(
+                "usd:mr_connect".into(),
+                serde_json::Value::String("metallic".into()),
+            );
+        }
+        (None, Some(r)) => {
+            mat.metallic_roughness_texture = Some(r);
+            mat.extras.insert(
+                "usd:mr_connect".into(),
+                serde_json::Value::String("roughness".into()),
+            );
+        }
+        (None, None) => {}
+    }
+
+    // Inputs with no typed texture slot round-trip via extras.
+    for input in ["opacity", "displacement"] {
+        if let Some(tex_ref) = resolve_texture_connect(
+            ctx,
+            parent_path,
+            parent,
+            surface
+                .attrs
+                .get(format!("inputs:{input}.connect").as_str()),
+        )? {
+            mat.extras
+                .insert(format!("usd:tex:{input}"), texref_to_json(tex_ref));
+        }
+    }
     Ok(())
+}
+
+/// JSON shape for a [`TextureRef`] preserved on `Material::extras`
+/// (`usd:tex:<input>` slots): `{"texture": N, "uv_set": M}`.
+fn texref_to_json(tref: TextureRef) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "texture".into(),
+        serde_json::Value::Number(tref.texture.0.into()),
+    );
+    obj.insert(
+        "uv_set".into(),
+        serde_json::Value::Number(tref.uv_set.into()),
+    );
+    serde_json::Value::Object(obj)
 }
 
 /// Resolve an `inputs:foo.connect = </path/Tex.outputs:rgb>`

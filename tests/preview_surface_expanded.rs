@@ -1,0 +1,240 @@
+//! Expanded `UsdPreviewSurface` input coverage (staged schema §2.1,
+//! `docs/3d/usd/usdskel-usdpreviewsurface-schema.md`): specular
+//! workflow, clearcoat lobe, IOR, opacity threshold (cutout),
+//! occlusion multiplier, displacement + constant normal
+//! preservation, and metallic/roughness texture connections into the
+//! packed slot — plus the write → re-read round trip for all of it.
+
+mod common;
+
+use oxideav_mesh3d::{AlphaMode, Mesh3DDecoder};
+use oxideav_usdz::{UsdzDecoder, UsdzEncoder};
+
+const EXPANDED_USDA: &str = r#"#usda 1.0
+(
+    defaultPrim = "Root"
+)
+def Xform "Root" {
+    def Mesh "M" {
+        rel material:binding = </Root/Mat>
+        int[] faceVertexCounts = [3]
+        int[] faceVertexIndices = [0, 1, 2]
+        point3f[] points = [(0,0,0), (1,0,0), (0,1,0)]
+    }
+    def Material "Mat" {
+        def Shader "Surface" {
+            uniform token info:id = "UsdPreviewSurface"
+            color3f inputs:diffuseColor = (0.5, 0.4, 0.3)
+            int inputs:useSpecularWorkflow = 1
+            color3f inputs:specularColor = (0.9, 0.8, 0.7)
+            float inputs:clearcoat = 0.6
+            float inputs:clearcoatRoughness = 0.2
+            float inputs:ior = 1.45
+            float inputs:opacity = 0.8
+            float inputs:opacityThreshold = 0.25
+            float inputs:occlusion = 0.75
+            float inputs:displacement = 0.125
+            normal3f inputs:normal = (0, 1, 0)
+            token outputs:surface
+        }
+    }
+}
+"#;
+
+fn decode(usda: &str) -> oxideav_mesh3d::Scene3D {
+    let usdz = common::build_usdz(&[common::UsdzEntry {
+        name: "scene.usda",
+        payload: usda.as_bytes(),
+    }]);
+    UsdzDecoder::new().decode_bytes(&usdz).unwrap()
+}
+
+fn approx(a: f32, b: f32) -> bool {
+    (a - b).abs() < 1e-5
+}
+
+#[test]
+fn specular_workflow_maps_to_specular_extension() {
+    let scene = decode(EXPANDED_USDA);
+    let mat = &scene.materials[0];
+    let spec = mat.ext.specular.as_ref().expect("specular ext set");
+    assert!(approx(spec.color_factor[0], 0.9));
+    assert!(approx(spec.color_factor[1], 0.8));
+    assert!(approx(spec.color_factor[2], 0.7));
+    assert_eq!(
+        mat.extras
+            .get("usd:useSpecularWorkflow")
+            .and_then(|v| v.as_i64()),
+        Some(1)
+    );
+}
+
+#[test]
+fn clearcoat_ior_occlusion_map_to_typed_slots() {
+    let scene = decode(EXPANDED_USDA);
+    let mat = &scene.materials[0];
+    let cc = mat.ext.clearcoat.as_ref().expect("clearcoat ext set");
+    assert!(approx(cc.factor, 0.6));
+    assert!(approx(cc.roughness, 0.2));
+    assert!(approx(mat.ext.ior.expect("ior set"), 1.45));
+    assert!(approx(mat.occlusion_strength, 0.75));
+}
+
+#[test]
+fn opacity_threshold_selects_mask_alpha() {
+    let scene = decode(EXPANDED_USDA);
+    let mat = &scene.materials[0];
+    match mat.alpha_mode {
+        AlphaMode::Mask { cutoff } => assert!(approx(cutoff, 0.25)),
+        other => panic!("expected Mask alpha mode, got {other:?}"),
+    }
+    assert!(approx(mat.base_color[3], 0.8));
+}
+
+#[test]
+fn sub_one_opacity_without_threshold_selects_blend() {
+    let usda = EXPANDED_USDA.replace("float inputs:opacityThreshold = 0.25\n", "");
+    let scene = decode(&usda);
+    assert_eq!(scene.materials[0].alpha_mode, AlphaMode::Blend);
+}
+
+#[test]
+fn displacement_and_constant_normal_preserved_on_extras() {
+    let scene = decode(EXPANDED_USDA);
+    let mat = &scene.materials[0];
+    assert!(approx(
+        mat.extras
+            .get("usd:inputs:displacement")
+            .and_then(|v| v.as_f64())
+            .unwrap() as f32,
+        0.125
+    ));
+    let nrm = mat
+        .extras
+        .get("usd:inputs:normal")
+        .and_then(|v| v.as_array())
+        .expect("normal preserved");
+    assert_eq!(nrm.len(), 3);
+    assert!(approx(nrm[1].as_f64().unwrap() as f32, 1.0));
+}
+
+#[test]
+fn clearcoat_defaults_fill_unauthored_half() {
+    // Only `clearcoat` authored — roughness falls back to the USD
+    // schema default 0.01 (not glTF's 0.0).
+    let usda = r#"#usda 1.0
+def Material "Mat" {
+    def Shader "Surface" {
+        uniform token info:id = "UsdPreviewSurface"
+        float inputs:clearcoat = 1
+        token outputs:surface
+    }
+}
+"#;
+    let scene = decode(usda);
+    let cc = scene.materials[0].ext.clearcoat.as_ref().unwrap();
+    assert!(approx(cc.factor, 1.0));
+    assert!(approx(cc.roughness, 0.01));
+}
+
+#[test]
+fn metallic_roughness_connections_share_packed_slot() {
+    let usda = r#"#usda 1.0
+def Xform "Root" {
+    def Mesh "M" {
+        rel material:binding = </Root/Mat>
+        int[] faceVertexCounts = [3]
+        int[] faceVertexIndices = [0, 1, 2]
+        point3f[] points = [(0,0,0), (1,0,0), (0,1,0)]
+    }
+    def Material "Mat" {
+        def Shader "Surface" {
+            uniform token info:id = "UsdPreviewSurface"
+            float inputs:metallic.connect = </Root/Mat/OrmTex.outputs:b>
+            float inputs:roughness.connect = </Root/Mat/OrmTex.outputs:g>
+            token outputs:surface
+        }
+        def Shader "OrmTex" {
+            uniform token info:id = "UsdUVTexture"
+            asset inputs:file = @orm.png@
+            float outputs:g
+            float outputs:b
+        }
+    }
+}
+"#;
+    let usdz = common::build_usdz(&[
+        common::UsdzEntry {
+            name: "scene.usda",
+            payload: usda.as_bytes(),
+        },
+        common::UsdzEntry {
+            name: "orm.png",
+            payload: b"ORM-PIXEL-DATA",
+        },
+    ]);
+    let scene = UsdzDecoder::new().decode_bytes(&usdz).unwrap();
+    let mat = &scene.materials[0];
+    assert!(mat.metallic_roughness_texture.is_some());
+    assert_eq!(
+        mat.extras.get("usd:mr_connect").and_then(|v| v.as_str()),
+        Some("both"),
+        "same texture on both inputs collapses to one packed slot"
+    );
+    assert_eq!(scene.textures.len(), 1);
+}
+
+#[test]
+fn expanded_material_round_trips() {
+    let scene = decode(EXPANDED_USDA);
+    let bytes = UsdzEncoder::new().encode_bytes(&scene).expect("encode ok");
+    let s2 = UsdzDecoder::new().decode(&bytes).expect("re-decode ok");
+    let a = &scene.materials[0];
+    let b = &s2.materials[0];
+
+    assert_eq!(a.name, b.name);
+    for i in 0..4 {
+        assert!(approx(a.base_color[i], b.base_color[i]), "base_color[{i}]");
+    }
+    assert_eq!(a.alpha_mode, b.alpha_mode);
+    assert!(approx(a.occlusion_strength, b.occlusion_strength));
+    let (sa, sb) = (
+        a.ext.specular.as_ref().unwrap(),
+        b.ext.specular.as_ref().unwrap(),
+    );
+    assert_eq!(sa.color_factor, sb.color_factor);
+    let (ca, cb) = (
+        a.ext.clearcoat.as_ref().unwrap(),
+        b.ext.clearcoat.as_ref().unwrap(),
+    );
+    assert!(approx(ca.factor, cb.factor));
+    assert!(approx(ca.roughness, cb.roughness));
+    assert_eq!(a.ext.ior, b.ext.ior);
+    assert_eq!(
+        a.extras.get("usd:inputs:displacement"),
+        b.extras.get("usd:inputs:displacement")
+    );
+    assert_eq!(
+        a.extras.get("usd:inputs:normal"),
+        b.extras.get("usd:inputs:normal")
+    );
+}
+
+#[test]
+fn second_encode_of_expanded_material_is_stable() {
+    let scene = decode(EXPANDED_USDA);
+    let first = UsdzEncoder::new()
+        .encode_with_report(&scene)
+        .expect("encode ok")
+        .usda;
+    let bytes = UsdzEncoder::new().encode_bytes(&scene).expect("encode ok");
+    let s2 = UsdzDecoder::new().decode(&bytes).expect("decode ok");
+    let second = UsdzEncoder::new()
+        .encode_with_report(&s2)
+        .expect("encode ok")
+        .usda;
+    assert_eq!(
+        first, second,
+        "expanded-material round-trip must be a fixed point"
+    );
+}

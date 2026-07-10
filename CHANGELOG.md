@@ -23,6 +23,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keyed by the timeCode's decimal string, and `variant_codec`
   round-trips it losslessly (order + f64 keys preserved).
 
+- **Expanded `UsdPreviewSurface` input coverage (staged schema §2.1).**
+  The material translator now reads the full shader input set:
+  `useSpecularWorkflow = 1` + `specularColor` map onto the typed
+  specular extension slot (workflow selector preserved on
+  `extras["usd:useSpecularWorkflow"]`), `clearcoat` /
+  `clearcoatRoughness` onto the clearcoat extension (USD's `0.01`
+  roughness default honoured, not glTF's `0.0`), `ior` onto the IOR
+  extension, `occlusion` onto `occlusion_strength`, and
+  `opacityThreshold > 0` selects cutout (`AlphaMode::Mask`) with a
+  sub-1 `opacity` otherwise selecting `AlphaMode::Blend`.
+  `displacement` and a non-default constant `normal` are preserved on
+  `extras["usd:inputs:*"]`. `metallic.connect` / `roughness.connect`
+  resolve into the packed metallic-roughness texture slot with the
+  authored-input record on `extras["usd:mr_connect"]`; texture
+  connections without a typed slot (opacity, displacement, a
+  roughness map differing from the metallic map) round-trip through
+  `extras["usd:tex:<input>"]`. The writer re-emits every expanded
+  input and connection, and the encode → decode → encode cycle is a
+  fixed point (covered by `tests/preview_surface_expanded.rs`).
+
 ### Fixed
 
 - **round-trip drift: bare-mesh-carrier collapse.** A `Scene3D` whose
