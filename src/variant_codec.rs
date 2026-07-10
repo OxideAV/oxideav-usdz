@@ -310,6 +310,25 @@ fn encode_value(v: &Value) -> JValue {
             JValue::Object(o)
         }
         Value::Raw(s) => tagged("Raw", JValue::String(s.clone())),
+        Value::TimeSamples(samples) => tagged(
+            "TimeSamples",
+            JValue::Array(
+                samples
+                    .iter()
+                    .map(|(t, v)| {
+                        let mut o = JMap::new();
+                        o.insert(
+                            "time".into(),
+                            serde_json::Number::from_f64(*t)
+                                .map(JValue::Number)
+                                .unwrap_or(JValue::Null),
+                        );
+                        o.insert("value".into(), encode_value(v));
+                        JValue::Object(o)
+                    })
+                    .collect(),
+            ),
+        ),
         Value::ListOp(list) => {
             let mut o = JMap::new();
             o.insert("t".into(), JValue::String("ListOp".into()));
@@ -353,6 +372,23 @@ fn decode_value(v: &JValue) -> Value {
             prim_path: read_str(obj, "prim_path"),
         },
         "Raw" => Value::Raw(read_str(obj, "v")),
+        "TimeSamples" => {
+            let samples = match obj.get("v") {
+                Some(JValue::Array(arr)) => arr
+                    .iter()
+                    .filter_map(|entry| {
+                        let JValue::Object(o) = entry else {
+                            return None;
+                        };
+                        let time = o.get("time").and_then(|t| t.as_f64())?;
+                        let value = o.get("value").map(decode_value).unwrap_or(Value::None);
+                        Some((time, value))
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            Value::TimeSamples(samples)
+        }
         "ListOp" => {
             let sub = |k: &str| obj.get(k).map(decode_value);
             Value::ListOp(Box::new(crate::usda::ListOp {

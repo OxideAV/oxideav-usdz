@@ -836,6 +836,7 @@ fn render_value(v: &crate::usda::Value) -> Option<String> {
             buf
         }
         V::AssetWithPath { asset, prim_path } => format!("@{asset}@<{prim_path}>"),
+        V::TimeSamples(samples) => format_time_samples(samples, render_value),
         V::Raw(s) => s.clone(),
         // A list-edited field has no single literal body; render the
         // strongest authored sublist as a fallback for callers that
@@ -852,6 +853,28 @@ fn render_value(v: &crate::usda::Value) -> Option<String> {
         }
         V::None => return None,
     })
+}
+
+/// Serialise a timeSamples map back into its `{ T: V, T: V }` USDA
+/// literal. `render` is the value renderer of the calling context
+/// ([`render_value`] or [`format_metadata_value`]) so both emission
+/// paths stay literal-compatible with their surroundings.
+fn format_time_samples(
+    samples: &[(f64, Value)],
+    render: impl Fn(&Value) -> Option<String>,
+) -> String {
+    let mut s = String::from("{");
+    for (i, (time, value)) in samples.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push(' ');
+        s.push_str(&format_float(*time));
+        s.push_str(": ");
+        s.push_str(&render(value).unwrap_or_else(|| "None".into()));
+    }
+    s.push_str(" }");
+    s
 }
 
 fn escape_quoted(s: &str) -> String {
@@ -1882,6 +1905,9 @@ fn format_metadata_value(value: &Value) -> String {
             s
         }
         Value::AssetWithPath { asset, prim_path } => format!("@{asset}@<{prim_path}>"),
+        Value::TimeSamples(samples) => {
+            format_time_samples(samples, |v| Some(format_metadata_value(v)))
+        }
         Value::Dict(map) => format_metadata_dict(map),
         // Single-body fallback (multi-operator emission lives in
         // `format_metadata_lines`): render the strongest authored
@@ -1936,6 +1962,7 @@ fn guess_usda_type(v: &Value) -> &'static str {
         Value::Bool(_) => "bool",
         Value::Tuple(_) => "double3",
         Value::Array(_) => "string[]",
+        Value::TimeSamples(_) => "double",
         Value::Dict(_) => "dictionary",
         Value::ListOp(list) => list
             .entries()

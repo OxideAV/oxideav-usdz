@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **USDA `timeSamples` parsing.** The parser now understands the
+  time-sampled attribute value form
+  `<attr>.timeSamples = { 0: VALUE, 10: VALUE, ... }` — the shape
+  UsdSkel animations author their `translations` / `rotations` /
+  `scales` / `blendShapeWeights` in. Samples land on the new
+  `usda::Value::TimeSamples(Vec<(f64, Value)>)` variant in authoring
+  order (negative timeCodes and trailing commas tolerated). The
+  braces syntax is disambiguated from `{ TYPE NAME = VALUE }` typed
+  dictionaries on the first non-trivia character after `{` (numeric
+  lead-in = timeSamples). The writer emits the map back with the
+  same literal shape, the extras JSON view flattens it to an object
+  keyed by the timeCode's decimal string, and `variant_codec`
+  round-trips it losslessly (order + f64 keys preserved).
+
 ### Fixed
 
 - **round-trip drift: bare-mesh-carrier collapse.** A `Scene3D` whose

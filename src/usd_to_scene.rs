@@ -2186,6 +2186,16 @@ fn value_to_json(v: &Value) -> Option<serde_json::Value> {
                 .map(|(k, v)| (k.clone(), value_to_json(v).unwrap_or(J::Null)))
                 .collect(),
         ),
+        // Time-sample maps flatten to a JSON object keyed by the
+        // timeCode's decimal string so an extras consumer can read
+        // each sample; the typed round-trip path goes through
+        // `variant_codec` which preserves order + f64 keys exactly.
+        Value::TimeSamples(samples) => J::Object(
+            samples
+                .iter()
+                .map(|(t, v)| (format!("{t}"), value_to_json(v).unwrap_or(J::Null)))
+                .collect(),
+        ),
         // `references = @file@</Prim>` — flatten to "asset</prim>"
         // for the JSON view; consumers wanting the parts can walk
         // the prim tree directly.

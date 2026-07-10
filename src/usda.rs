@@ -304,6 +304,18 @@ pub enum Value {
         /// `<...>` portion (empty when omitted).
         prim_path: String,
     },
+    /// Time-sampled attribute value — the right-hand side of a
+    /// `<attr>.timeSamples = { 0: VALUE, 10: VALUE, ... }`
+    /// statement. Each entry pairs the authored timeCode (a decimal
+    /// literal; the layer's `timeCodesPerSecond` metadata maps it to
+    /// seconds) with the value at that sample. Entries are kept in
+    /// authoring order (USDA convention: ascending time).
+    ///
+    /// The braces syntax collides with [`Value::Dict`]'s
+    /// `{ TYPE NAME = VALUE }` shape; the parser disambiguates on the
+    /// first non-trivia character after `{` — a digit / sign starts a
+    /// time-sample map, an identifier starts a typed dictionary.
+    TimeSamples(Vec<(f64, Value)>),
     /// A list-edited metadata field — `prepend references = ...`,
     /// `append references = ...`, `delete references = ...`,
     /// `add references = ...`, `reorder references = ...`, or an
@@ -1075,7 +1087,23 @@ fn parse_value(t: &mut Tokenizer<'_>) -> Result<Value> {
         '<' => Ok(Value::Path(read_path(t)?)),
         '(' => Ok(Value::Tuple(read_tuple(t)?)),
         '[' => Ok(Value::Array(read_array(t)?)),
-        '{' => Ok(Value::Dict(read_dict(t)?)),
+        '{' => {
+            // Disambiguate `{ TYPE NAME = VALUE }` typed dictionaries
+            // from `{ 0: VALUE, 10: VALUE }` timeSamples maps: peek
+            // past the `{` — a leading digit or sign can only start a
+            // timeCode key.
+            let saved = t.pos;
+            t.advance(); // consume `{`
+            t.skip_trivia();
+            let leads_numeric =
+                matches!(t.peek_char(), Some(c) if c.is_ascii_digit() || c == '+' || c == '-');
+            t.pos = saved;
+            if leads_numeric {
+                Ok(Value::TimeSamples(read_time_samples(t)?))
+            } else {
+                Ok(Value::Dict(read_dict(t)?))
+            }
+        }
         '+' | '-' => read_number(t),
         c if c.is_ascii_digit() => read_number(t),
         c if is_ident_start(c) => {
@@ -1153,6 +1181,56 @@ fn read_dict(t: &mut Tokenizer<'_>) -> Result<BTreeMap<String, Value>> {
             // the key still round-trips.
             out.insert(name, Value::None);
         }
+    }
+}
+
+/// Read a `{ TIME: VALUE, TIME: VALUE, ... }` time-sample map — the
+/// right-hand side of a `.timeSamples` attribute statement.
+///
+/// Each key is a decimal timeCode literal (`0`, `10`, `2.5`, `-1`);
+/// each value is any [`Value`] the general literal parser accepts
+/// (scalars, tuples, arrays of tuples, ...). Entries are separated
+/// by commas; a trailing comma before the closing `}` is tolerated
+/// (authoring tools commonly emit one). Entries are returned in
+/// authoring order.
+fn read_time_samples(t: &mut Tokenizer<'_>) -> Result<Vec<(f64, Value)>> {
+    if !t.eat('{') {
+        return Err(invalid("expected `{` to start timeSamples map"));
+    }
+    let mut out = Vec::new();
+    loop {
+        t.skip_trivia();
+        if t.eat('}') {
+            return Ok(out);
+        }
+        if t.eof() {
+            return Err(invalid("EOF inside `{ ... }` timeSamples map"));
+        }
+        let time = match read_number(t)? {
+            Value::Float(f) => f,
+            _ => unreachable!("read_number only returns Float"),
+        };
+        t.skip_trivia();
+        if !t.eat(':') {
+            return Err(invalid(format!(
+                "expected `:` after timeSample key at {}",
+                t.pos_display()
+            )));
+        }
+        t.skip_trivia();
+        let value = parse_value(t)?;
+        out.push((time, value));
+        t.skip_trivia();
+        if t.eat(',') {
+            continue;
+        }
+        if t.eat('}') {
+            return Ok(out);
+        }
+        return Err(invalid(format!(
+            "expected `,` or `}}` in timeSamples map at {}",
+            t.pos_display()
+        )));
     }
 }
 
@@ -1509,6 +1587,61 @@ def Xform "Root" {
             Value::Asset(s) => assert_eq!(s, "./diffuse.png"),
             other => panic!("expected Asset, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_time_samples_scalar() {
+        let src = b"#usda 1.0\ndef SkelAnimation \"A\" {\n    float[] blendShapeWeights.timeSamples = {\n        0: [0],\n        10: [1],\n    }\n}\n";
+        let layer = parse(src).expect("parse ok");
+        let a = &layer.prims[0];
+        let attr = a.attrs.get("blendShapeWeights.timeSamples").unwrap();
+        let Value::TimeSamples(samples) = &attr.value else {
+            panic!("expected TimeSamples, got {:?}", attr.value);
+        };
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].0, 0.0);
+        assert_eq!(samples[1].0, 10.0);
+        assert_eq!(samples[1].1.as_seq().unwrap()[0].as_f32(), Some(1.0));
+    }
+
+    #[test]
+    fn parse_time_samples_tuple_arrays() {
+        let src = b"#usda 1.0\ndef SkelAnimation \"A\" {\n    quatf[] rotations.timeSamples = {\n        0: [(1, 0, 0, 0), (1, 0, 0, 0)],\n        2.5: [(0.707, 0, 0.707, 0), (1, 0, 0, 0)]\n    }\n}\n";
+        let layer = parse(src).expect("parse ok");
+        let attr = layer.prims[0].attrs.get("rotations.timeSamples").unwrap();
+        let Value::TimeSamples(samples) = &attr.value else {
+            panic!("expected TimeSamples");
+        };
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[1].0, 2.5);
+        let frame = samples[1].1.as_seq().unwrap();
+        assert_eq!(frame.len(), 2);
+        assert_eq!(frame[0].as_floatn::<4>(), Some([0.707, 0.0, 0.707, 0.0]));
+    }
+
+    #[test]
+    fn typed_dict_still_parses_after_time_sample_support() {
+        // A `{ string k = "v" }` dict must not be mistaken for a
+        // timeSamples map (identifier lead-in vs numeric lead-in).
+        let src =
+            b"#usda 1.0\n(\n    customLayerData = {\n        string creator = \"x\"\n    }\n)\n";
+        let layer = parse(src).expect("parse ok");
+        let Some(Value::Dict(d)) = layer.metadata.get("customLayerData") else {
+            panic!("expected Dict");
+        };
+        assert_eq!(d.get("creator").and_then(|v| v.as_text()), Some("x"));
+    }
+
+    #[test]
+    fn time_samples_negative_time_and_trailing_comma() {
+        let src = b"#usda 1.0\ndef X \"A\" {\n    double v.timeSamples = { -1.5: 3, 0: 4, }\n}\n";
+        let layer = parse(src).expect("parse ok");
+        let attr = layer.prims[0].attrs.get("v.timeSamples").unwrap();
+        let Value::TimeSamples(samples) = &attr.value else {
+            panic!("expected TimeSamples");
+        };
+        assert_eq!(samples[0].0, -1.5);
+        assert_eq!(samples[1].1.as_f32(), Some(4.0));
     }
 
     #[test]
