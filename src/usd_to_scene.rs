@@ -76,9 +76,22 @@ pub fn translate(layer: &Layer, archive: Arc<Vec<u8>>, entries: &[ZipEntry]) -> 
         textures_by_path: HashMap::new(),
         skeletons_by_path: HashMap::new(),
         skins_by_skeleton: HashMap::new(),
+        time_codes_per_second: 24.0,
     };
 
     apply_layer_metadata(&mut ctx.scene, &layer.metadata);
+    // SkelAnimation timeCodes → seconds conversion factor. USD's
+    // layer default when unauthored is 24 timeCodes per second.
+    if let Some(tcps) = layer
+        .metadata
+        .get("timeCodesPerSecond")
+        .or_else(|| layer.metadata.get("framesPerSecond"))
+        .and_then(|v| v.as_f32())
+    {
+        if tcps > 0.0 {
+            ctx.time_codes_per_second = tcps as f64;
+        }
+    }
 
     // LayerStack composition (round 10): gather every in-archive
     // sublayer recursively, then merge their prim trees underneath
@@ -982,6 +995,10 @@ struct Ctx {
     /// One [`Skin`](oxideav_mesh3d::Skin) per bound skeleton, shared
     /// across every geometry node binding it.
     skins_by_skeleton: HashMap<u32, oxideav_mesh3d::SkinId>,
+    /// Layer `timeCodesPerSecond` (fallback `framesPerSecond`,
+    /// default 24) — maps SkelAnimation timeCodes onto the typed
+    /// model's keyframe seconds.
+    time_codes_per_second: f64,
 }
 
 /// Pre-pass record for one `def Skeleton` (UsdSkel §1.2).
@@ -993,9 +1010,8 @@ struct SkelInfo {
     /// reference it).
     joint_tokens: Vec<String>,
     /// One scene-graph node per joint, same order as `joint_tokens`.
-    /// Consumed by the SkelAnimation channel decoder (each animated
-    /// joint token resolves to its node target through this table).
-    #[allow(dead_code)]
+    /// The SkelAnimation channel decoder resolves each animated
+    /// joint token to its node target through this table.
     joint_nodes: Vec<oxideav_mesh3d::NodeId>,
     /// The joints with no parent among `joint_tokens` — the carrier
     /// node's children.
@@ -1378,6 +1394,35 @@ fn build_node(ctx: &mut Ctx, parent: &str, prim: &Prim) -> Result<Option<oxideav
                 node.extras
                     .insert("usd:skel:jointNames".into(), serde_json::Value::Array(arr));
             }
+            stash_extras(&mut node.extras, prim);
+            Ok(Some(ctx.scene.add_node(node)))
+        }
+        // UsdSkel §1.3: a SkelAnimation decodes into one typed
+        // [`Animation`](oxideav_mesh3d::Animation) — per-joint
+        // Translation / Rotation / Scale channels targeting the
+        // joint nodes of the skeleton its `joints` tokens name. The
+        // carrier node marks `usd:skelAnimation` (the animation
+        // index) so the writer re-emits a `def SkelAnimation` at the
+        // same spot. `PackedJointAnimation` is the deprecated
+        // predecessor with the same attribute surface.
+        "SkelAnimation" | "PackedJointAnimation" => {
+            let Some(anim_idx) = build_skel_animation(ctx, &path, prim)? else {
+                // No skeleton matches the animation's joints — keep
+                // the prim as an unknown-schema node so nothing is
+                // silently dropped.
+                let mut node = Node::new().with_name(prim.name.clone());
+                node.extras.insert(
+                    "usd:type".into(),
+                    serde_json::Value::String(prim.type_name.clone()),
+                );
+                stash_extras(&mut node.extras, prim);
+                return Ok(Some(ctx.scene.add_node(node)));
+            };
+            let mut node = Node::new().with_name(prim.name.clone());
+            node.extras.insert(
+                "usd:skelAnimation".into(),
+                serde_json::Value::Number(anim_idx.into()),
+            );
             stash_extras(&mut node.extras, prim);
             Ok(Some(ctx.scene.add_node(node)))
         }
@@ -2376,6 +2421,185 @@ fn skel_skin_for_prim(ctx: &mut Ctx, prim: &Prim) -> Option<oxideav_mesh3d::Skin
     let sid = ctx.scene.add_skin(skin);
     ctx.skins_by_skeleton.insert(info.skeleton.0, sid);
     Some(sid)
+}
+
+/// UsdSkel §1.3: decode a `def SkelAnimation` into one typed
+/// [`Animation`](oxideav_mesh3d::Animation) and return its index in
+/// `scene.animations` — or `None` when no registered skeleton
+/// matches any of the animation's `joints` tokens (nothing to
+/// target).
+///
+/// * `joints` (uniform token[]) — the joint ordering this animation
+///   authors; **may be a subset of, and differently ordered than,**
+///   the Skeleton's `joints`. Tokens are matched into the skeleton
+///   whose joint set overlaps most.
+/// * `translations` (float3[]) / `rotations` (quatf[]) / `scales`
+///   (half3[]) — parallel per-joint arrays per time sample. Each
+///   becomes one channel per joint (Translation / Rotation / Scale)
+///   targeting that joint's node. USD's `quatf` literal is
+///   `(w, x, y, z)`; the typed model stores xyzw.
+/// * timeCodes map to seconds through the layer's
+///   `timeCodesPerSecond`; a non-sampled (default-value) array is a
+///   single keyframe at `t = 0`.
+/// * `blendShapes` / `blendShapeWeights` decode into a
+///   `MorphWeights` channel per bound geometry (matched through the
+///   geometry's `skel:blendShapes` channel names) — handled by the
+///   blend-shape pass.
+fn build_skel_animation(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Option<usize>> {
+    let joint_tokens: Vec<String> = prim
+        .attrs
+        .get("joints")
+        .and_then(|a| a.value.as_seq())
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|v| v.as_text().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if joint_tokens.is_empty() {
+        return Ok(None);
+    }
+
+    // Pick the skeleton whose joint set overlaps the animation's
+    // tokens the most (typical content has exactly one skeleton).
+    let mut best: Option<(&SkelInfo, usize)> = None;
+    for info in ctx.skeletons_by_path.values() {
+        let matches = joint_tokens
+            .iter()
+            .filter(|t| info.joint_tokens.contains(t))
+            .count();
+        if matches > 0 && best.map(|(_, m)| matches > m).unwrap_or(true) {
+            best = Some((info, matches));
+        }
+    }
+    let Some((info, _)) = best else {
+        return Ok(None);
+    };
+    // Target node per animation joint (skipping unmatched tokens —
+    // §1.3 says consumers remap by matching path tokens).
+    let targets: Vec<Option<oxideav_mesh3d::NodeId>> = joint_tokens
+        .iter()
+        .map(|t| {
+            info.joint_tokens
+                .iter()
+                .position(|jt| jt == t)
+                .map(|i| info.joint_nodes[i])
+        })
+        .collect();
+
+    let tcps = ctx.time_codes_per_second;
+    // Materialise `<name>.timeSamples` (or the non-sampled default
+    // as one keyframe at t = 0) into (times_seconds, per-sample
+    // sequence-of-tuples) pairs.
+    let read_samples = |name: &str| -> Option<(Vec<f32>, Vec<Vec<Value>>)> {
+        if let Some(attr) = prim.attrs.get(&format!("{name}.timeSamples")) {
+            if let Value::TimeSamples(samples) = &attr.value {
+                let mut times = Vec::with_capacity(samples.len());
+                let mut frames = Vec::with_capacity(samples.len());
+                for (t, v) in samples {
+                    times.push((t / tcps) as f32);
+                    frames.push(v.as_seq().map(<[Value]>::to_vec).unwrap_or_default());
+                }
+                return Some((times, frames));
+            }
+        }
+        let attr = prim.attrs.get(name)?;
+        let frame = attr.value.as_seq()?.to_vec();
+        Some((vec![0.0], vec![frame]))
+    };
+
+    let n_joints = joint_tokens.len();
+    let mut channels: Vec<oxideav_mesh3d::AnimationChannel> = Vec::new();
+
+    // Translation + Scale share the float3 shape.
+    for (attr_name, property) in [
+        (
+            "translations",
+            oxideav_mesh3d::AnimationProperty::Translation,
+        ),
+        ("scales", oxideav_mesh3d::AnimationProperty::Scale),
+    ] {
+        let Some((times, frames)) = read_samples(attr_name) else {
+            continue;
+        };
+        for frame in &frames {
+            if frame.len() != n_joints {
+                return Err(invalid(format!(
+                    "SkelAnimation `{path}`: a `{attr_name}` sample has {} entries for {} joints \
+                     (§1.3 requires parallel arrays)",
+                    frame.len(),
+                    n_joints
+                )));
+            }
+        }
+        for (j, target) in targets.iter().enumerate() {
+            let Some(node) = target else { continue };
+            let mut values = Vec::with_capacity(frames.len());
+            for frame in &frames {
+                values.push(frame[j].as_floatn::<3>().ok_or_else(|| {
+                    invalid(format!(
+                        "SkelAnimation `{path}`: malformed `{attr_name}` tuple for joint {j}"
+                    ))
+                })?);
+            }
+            channels.push(oxideav_mesh3d::AnimationChannel {
+                target: oxideav_mesh3d::AnimationTarget {
+                    node: *node,
+                    property,
+                },
+                sampler: oxideav_mesh3d::AnimationSampler {
+                    keyframes: times.clone(),
+                    values: oxideav_mesh3d::AnimationValues::Vec3(values),
+                    interpolation: oxideav_mesh3d::Interpolation::Linear,
+                },
+            });
+        }
+    }
+
+    // Rotations: quatf authored (w, x, y, z) → internal xyzw.
+    if let Some((times, frames)) = read_samples("rotations") {
+        for frame in &frames {
+            if frame.len() != n_joints {
+                return Err(invalid(format!(
+                    "SkelAnimation `{path}`: a `rotations` sample has {} entries for {} joints",
+                    frame.len(),
+                    n_joints
+                )));
+            }
+        }
+        for (j, target) in targets.iter().enumerate() {
+            let Some(node) = target else { continue };
+            let mut values = Vec::with_capacity(frames.len());
+            for frame in &frames {
+                let wxyz = frame[j].as_floatn::<4>().ok_or_else(|| {
+                    invalid(format!(
+                        "SkelAnimation `{path}`: malformed `rotations` quaternion for joint {j}"
+                    ))
+                })?;
+                values.push([wxyz[1], wxyz[2], wxyz[3], wxyz[0]]);
+            }
+            channels.push(oxideav_mesh3d::AnimationChannel {
+                target: oxideav_mesh3d::AnimationTarget {
+                    node: *node,
+                    property: oxideav_mesh3d::AnimationProperty::Rotation,
+                },
+                sampler: oxideav_mesh3d::AnimationSampler {
+                    keyframes: times.clone(),
+                    values: oxideav_mesh3d::AnimationValues::Quat(values),
+                    interpolation: oxideav_mesh3d::Interpolation::Linear,
+                },
+            });
+        }
+    }
+
+    if channels.is_empty() {
+        return Ok(None);
+    }
+    let idx = ctx.scene.add_animation(oxideav_mesh3d::Animation {
+        name: Some(prim.name.clone()),
+        channels,
+    });
+    Ok(Some(idx))
 }
 
 /// Build a Lines / LineStrip / LineLoop primitive from a USD

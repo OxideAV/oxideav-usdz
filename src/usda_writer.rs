@@ -452,6 +452,18 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
         write_skeleton_prim(w, scene, node, &safe_name, skel_idx as usize);
         return;
     }
+
+    // UsdSkel §1.3: an animation-carrier node (decoder marker
+    // `usd:skelAnimation` = animation index) re-emits as a
+    // `def SkelAnimation` reconstructed from the typed channels.
+    if let Some(anim_idx) = node
+        .extras
+        .get("usd:skelAnimation")
+        .and_then(|v| v.as_u64())
+    {
+        write_skel_animation_prim(w, scene, &safe_name, anim_idx as usize);
+        return;
+    }
     // Round 8: surface the prim's variant declarations on the prim
     // metadata block — `prepend variantSets = [...]` lists the set
     // names we'll emit inside the body, and `variants = {...}` carries
@@ -498,11 +510,8 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
                         // BindingAPI opinion, so no Xform wrapper is
                         // needed (and keeping one would re-grow the
                         // tree each encode→decode cycle).
-                        let skel_path = node
-                            .skin
-                            .and_then(|sid| scene.skins.get(sid.0 as usize))
-                            .and_then(|skin| skeleton_prim_path(scene, skin.skeleton));
-                        write_mesh(w, scene, mesh, mesh_id, parent_path, skel_path.as_deref());
+                        let skel = skel_binding_paths(scene, node);
+                        write_mesh(w, scene, mesh, mesh_id, parent_path, skel.as_ref());
                         return;
                     }
                 }
@@ -561,11 +570,8 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
     // carries the §1.5 BindingAPI opinions.
     if let Some(mesh_id) = node.mesh {
         if let Some(mesh) = scene.mesh(mesh_id) {
-            let skel_path = node
-                .skin
-                .and_then(|sid| scene.skins.get(sid.0 as usize))
-                .and_then(|skin| skeleton_prim_path(scene, skin.skeleton));
-            write_mesh(w, scene, mesh, mesh_id, &path, skel_path.as_deref());
+            let skel = skel_binding_paths(scene, node);
+            write_mesh(w, scene, mesh, mesh_id, &path, skel.as_ref());
         }
     }
 
@@ -1049,7 +1055,7 @@ fn write_mesh(
     mesh: &Mesh,
     _id: MeshId,
     parent_path: &str,
-    skel_path: Option<&str>,
+    skel: Option<&SkelBindingPaths>,
 ) {
     let raw_name = mesh.name.clone().unwrap_or_else(|| "Mesh".to_string());
     let mesh_name = sanitize_prim_name(&raw_name);
@@ -1090,28 +1096,14 @@ fn write_mesh(
             format!("{mesh_name}_{i}")
         };
         match prim.topology {
-            Topology::Triangles => write_one_mesh_prim(w, scene, prim, &prim_name, None, skel_path),
+            Topology::Triangles => write_one_mesh_prim(w, scene, prim, &prim_name, None, skel),
             Topology::TriangleStrip => {
                 let expanded = expand_strip_to_triangle_list(prim);
-                write_one_mesh_prim(
-                    w,
-                    scene,
-                    &expanded,
-                    &prim_name,
-                    Some("triangleStrip"),
-                    skel_path,
-                );
+                write_one_mesh_prim(w, scene, &expanded, &prim_name, Some("triangleStrip"), skel);
             }
             Topology::TriangleFan => {
                 let expanded = expand_fan_to_triangle_list(prim);
-                write_one_mesh_prim(
-                    w,
-                    scene,
-                    &expanded,
-                    &prim_name,
-                    Some("triangleFan"),
-                    skel_path,
-                );
+                write_one_mesh_prim(w, scene, &expanded, &prim_name, Some("triangleFan"), skel);
             }
             Topology::Lines | Topology::LineStrip | Topology::LineLoop => {
                 write_basis_curves_prim(w, scene, prim, &prim_name);
@@ -1136,7 +1128,7 @@ fn write_one_mesh_prim(
     prim: &Primitive,
     prim_name: &str,
     original_topology_hint: Option<&str>,
-    skel_path: Option<&str>,
+    skel: Option<&SkelBindingPaths>,
 ) {
     let mut metadata_lines: Vec<String> = Vec::new();
     if let Some(token) = original_topology_hint {
@@ -1145,7 +1137,7 @@ fn write_one_mesh_prim(
     if extras_no_fold(&prim.extras) {
         metadata_lines.push("usd:no_fold = 1".to_string());
     }
-    let skinned = skel_path.is_some() && prim.joints.is_some();
+    let skinned = skel.is_some() && prim.joints.is_some();
     if skinned {
         // §1.5: BindingAPI is an applied API schema — declare it on
         // the skinned geometry prim.
@@ -1201,11 +1193,14 @@ fn write_one_mesh_prim(
     // quad width, indices in the Skeleton's own joint order — no
     // `skel:joints` override needed on output).
     if skinned {
-        if let (Some(joints), Some(weights), Some(skel_path)) =
-            (&prim.joints, &prim.weights, skel_path)
-        {
+        if let (Some(joints), Some(weights), Some(skel)) = (&prim.joints, &prim.weights, skel) {
+            let skel_path = &skel.skeleton;
             w.write_indent();
             writeln!(w.s, "rel skel:skeleton = <{skel_path}>").unwrap();
+            if let Some(anim_path) = &skel.animation {
+                w.write_indent();
+                writeln!(w.s, "rel skel:animationSource = <{anim_path}>").unwrap();
+            }
             w.write_indent();
             write!(w.s, "int[] primvars:skel:jointIndices = [").unwrap();
             for (i, q) in joints.iter().enumerate() {
@@ -1301,24 +1296,68 @@ fn format_matrix4(m: [[f32; 4]; 4]) -> String {
     s
 }
 
-/// Emitted prim path of the carrier node marking `skeleton_id` —
-/// found by replaying the writer's deterministic naming over the
-/// node forest. `None` when the scene has no carrier for that
-/// skeleton (e.g. a programmatically built scene without the
-/// decoder's `usd:skeleton` marker).
-fn skeleton_prim_path(scene: &Scene3D, skeleton_id: oxideav_mesh3d::SkeletonId) -> Option<String> {
-    fn walk(scene: &Scene3D, id: NodeId, parent_path: &str, target: u64) -> Option<String> {
+/// UsdSkel binding paths the node walk passes down to a skinned
+/// geometry prim: the bound skeleton's emitted prim path plus (when
+/// an animation drives that skeleton) the animation's emitted prim
+/// path for the `skel:animationSource` relationship.
+struct SkelBindingPaths {
+    skeleton: String,
+    animation: Option<String>,
+}
+
+/// Resolve a skinned node's [`SkelBindingPaths`]. `None` when the
+/// node is unskinned or the scene carries no skeleton carrier.
+fn skel_binding_paths(scene: &Scene3D, node: &oxideav_mesh3d::Node) -> Option<SkelBindingPaths> {
+    let skin = scene.skins.get(node.skin?.0 as usize)?;
+    let skeleton = marker_prim_path(scene, "usd:skeleton", skin.skeleton.0 as u64)?;
+    let animation = animation_index_for_skeleton(scene, skin.skeleton)
+        .and_then(|idx| marker_prim_path(scene, "usd:skelAnimation", idx as u64));
+    Some(SkelBindingPaths {
+        skeleton,
+        animation,
+    })
+}
+
+/// Index of the first animation whose channels target the given
+/// skeleton's joints — the `skel:animationSource` the writer
+/// re-authors for geometry bound to that skeleton.
+fn animation_index_for_skeleton(
+    scene: &Scene3D,
+    skeleton_id: oxideav_mesh3d::SkeletonId,
+) -> Option<usize> {
+    let skeleton = scene.skeletons.get(skeleton_id.0 as usize)?;
+    let joint_set: std::collections::BTreeSet<u32> = skeleton.joints.iter().map(|j| j.0).collect();
+    scene.animations.iter().position(|anim| {
+        anim.channels
+            .iter()
+            .any(|ch| joint_set.contains(&ch.target.node.0))
+    })
+}
+
+/// Emitted prim path of the carrier node whose extras `marker` holds
+/// `target` — found by replaying the writer's deterministic naming
+/// over the node forest. `None` when the scene has no such carrier
+/// (e.g. a programmatically built scene without the decoder's
+/// markers).
+fn marker_prim_path(scene: &Scene3D, marker: &str, target: u64) -> Option<String> {
+    fn walk(
+        scene: &Scene3D,
+        id: NodeId,
+        parent_path: &str,
+        marker: &str,
+        target: u64,
+    ) -> Option<String> {
         let node = scene.node(id)?;
         let name = node
             .name
             .clone()
             .unwrap_or_else(|| format!("node_{}", id.0));
         let path = format!("{parent_path}/{}", sanitize_prim_name(&name));
-        if node.extras.get("usd:skeleton").and_then(|v| v.as_u64()) == Some(target) {
+        if node.extras.get(marker).and_then(|v| v.as_u64()) == Some(target) {
             return Some(path);
         }
         for &child in &node.children {
-            if let Some(found) = walk(scene, child, &path, target) {
+            if let Some(found) = walk(scene, child, &path, marker, target) {
                 return Some(found);
             }
         }
@@ -1327,7 +1366,215 @@ fn skeleton_prim_path(scene: &Scene3D, skeleton_id: oxideav_mesh3d::SkeletonId) 
     scene
         .roots
         .iter()
-        .find_map(|&root| walk(scene, root, "", skeleton_id.0 as u64))
+        .find_map(|&root| walk(scene, root, "", marker, target))
+}
+
+/// Layer timeCodes-per-second used to map the typed model's
+/// keyframe seconds back onto SkelAnimation timeCodes — read from
+/// the preserved layer metadata (`usd:timeCodesPerSecond` /
+/// `usd:framesPerSecond` extras), defaulting to USD's 24.
+fn time_codes_per_second(scene: &Scene3D) -> f64 {
+    scene
+        .extras
+        .get("usd:timeCodesPerSecond")
+        .or_else(|| scene.extras.get("usd:framesPerSecond"))
+        .and_then(|v| v.as_f64())
+        .filter(|f| *f > 0.0)
+        .unwrap_or(24.0)
+}
+
+/// Emit a `def SkelAnimation "<name>" { ... }` prim (§1.3)
+/// reconstructed from one typed
+/// [`Animation`](oxideav_mesh3d::Animation):
+///
+/// * `joints` — token per animated joint node (first-appearance
+///   channel order), rebuilt from the skeleton carriers' joint
+///   trees.
+/// * `translations` / `rotations` / `scales` `.timeSamples` — one
+///   per-joint array per keyframe, timeCodes = seconds x the
+///   layer's `timeCodesPerSecond`. Rotations convert xyzw →
+///   USD's `(w, x, y, z)` quatf literal. A joint lacking a channel
+///   for an emitted property gets the identity default for that
+///   slot.
+fn write_skel_animation_prim(w: &mut Out, scene: &Scene3D, safe_name: &str, anim_idx: usize) {
+    use oxideav_mesh3d::{AnimationProperty, AnimationValues};
+    let Some(anim) = scene.animations.get(anim_idx) else {
+        return;
+    };
+
+    // Token per joint node across every skeleton carrier.
+    let mut tokens_by_node: std::collections::HashMap<u32, String> =
+        std::collections::HashMap::new();
+    for node in &scene.nodes {
+        if node.extras.contains_key("usd:skeleton") {
+            for &root in &node.children {
+                assign_joint_tokens(scene, root, "", &mut tokens_by_node);
+            }
+        }
+    }
+
+    // Animated joints in first-appearance channel order.
+    let mut joints: Vec<NodeId> = Vec::new();
+    for ch in &anim.channels {
+        if matches!(
+            ch.target.property,
+            AnimationProperty::Translation | AnimationProperty::Rotation | AnimationProperty::Scale
+        ) && !joints.contains(&ch.target.node)
+        {
+            joints.push(ch.target.node);
+        }
+    }
+
+    w.write_indent();
+    writeln!(w.s, "def SkelAnimation \"{safe_name}\" {{").unwrap();
+    w.indent += 1;
+
+    w.write_indent();
+    write!(w.s, "uniform token[] joints = [").unwrap();
+    for (i, joint) in joints.iter().enumerate() {
+        if i > 0 {
+            w.s.push_str(", ");
+        }
+        let fallback = format!("joint_{}", joint.0);
+        let token = tokens_by_node
+            .get(&joint.0)
+            .map(String::as_str)
+            .unwrap_or(&fallback);
+        write!(w.s, "\"{token}\"").unwrap();
+    }
+    writeln!(w.s, "]").unwrap();
+
+    let tcps = time_codes_per_second(scene);
+    let channel_for = |node: NodeId, property: AnimationProperty| {
+        anim.channels
+            .iter()
+            .find(|ch| ch.target.node == node && ch.target.property == property)
+    };
+    // Keyframe timeline: the decoder produces parallel samplers, so
+    // the first TRS channel's keyframes are the shared timeline.
+    let timeline: Vec<f32> = anim
+        .channels
+        .iter()
+        .find(|ch| {
+            matches!(
+                ch.target.property,
+                AnimationProperty::Translation
+                    | AnimationProperty::Rotation
+                    | AnimationProperty::Scale
+            )
+        })
+        .map(|ch| ch.sampler.keyframes.clone())
+        .unwrap_or_default();
+
+    for (attr_name, type_token, property, default) in [
+        (
+            "translations",
+            "float3[]",
+            AnimationProperty::Translation,
+            [0.0f32, 0.0, 0.0],
+        ),
+        (
+            "scales",
+            "half3[]",
+            AnimationProperty::Scale,
+            [1.0, 1.0, 1.0],
+        ),
+    ] {
+        if !joints.iter().any(|&j| channel_for(j, property).is_some()) {
+            continue;
+        }
+        w.write_indent();
+        write!(w.s, "{type_token} {attr_name}.timeSamples = {{").unwrap();
+        for (k, t) in timeline.iter().enumerate() {
+            if k > 0 {
+                w.s.push(',');
+            }
+            write!(w.s, " {}: [", format_float((*t as f64) * tcps)).unwrap();
+            for (i, &joint) in joints.iter().enumerate() {
+                if i > 0 {
+                    w.s.push_str(", ");
+                }
+                let v = channel_for(joint, property)
+                    .and_then(|ch| match &ch.sampler.values {
+                        AnimationValues::Vec3(vals) => vals.get(k).copied(),
+                        _ => None,
+                    })
+                    .unwrap_or(default);
+                write!(
+                    w.s,
+                    "({}, {}, {})",
+                    format_float(v[0] as f64),
+                    format_float(v[1] as f64),
+                    format_float(v[2] as f64)
+                )
+                .unwrap();
+            }
+            w.s.push(']');
+        }
+        writeln!(w.s, " }}").unwrap();
+    }
+
+    if joints
+        .iter()
+        .any(|&j| channel_for(j, AnimationProperty::Rotation).is_some())
+    {
+        w.write_indent();
+        write!(w.s, "quatf[] rotations.timeSamples = {{").unwrap();
+        for (k, t) in timeline.iter().enumerate() {
+            if k > 0 {
+                w.s.push(',');
+            }
+            write!(w.s, " {}: [", format_float((*t as f64) * tcps)).unwrap();
+            for (i, &joint) in joints.iter().enumerate() {
+                if i > 0 {
+                    w.s.push_str(", ");
+                }
+                let q = channel_for(joint, AnimationProperty::Rotation)
+                    .and_then(|ch| match &ch.sampler.values {
+                        AnimationValues::Quat(vals) => vals.get(k).copied(),
+                        _ => None,
+                    })
+                    .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+                // Internal xyzw → USD's (w, x, y, z) literal.
+                write!(
+                    w.s,
+                    "({}, {}, {}, {})",
+                    format_float(q[3] as f64),
+                    format_float(q[0] as f64),
+                    format_float(q[1] as f64),
+                    format_float(q[2] as f64)
+                )
+                .unwrap();
+            }
+            w.s.push(']');
+        }
+        writeln!(w.s, " }}").unwrap();
+    }
+
+    w.indent -= 1;
+    w.write_indent();
+    writeln!(w.s, "}}").unwrap();
+}
+
+/// DFS from a joint node assigning slash-joined name-path tokens —
+/// shared by the Skeleton and SkelAnimation writers.
+fn assign_joint_tokens(
+    scene: &Scene3D,
+    id: NodeId,
+    prefix: &str,
+    out: &mut std::collections::HashMap<u32, String>,
+) {
+    let Some(n) = scene.node(id) else { return };
+    let name = sanitize_prim_name(n.name.as_deref().unwrap_or("joint"));
+    let token = if prefix.is_empty() {
+        name
+    } else {
+        format!("{prefix}/{name}")
+    };
+    for &child in &n.children {
+        assign_joint_tokens(scene, child, &token, out);
+    }
+    out.insert(id.0, token);
 }
 
 /// Emit a `def Skeleton "<name>" { ... }` prim (§1.2) reconstructed
@@ -1355,26 +1602,8 @@ fn write_skeleton_prim(
     // slash-joined name paths.
     let mut tokens_by_node: std::collections::HashMap<u32, String> =
         std::collections::HashMap::new();
-    fn assign_tokens(
-        scene: &Scene3D,
-        id: NodeId,
-        prefix: &str,
-        out: &mut std::collections::HashMap<u32, String>,
-    ) {
-        let Some(n) = scene.node(id) else { return };
-        let name = sanitize_prim_name(n.name.as_deref().unwrap_or("joint"));
-        let token = if prefix.is_empty() {
-            name
-        } else {
-            format!("{prefix}/{name}")
-        };
-        for &child in &n.children {
-            assign_tokens(scene, child, &token, out);
-        }
-        out.insert(id.0, token);
-    }
     for &root in &node.children {
-        assign_tokens(scene, root, "", &mut tokens_by_node);
+        assign_joint_tokens(scene, root, "", &mut tokens_by_node);
     }
 
     w.write_indent();

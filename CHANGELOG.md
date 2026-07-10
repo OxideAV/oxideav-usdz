@@ -95,6 +95,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   integration tests in `tests/usdskel_binding.rs`, including
   write → re-read fidelity and the one-cycle fixed point.
 
+- **UsdSkel SkelAnimation (staged schema §1.3).** A
+  `def SkelAnimation` (or the deprecated `PackedJointAnimation`)
+  decodes into one typed `Animation`: per-joint Translation /
+  Rotation / Scale channels targeting the joint nodes of the
+  skeleton its `joints` tokens name (subset / reordered token lists
+  remap by path-token match; the parallel-array lengths are
+  validated per sample). timeCodes map to seconds through the
+  layer's `timeCodesPerSecond` (fallback `framesPerSecond`, default
+  24); a non-sampled default array is a single keyframe at `t = 0`;
+  `quatf` literals convert from USD's `(w, x, y, z)` to the model's
+  xyzw. The carrier node marks `usd:skelAnimation` so the writer
+  re-emits a `def SkelAnimation` reconstructed from the typed
+  channels (joint tokens rebuilt from the skeleton carriers,
+  per-property `.timeSamples` maps on the shared timeline, seconds x
+  tcps back to timeCodes) and skinned geometry re-authors
+  `rel skel:animationSource` pointing at the animation that drives
+  its bound skeleton. 8 integration tests in
+  `tests/usdskel_animation.rs`, including round-trip fidelity and
+  the one-cycle fixed point.
+
 ### Fixed
 
 - **round-trip drift: bare-mesh-carrier collapse.** A `Scene3D` whose
