@@ -2091,18 +2091,19 @@ fn build_material(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Material> {
 ///   `cutoff`. `0` (the default) disables cutout; an authored
 ///   `opacity < 1` then selects [`AlphaMode::Blend`].
 /// * `useSpecularWorkflow = 1` + `specularColor` — the specular
-///   workflow's normal-incidence reflectivity color, mapped onto
-///   `Material::ext.specular` (the typed specular extension slot).
-///   The workflow selector round-trips via
-///   `extras["usd:useSpecularWorkflow"]`.
-/// * `clearcoat` / `clearcoatRoughness` — second specular lobe,
-///   mapped onto `Material::ext.clearcoat`. Schema defaults fill the
-///   unauthored half (`0.0` strength / `0.01` roughness).
-/// * `ior` — dielectric index of refraction, `Material::ext.ior`.
+///   workflow. Both ride on extras (`usd:useSpecularWorkflow`,
+///   `usd:inputs:specularColor`) so the writer re-authors exactly
+///   the source inputs. (A typed-slot mapping onto the material-
+///   extension model is deferred until the published
+///   `oxideav-mesh3d` release carries it — the current release's
+///   `Material` has no extension surface.)
+/// * `clearcoat` / `clearcoatRoughness` / `ior` / `displacement` —
+///   scalar inputs preserved per-input on
+///   `extras["usd:inputs:<name>"]`, so only authored opinions
+///   re-emit.
 /// * `occlusion` — constant ambient-occlusion multiplier, mapped
 ///   onto [`Material::occlusion_strength`].
-/// * `displacement` / constant (non-default) `normal` — no typed
-///   model slot; preserved on `extras["usd:inputs:displacement"]` /
+/// * constant (non-default) `normal` — preserved on
 ///   `extras["usd:inputs:normal"]`.
 ///
 /// Texture connections resolve for every input; slots without a
@@ -2164,78 +2165,60 @@ fn apply_preview_surface(
     }
 
     // Specular workflow (`useSpecularWorkflow = 1`): `specularColor`
-    // is the reflectivity at normal incidence. The typed model's
-    // specular extension carries it; the selector int itself rides
-    // on extras so the writer can re-author the exact input.
+    // is the reflectivity at normal incidence. Both ride on extras —
+    // the workflow selector plus the authored color — so the writer
+    // re-authors exactly the source inputs. (A typed-slot mapping is
+    // deferred until the published typed model grows an extension
+    // surface.)
     let use_specular = scalar("inputs:useSpecularWorkflow")
         .map(|f| f as i32)
         .unwrap_or(0);
-    let specular_color_tex = resolve_texture_connect(
-        ctx,
-        parent_path,
-        parent,
-        surface.attrs.get("inputs:specularColor.connect"),
-    )?;
     if use_specular == 1 {
-        let mut spec = oxideav_mesh3d::Specular {
-            // Schema default when unauthored: black F0 (USD's
-            // `specularColor` default is (0, 0, 0)).
-            color_factor: color("inputs:specularColor").unwrap_or([0.0, 0.0, 0.0]),
-            ..oxideav_mesh3d::Specular::default()
-        };
-        spec.color_texture = specular_color_tex;
-        mat.ext.specular = Some(spec);
         mat.extras.insert(
             "usd:useSpecularWorkflow".into(),
             serde_json::Value::Number(1.into()),
         );
     }
-
-    // Clearcoat lobe — materialise the typed extension when either
-    // input (or either texture connection) is authored.
-    let cc_factor = scalar("inputs:clearcoat");
-    let cc_rough = scalar("inputs:clearcoatRoughness");
-    let cc_factor_tex = resolve_texture_connect(
+    if let Some(sc) = color("inputs:specularColor") {
+        mat.extras
+            .insert("usd:inputs:specularColor".into(), f32s_to_json(&sc));
+    }
+    if let Some(tref) = resolve_texture_connect(
         ctx,
         parent_path,
         parent,
-        surface.attrs.get("inputs:clearcoat.connect"),
-    )?;
-    let cc_rough_tex = resolve_texture_connect(
-        ctx,
-        parent_path,
-        parent,
-        surface.attrs.get("inputs:clearcoatRoughness.connect"),
-    )?;
-    if cc_factor.is_some()
-        || cc_rough.is_some()
-        || cc_factor_tex.is_some()
-        || cc_rough_tex.is_some()
-    {
-        mat.ext.clearcoat = Some(oxideav_mesh3d::Clearcoat {
-            factor: cc_factor.unwrap_or(0.0),
-            factor_texture: cc_factor_tex,
-            // USD's schema default is 0.01 (unlike glTF's 0.0).
-            roughness: cc_rough.unwrap_or(0.01),
-            roughness_texture: cc_rough_tex,
-            normal_texture: None,
-            normal_scale: 1.0,
-        });
+        surface.attrs.get("inputs:specularColor.connect"),
+    )? {
+        mat.extras
+            .insert("usd:tex:specularColor".into(), texref_to_json(tref));
     }
 
-    if let Some(i) = scalar("inputs:ior") {
-        mat.ext.ior = Some(i);
+    // Clearcoat lobe, IOR, displacement — scalar inputs preserved
+    // per-input so only the authored opinions re-emit.
+    for input in ["clearcoat", "clearcoatRoughness", "ior", "displacement"] {
+        if let Some(f) = scalar(&format!("inputs:{input}")) {
+            if let Some(n) = serde_json::Number::from_f64(f as f64) {
+                mat.extras
+                    .insert(format!("usd:inputs:{input}"), serde_json::Value::Number(n));
+            }
+        }
     }
+    for input in ["clearcoat", "clearcoatRoughness"] {
+        if let Some(tref) = resolve_texture_connect(
+            ctx,
+            parent_path,
+            parent,
+            surface
+                .attrs
+                .get(format!("inputs:{input}.connect").as_str()),
+        )? {
+            mat.extras
+                .insert(format!("usd:tex:{input}"), texref_to_json(tref));
+        }
+    }
+
     if let Some(o) = scalar("inputs:occlusion") {
         mat.occlusion_strength = o;
-    }
-    if let Some(d) = scalar("inputs:displacement") {
-        if let Some(n) = serde_json::Number::from_f64(d as f64) {
-            mat.extras.insert(
-                "usd:inputs:displacement".into(),
-                serde_json::Value::Number(n),
-            );
-        }
     }
     // A constant (unconnected) normal opinion other than the
     // unperturbed default (0, 0, 1) has no typed slot — preserve it.
@@ -2357,6 +2340,16 @@ fn apply_preview_surface(
         }
     }
     Ok(())
+}
+
+/// JSON array of numbers from an `f32` slice (extras stash shape for
+/// color / vector shader inputs).
+fn f32s_to_json(xs: &[f32]) -> serde_json::Value {
+    serde_json::Value::Array(
+        xs.iter()
+            .filter_map(|c| serde_json::Number::from_f64(*c as f64).map(serde_json::Value::Number))
+            .collect(),
+    )
 }
 
 /// JSON shape for a [`TextureRef`] preserved on `Material::extras`

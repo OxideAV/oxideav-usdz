@@ -25,19 +25,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Expanded `UsdPreviewSurface` input coverage (staged schema §2.1).**
   The material translator now reads the full shader input set:
-  `useSpecularWorkflow = 1` + `specularColor` map onto the typed
-  specular extension slot (workflow selector preserved on
-  `extras["usd:useSpecularWorkflow"]`), `clearcoat` /
-  `clearcoatRoughness` onto the clearcoat extension (USD's `0.01`
-  roughness default honoured, not glTF's `0.0`), `ior` onto the IOR
-  extension, `occlusion` onto `occlusion_strength`, and
+  `occlusion` maps onto `occlusion_strength`, and
   `opacityThreshold > 0` selects cutout (`AlphaMode::Mask`) with a
   sub-1 `opacity` otherwise selecting `AlphaMode::Blend`.
-  `displacement` and a non-default constant `normal` are preserved on
-  `extras["usd:inputs:*"]`. `metallic.connect` / `roughness.connect`
-  resolve into the packed metallic-roughness texture slot with the
-  authored-input record on `extras["usd:mr_connect"]`; texture
-  connections without a typed slot (opacity, displacement, a
+  `useSpecularWorkflow` + `specularColor`, `clearcoat`,
+  `clearcoatRoughness`, `ior`, `displacement`, and a non-default
+  constant `normal` are preserved per-input on
+  `extras["usd:inputs:*"]` / `extras["usd:useSpecularWorkflow"]`, so
+  only authored opinions re-emit. (Mapping the specular workflow /
+  clearcoat / IOR onto the typed material-extension slots is deferred
+  until the published `oxideav-mesh3d` release carries that extension
+  surface.) `metallic.connect` / `roughness.connect` resolve into the
+  packed metallic-roughness texture slot with the authored-input
+  record on `extras["usd:mr_connect"]`; texture connections without a
+  typed slot (opacity, displacement, specularColor, clearcoat maps, a
   roughness map differing from the metallic map) round-trip through
   `extras["usd:tex:<input>"]`. The writer re-emits every expanded
   input and connection, and the encode → decode → encode cycle is a

@@ -1853,38 +1853,42 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
         )
         .unwrap();
     }
-    if let Some(spec) = &mat.ext.specular {
+    if mat
+        .extras
+        .get("usd:useSpecularWorkflow")
+        .and_then(|v| v.as_i64())
+        == Some(1)
+    {
         w.write_indent();
         writeln!(w.s, "int inputs:useSpecularWorkflow = 1").unwrap();
-        w.write_indent();
-        writeln!(
-            w.s,
-            "color3f inputs:specularColor = ({}, {}, {})",
-            format_float(spec.color_factor[0] as f64),
-            format_float(spec.color_factor[1] as f64),
-            format_float(spec.color_factor[2] as f64)
-        )
-        .unwrap();
     }
-    if let Some(cc) = &mat.ext.clearcoat {
-        w.write_indent();
-        writeln!(
-            w.s,
-            "float inputs:clearcoat = {}",
-            format_float(cc.factor as f64)
-        )
-        .unwrap();
-        w.write_indent();
-        writeln!(
-            w.s,
-            "float inputs:clearcoatRoughness = {}",
-            format_float(cc.roughness as f64)
-        )
-        .unwrap();
+    if let Some(sc) = mat
+        .extras
+        .get("usd:inputs:specularColor")
+        .and_then(|v| v.as_array())
+    {
+        if sc.len() == 3 {
+            let c = |i: usize| sc[i].as_f64().unwrap_or(0.0);
+            w.write_indent();
+            writeln!(
+                w.s,
+                "color3f inputs:specularColor = ({}, {}, {})",
+                format_float(c(0)),
+                format_float(c(1)),
+                format_float(c(2))
+            )
+            .unwrap();
+        }
     }
-    if let Some(ior) = mat.ext.ior {
-        w.write_indent();
-        writeln!(w.s, "float inputs:ior = {}", format_float(ior as f64)).unwrap();
+    for input in ["clearcoat", "clearcoatRoughness", "ior", "displacement"] {
+        if let Some(f) = mat
+            .extras
+            .get(&format!("usd:inputs:{input}"))
+            .and_then(|v| v.as_f64())
+        {
+            w.write_indent();
+            writeln!(w.s, "float inputs:{input} = {}", format_float(f)).unwrap();
+        }
     }
     if mat.occlusion_strength != 1.0 {
         w.write_indent();
@@ -1894,14 +1898,6 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
             format_float(mat.occlusion_strength as f64)
         )
         .unwrap();
-    }
-    if let Some(d) = mat
-        .extras
-        .get("usd:inputs:displacement")
-        .and_then(|v| v.as_f64())
-    {
-        w.write_indent();
-        writeln!(w.s, "float inputs:displacement = {}", format_float(d)).unwrap();
     }
     if let Some(nrm) = mat
         .extras
@@ -1953,22 +1949,9 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
             write_tex_connect(w, &mat_path, "roughness", tref, "g");
         }
     }
-    if let Some(spec) = &mat.ext.specular {
-        if let Some(tref) = spec.color_texture {
-            write_tex_connect(w, &mat_path, "specularColor", tref, "rgb");
-        }
-    }
-    if let Some(cc) = &mat.ext.clearcoat {
-        if let Some(tref) = cc.factor_texture {
-            write_tex_connect(w, &mat_path, "clearcoat", tref, "r");
-        }
-        if let Some(tref) = cc.roughness_texture {
-            write_tex_connect(w, &mat_path, "clearcoatRoughness", tref, "g");
-        }
-    }
     // No-typed-slot texture inputs preserved on extras
     // (`usd:tex:<input>` → {"texture": N, "uv_set": M}).
-    for (input, channel) in [("opacity", "a"), ("displacement", "r"), ("roughness", "g")] {
+    for (input, channel) in EXTRAS_TEX_INPUTS {
         if let Some(tref) = texref_from_extras(&mat.extras, input) {
             write_tex_connect(w, &mat_path, input, tref, channel);
         }
@@ -1980,9 +1963,9 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
     writeln!(w.s, "}}").unwrap();
 
     // One UsdUVTexture child per bound texture (deduped on TextureId).
-    let extras_texrefs: Vec<Option<TextureRef>> = ["opacity", "displacement", "roughness"]
+    let extras_texrefs: Vec<Option<TextureRef>> = EXTRAS_TEX_INPUTS
         .iter()
-        .map(|input| texref_from_extras(&mat.extras, input))
+        .map(|(input, _)| texref_from_extras(&mat.extras, input))
         .collect();
     let mut emitted = std::collections::BTreeSet::new();
     for tref in [
@@ -1991,9 +1974,6 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
         mat.emissive_texture,
         mat.occlusion_texture,
         mat.metallic_roughness_texture,
-        mat.ext.specular.as_ref().and_then(|s| s.color_texture),
-        mat.ext.clearcoat.as_ref().and_then(|c| c.factor_texture),
-        mat.ext.clearcoat.as_ref().and_then(|c| c.roughness_texture),
     ]
     .into_iter()
     .chain(extras_texrefs)
@@ -2133,6 +2113,18 @@ fn type_for_slot(slot: &str) -> &'static str {
         _ => "color3f",
     }
 }
+
+/// Shader inputs whose texture connection has no typed model slot;
+/// each round-trips through `Material::extras["usd:tex:<input>"]`
+/// with the listed output channel.
+const EXTRAS_TEX_INPUTS: [(&str, &str); 6] = [
+    ("opacity", "a"),
+    ("displacement", "r"),
+    ("roughness", "g"),
+    ("specularColor", "rgb"),
+    ("clearcoat", "r"),
+    ("clearcoatRoughness", "g"),
+];
 
 /// Decode a `usd:tex:<input>` extras entry back into a [`TextureRef`]
 /// (`{"texture": N, "uv_set": M}` — the shape the decoder stashes for

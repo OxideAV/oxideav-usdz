@@ -53,30 +53,49 @@ fn approx(a: f32, b: f32) -> bool {
     (a - b).abs() < 1e-5
 }
 
+fn extras_f32(mat: &oxideav_mesh3d::Material, key: &str) -> Option<f32> {
+    mat.extras
+        .get(key)
+        .and_then(|v| v.as_f64())
+        .map(|f| f as f32)
+}
+
 #[test]
-fn specular_workflow_maps_to_specular_extension() {
+fn specular_workflow_preserved_on_extras() {
     let scene = decode(EXPANDED_USDA);
     let mat = &scene.materials[0];
-    let spec = mat.ext.specular.as_ref().expect("specular ext set");
-    assert!(approx(spec.color_factor[0], 0.9));
-    assert!(approx(spec.color_factor[1], 0.8));
-    assert!(approx(spec.color_factor[2], 0.7));
     assert_eq!(
         mat.extras
             .get("usd:useSpecularWorkflow")
             .and_then(|v| v.as_i64()),
         Some(1)
     );
+    let sc: Vec<f64> = mat
+        .extras
+        .get("usd:inputs:specularColor")
+        .and_then(|v| v.as_array())
+        .expect("specularColor preserved")
+        .iter()
+        .filter_map(|v| v.as_f64())
+        .collect();
+    assert!(approx(sc[0] as f32, 0.9));
+    assert!(approx(sc[1] as f32, 0.8));
+    assert!(approx(sc[2] as f32, 0.7));
 }
 
 #[test]
-fn clearcoat_ior_occlusion_map_to_typed_slots() {
+fn clearcoat_ior_occlusion_mapped() {
     let scene = decode(EXPANDED_USDA);
     let mat = &scene.materials[0];
-    let cc = mat.ext.clearcoat.as_ref().expect("clearcoat ext set");
-    assert!(approx(cc.factor, 0.6));
-    assert!(approx(cc.roughness, 0.2));
-    assert!(approx(mat.ext.ior.expect("ior set"), 1.45));
+    assert!(approx(
+        extras_f32(mat, "usd:inputs:clearcoat").unwrap(),
+        0.6
+    ));
+    assert!(approx(
+        extras_f32(mat, "usd:inputs:clearcoatRoughness").unwrap(),
+        0.2
+    ));
+    assert!(approx(extras_f32(mat, "usd:inputs:ior").unwrap(), 1.45));
     assert!(approx(mat.occlusion_strength, 0.75));
 }
 
@@ -119,9 +138,10 @@ fn displacement_and_constant_normal_preserved_on_extras() {
 }
 
 #[test]
-fn clearcoat_defaults_fill_unauthored_half() {
-    // Only `clearcoat` authored — roughness falls back to the USD
-    // schema default 0.01 (not glTF's 0.0).
+fn only_authored_clearcoat_inputs_preserved() {
+    // Only `clearcoat` authored — the unauthored roughness must not
+    // materialise a synthetic opinion (the schema default 0.01 is the
+    // consumer's job, not the file's).
     let usda = r#"#usda 1.0
 def Material "Mat" {
     def Shader "Surface" {
@@ -132,9 +152,15 @@ def Material "Mat" {
 }
 "#;
     let scene = decode(usda);
-    let cc = scene.materials[0].ext.clearcoat.as_ref().unwrap();
-    assert!(approx(cc.factor, 1.0));
-    assert!(approx(cc.roughness, 0.01));
+    let mat = &scene.materials[0];
+    assert!(approx(
+        extras_f32(mat, "usd:inputs:clearcoat").unwrap(),
+        1.0
+    ));
+    assert!(
+        !mat.extras.contains_key("usd:inputs:clearcoatRoughness"),
+        "unauthored input must not be synthesised"
+    );
 }
 
 #[test]
@@ -198,26 +224,17 @@ fn expanded_material_round_trips() {
     }
     assert_eq!(a.alpha_mode, b.alpha_mode);
     assert!(approx(a.occlusion_strength, b.occlusion_strength));
-    let (sa, sb) = (
-        a.ext.specular.as_ref().unwrap(),
-        b.ext.specular.as_ref().unwrap(),
-    );
-    assert_eq!(sa.color_factor, sb.color_factor);
-    let (ca, cb) = (
-        a.ext.clearcoat.as_ref().unwrap(),
-        b.ext.clearcoat.as_ref().unwrap(),
-    );
-    assert!(approx(ca.factor, cb.factor));
-    assert!(approx(ca.roughness, cb.roughness));
-    assert_eq!(a.ext.ior, b.ext.ior);
-    assert_eq!(
-        a.extras.get("usd:inputs:displacement"),
-        b.extras.get("usd:inputs:displacement")
-    );
-    assert_eq!(
-        a.extras.get("usd:inputs:normal"),
-        b.extras.get("usd:inputs:normal")
-    );
+    for key in [
+        "usd:useSpecularWorkflow",
+        "usd:inputs:specularColor",
+        "usd:inputs:clearcoat",
+        "usd:inputs:clearcoatRoughness",
+        "usd:inputs:ior",
+        "usd:inputs:displacement",
+        "usd:inputs:normal",
+    ] {
+        assert_eq!(a.extras.get(key), b.extras.get(key), "extras `{key}`");
+    }
 }
 
 #[test]
