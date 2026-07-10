@@ -62,6 +62,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   vertex-colour set (constant/uniform interpolations preserved on
   extras). Covered by `tests/uvtexture_primvar_reader.rs`.
 
+- **UsdSkel core — `SkelRoot` / `Skeleton` / BindingAPI (staged
+  schema §1.1–§1.6).** A `def Skeleton` now materialises into the
+  typed model: one scene-graph node per `joints` token (tree
+  topology from the path-prefix rule, local rest transform from
+  `restTransforms`) plus a `Skeleton` resource whose
+  `inverse_bind_matrices` are the inverted world-space
+  `bindTransforms` (Gauss-Jordan, f64). The carrier node marks
+  itself with `extras["usd:skeleton"]` so the writer re-emits a
+  `def Skeleton` reconstructed from the typed data (joint tokens
+  from the node tree, `bindTransforms` re-inverted, `restTransforms`
+  from the joint nodes' local transforms); `jointNames` round-trips
+  via the carrier stash. BindingAPI: `rel skel:skeleton` binds
+  geometry (inheritance down namespace per §1.5 — `skel:skeleton` /
+  `skel:animationSource` / `skel:joints` propagate to descendants),
+  `primvars:skel:jointIndices` / `jointWeights` decode under their
+  `interpolation` (`constant` = rigid, replicated per point;
+  `vertex` = per point) and `elementSize` knobs into the typed
+  4-wide joint/weight quads (over-4 influence sets keep the 4
+  strongest; weights stay as-authored per §1.6), with `skel:joints`
+  overrides remapped into the Skeleton's canonical joint order by
+  token match. `geomBindTransform` + `skinningMethod` ride on
+  `Primitive::extras["usd:skel:*"]`. Skinned nodes get a shared
+  `Skin` (explicit root = the skeleton's root joint) and the writer
+  emits the full binding back (`SkelBindingAPI` apiSchemas
+  declaration, skeleton rel, canonical `vertex`/`elementSize = 4`
+  influence primvars). `def SkelRoot` survives as the container's
+  schema token via `extras["usd:type"]` (unknown-schema containers
+  now re-emit their token generally). The attribute-metadata parser
+  additionally tolerates `,` / `;` entry separators
+  (`(elementSize = 4, interpolation = "vertex")`). 13 new
+  integration tests in `tests/usdskel_binding.rs`, including
+  write → re-read fidelity and the one-cycle fixed point.
+
 ### Fixed
 
 - **round-trip drift: bare-mesh-carrier collapse.** A `Scene3D` whose

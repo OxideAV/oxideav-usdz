@@ -74,6 +74,8 @@ pub fn translate(layer: &Layer, archive: Arc<Vec<u8>>, entries: &[ZipEntry]) -> 
         entries: entry_map.clone(),
         materials_by_path: HashMap::new(),
         textures_by_path: HashMap::new(),
+        skeletons_by_path: HashMap::new(),
+        skins_by_skeleton: HashMap::new(),
     };
 
     apply_layer_metadata(&mut ctx.scene, &layer.metadata);
@@ -209,11 +211,25 @@ pub fn translate(layer: &Layer, archive: Arc<Vec<u8>>, entries: &[ZipEntry]) -> 
 
     // Recursively compose variant selections so the rest of the
     // translator never has to think about variant_sets again.
-    let resolved: Vec<Prim> = merged_layer
+    let mut resolved: Vec<Prim> = merged_layer
         .prims
         .iter()
         .map(resolve_variants_recursive)
         .collect();
+
+    // UsdSkel BindingAPI inheritance (§1.5): `skel:skeleton`,
+    // `skel:animationSource`, and `skel:joints` authored on an
+    // ancestor apply to all descendants unless overridden. Push the
+    // opinions down onto the geometry prims so the per-prim builders
+    // read them locally.
+    for prim in &mut resolved {
+        propagate_skel_bindings(prim);
+    }
+
+    // UsdSkel pre-pass: register every `def Skeleton` (joint nodes +
+    // inverse bind matrices) so `rel skel:skeleton` bindings resolve
+    // during the node walk regardless of declaration order.
+    index_skeletons(&mut ctx, "", &resolved)?;
 
     // Walk the prim tree once, indexing every Material + Shader by
     // its absolute prim path. We resolve material bindings on a
@@ -959,6 +975,31 @@ struct Ctx {
     /// Cache so two materials referencing the same shader's texture
     /// share one `TextureId` instead of duplicating the asset.
     textures_by_path: HashMap<String, TextureRef>,
+    /// Every `def Skeleton` indexed by absolute prim path — built by
+    /// the pre-pass so `rel skel:skeleton = </path>` bindings resolve
+    /// regardless of declaration order.
+    skeletons_by_path: HashMap<String, SkelInfo>,
+    /// One [`Skin`](oxideav_mesh3d::Skin) per bound skeleton, shared
+    /// across every geometry node binding it.
+    skins_by_skeleton: HashMap<u32, oxideav_mesh3d::SkinId>,
+}
+
+/// Pre-pass record for one `def Skeleton` (UsdSkel §1.2).
+#[derive(Clone)]
+struct SkelInfo {
+    skeleton: oxideav_mesh3d::SkeletonId,
+    /// The authored `joints` token array — its index order is the
+    /// canonical joint index space (`jointIndices` + animations
+    /// reference it).
+    joint_tokens: Vec<String>,
+    /// One scene-graph node per joint, same order as `joint_tokens`.
+    /// Consumed by the SkelAnimation channel decoder (each animated
+    /// joint token resolves to its node target through this table).
+    #[allow(dead_code)]
+    joint_nodes: Vec<oxideav_mesh3d::NodeId>,
+    /// The joints with no parent among `joint_tokens` — the carrier
+    /// node's children.
+    root_joints: Vec<oxideav_mesh3d::NodeId>,
 }
 
 fn apply_layer_metadata(scene: &mut Scene3D, meta: &BTreeMap<String, Value>) {
@@ -1041,6 +1082,250 @@ fn index_materials(ctx: &mut Ctx, parent: &str, prims: &[Prim]) -> Result<()> {
     Ok(())
 }
 
+/// UsdSkel BindingAPI inheritance (§1.5): `skel:skeleton` and
+/// `skel:animationSource` are relationships that, when authored on an
+/// ancestor (typically the `SkelRoot`), apply to all descendants
+/// unless overridden; `skel:joints` is likewise "inherited
+/// hierarchically". Copy each such opinion onto children lacking it
+/// so the per-prim builders read them locally. `Skeleton` /
+/// `SkelAnimation` / shading prims are skipped — the binding targets
+/// skinnable geometry and scopes, not the rig itself.
+fn propagate_skel_bindings(prim: &mut Prim) {
+    const INHERITED: [&str; 3] = ["skel:skeleton", "skel:animationSource", "skel:joints"];
+    let inherited: Vec<(String, Attr)> = INHERITED
+        .iter()
+        .filter_map(|k| prim.attrs.get(*k).map(|a| (k.to_string(), a.clone())))
+        .collect();
+    for child in &mut prim.children {
+        if matches!(
+            child.type_name.as_str(),
+            "Skeleton" | "SkelAnimation" | "PackedJointAnimation" | "Material" | "Shader"
+        ) {
+            continue;
+        }
+        for (k, a) in &inherited {
+            child.attrs.entry(k.clone()).or_insert_with(|| a.clone());
+        }
+        propagate_skel_bindings(child);
+    }
+}
+
+/// UsdSkel pre-pass: walk every prim and materialise each
+/// `def Skeleton` (§1.2) into scene resources — one joint
+/// [`Node`](oxideav_mesh3d::Node) per `joints` token (tree topology
+/// from the path-prefix rule, local rest transform from
+/// `restTransforms`) plus a [`Skeleton`](oxideav_mesh3d::Skeleton)
+/// whose `inverse_bind_matrices` are the inverted world-space
+/// `bindTransforms`.
+fn index_skeletons(ctx: &mut Ctx, parent: &str, prims: &[Prim]) -> Result<()> {
+    for prim in prims {
+        let path = join_path(parent, &prim.name);
+        if prim.spec == "def" && prim.type_name == "Skeleton" {
+            let info = build_skeleton(ctx, &path, prim)?;
+            ctx.skeletons_by_path.insert(path.clone(), info);
+        }
+        index_skeletons(ctx, &path, &prim.children)?;
+    }
+    Ok(())
+}
+
+/// Materialise one `def Skeleton` prim (see [`index_skeletons`]).
+fn build_skeleton(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<SkelInfo> {
+    let joint_tokens: Vec<String> = prim
+        .attrs
+        .get("joints")
+        .and_then(|a| a.value.as_seq())
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|v| v.as_text().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if joint_tokens.is_empty() {
+        return Err(invalid(format!(
+            "Skeleton `{path}` is missing its `joints` token array"
+        )));
+    }
+    let read_matrices = |name: &str| -> Option<Vec<[[f32; 4]; 4]>> {
+        let seq = prim.attrs.get(name)?.value.as_seq()?;
+        let mut out = Vec::with_capacity(seq.len());
+        for m in seq {
+            out.push(read_matrix4(m)?);
+        }
+        Some(out)
+    };
+    let bind = read_matrices("bindTransforms");
+    let rest = read_matrices("restTransforms");
+    if let Some(b) = &bind {
+        if b.len() != joint_tokens.len() {
+            return Err(invalid(format!(
+                "Skeleton `{path}`: bindTransforms count {} != joints count {}",
+                b.len(),
+                joint_tokens.len()
+            )));
+        }
+    }
+    if let Some(r) = &rest {
+        if r.len() != joint_tokens.len() {
+            return Err(invalid(format!(
+                "Skeleton `{path}`: restTransforms count {} != joints count {}",
+                r.len(),
+                joint_tokens.len()
+            )));
+        }
+    }
+
+    // One node per joint. The token is a relative SdfPath
+    // ("Root/Hip/Knee"); its parent is the longest other entry that
+    // is a path-prefix — with canonical authoring that's exactly the
+    // token up to the last `/`.
+    let mut nodes_by_token: HashMap<&str, oxideav_mesh3d::NodeId> = HashMap::new();
+    let mut joint_nodes = Vec::with_capacity(joint_tokens.len());
+    for (i, token) in joint_tokens.iter().enumerate() {
+        let name = token.rsplit('/').next().unwrap_or(token);
+        let mut node = Node::new().with_name(name.to_string());
+        if let Some(r) = &rest {
+            node.transform = Transform::Matrix(r[i]);
+        }
+        let id = ctx.scene.add_node(node);
+        nodes_by_token.insert(token.as_str(), id);
+        joint_nodes.push(id);
+    }
+    // Parent wiring + root detection.
+    let mut root_joints = Vec::new();
+    for (i, token) in joint_tokens.iter().enumerate() {
+        let parent_id = token
+            .rfind('/')
+            .and_then(|cut| nodes_by_token.get(&token[..cut]).copied());
+        match parent_id {
+            Some(pid) => {
+                let child = joint_nodes[i];
+                ctx.scene.nodes[pid.0 as usize].children.push(child);
+            }
+            None => root_joints.push(joint_nodes[i]),
+        }
+    }
+
+    let inverse_bind_matrices: Vec<[[f32; 4]; 4]> = match &bind {
+        Some(b) => b.iter().map(|m| invert_matrix4(*m)).collect(),
+        None => joint_tokens.iter().map(|_| IDENTITY4).collect(),
+    };
+    let skeleton = oxideav_mesh3d::Skeleton {
+        name: Some(prim.name.clone()),
+        joints: joint_nodes.clone(),
+        inverse_bind_matrices,
+    };
+    let skeleton_id = ctx.scene.add_skeleton(skeleton);
+    Ok(SkelInfo {
+        skeleton: skeleton_id,
+        joint_tokens,
+        joint_nodes,
+        root_joints,
+    })
+}
+
+/// Row-major 4x4 identity.
+pub(crate) const IDENTITY4: [[f32; 4]; 4] = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+];
+
+/// Invert a 4x4 matrix by Gauss-Jordan elimination with partial
+/// pivoting (f64 internally). Returns the identity for a singular
+/// input — a defensive fallback for malformed bind transforms; a
+/// well-formed bind pose is always invertible.
+pub(crate) fn invert_matrix4(m: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    let mut a = [[0f64; 8]; 4];
+    for i in 0..4 {
+        for j in 0..4 {
+            a[i][j] = m[i][j] as f64;
+        }
+        a[i][4 + i] = 1.0;
+    }
+    for col in 0..4 {
+        // Partial pivot.
+        let mut pivot = col;
+        for row in (col + 1)..4 {
+            if a[row][col].abs() > a[pivot][col].abs() {
+                pivot = row;
+            }
+        }
+        if a[pivot][col].abs() < 1e-12 {
+            return IDENTITY4;
+        }
+        a.swap(col, pivot);
+        let p = a[col][col];
+        for cell in a[col].iter_mut() {
+            *cell /= p;
+        }
+        for row in 0..4 {
+            if row == col {
+                continue;
+            }
+            let f = a[row][col];
+            if f != 0.0 {
+                let pivot_row = a[col];
+                for (cell, p) in a[row].iter_mut().zip(pivot_row.iter()) {
+                    *cell -= f * p;
+                }
+            }
+        }
+    }
+    let mut out = [[0f32; 4]; 4];
+    for i in 0..4 {
+        for j in 0..4 {
+            out[i][j] = a[i][4 + j] as f32;
+        }
+    }
+    out
+}
+
+/// Compose a [`Transform`] into the row-major, row-vector-convention
+/// 4x4 matrix USD's `matrix4d` literal uses (translation in the last
+/// row): `p' = p · S · R · T` for TRS semantics.
+pub(crate) fn transform_to_matrix(t: &Transform) -> [[f32; 4]; 4] {
+    match *t {
+        Transform::Matrix(m) => m,
+        Transform::Trs {
+            translation,
+            rotation,
+            scale,
+        } => {
+            let [x, y, z, w] = rotation;
+            // Column-vector rotation matrix, transposed into the
+            // row-vector convention as it's written out.
+            let r = [
+                [
+                    1.0 - 2.0 * (y * y + z * z),
+                    2.0 * (x * y + z * w),
+                    2.0 * (x * z - y * w),
+                ],
+                [
+                    2.0 * (x * y - z * w),
+                    1.0 - 2.0 * (x * x + z * z),
+                    2.0 * (y * z + x * w),
+                ],
+                [
+                    2.0 * (x * z + y * w),
+                    2.0 * (y * z - x * w),
+                    1.0 - 2.0 * (x * x + y * y),
+                ],
+            ];
+            let mut m = IDENTITY4;
+            for i in 0..3 {
+                for j in 0..3 {
+                    m[i][j] = scale[i] * r[i][j];
+                }
+                m[i][3] = 0.0;
+            }
+            m[3] = [translation[0], translation[1], translation[2], 1.0];
+            m
+        }
+    }
+}
+
 /// Build a single node for `prim`, recursing into children.
 /// Returns `None` for prims that don't materialise into a
 /// scene-graph node (e.g. `Material` / `Shader` — already
@@ -1065,6 +1350,37 @@ fn build_node(ctx: &mut Ctx, parent: &str, prim: &Prim) -> Result<Option<oxideav
     let path = join_path(parent, &prim.name);
     match prim.type_name.as_str() {
         "Material" | "Shader" => Ok(None),
+        // UsdSkel §1.2: the Skeleton prim materialises as a carrier
+        // node whose children are the root joints built by the
+        // `index_skeletons` pre-pass. The `usd:skeleton` extras
+        // marker (the SkeletonId) tells the writer to re-emit a
+        // `def Skeleton` — with joints / bindTransforms /
+        // restTransforms reconstructed from the typed model — instead
+        // of walking the joints as plain Xforms.
+        "Skeleton" => {
+            let Some(info) = ctx.skeletons_by_path.get(&path).cloned() else {
+                return Ok(None);
+            };
+            let mut node = Node::new().with_name(prim.name.clone());
+            node.children = info.root_joints.clone();
+            node.transform = read_node_transform(prim);
+            node.extras.insert(
+                "usd:skeleton".into(),
+                serde_json::Value::Number(info.skeleton.0.into()),
+            );
+            // §1.2 jointNames (presentational) ride on extras.
+            if let Some(names) = prim.attrs.get("jointNames").and_then(|a| a.value.as_seq()) {
+                let arr: Vec<serde_json::Value> = names
+                    .iter()
+                    .filter_map(|v| v.as_text())
+                    .map(|s| serde_json::Value::String(s.to_string()))
+                    .collect();
+                node.extras
+                    .insert("usd:skel:jointNames".into(), serde_json::Value::Array(arr));
+            }
+            stash_extras(&mut node.extras, prim);
+            Ok(Some(ctx.scene.add_node(node)))
+        }
         "SpatialAudio" => {
             let (source, emitter) = build_audio_emitter(ctx, &path, prim)?;
             let source_id = ctx.scene.add_audio_source(source);
@@ -1081,9 +1397,17 @@ fn build_node(ctx: &mut Ctx, parent: &str, prim: &Prim) -> Result<Option<oxideav
             let id = ctx.scene.add_node(node);
             Ok(Some(id))
         }
-        "Xform" | "Scope" | "" => {
+        "Xform" | "Scope" | "SkelRoot" | "" => {
             let mut node = Node::new().with_name(prim.name.clone());
             node.transform = read_node_transform(prim);
+            // §1.1: SkelRoot marks the skinnable subtree; keep the
+            // schema token so the writer re-emits `def SkelRoot`.
+            if prim.type_name == "SkelRoot" {
+                node.extras.insert(
+                    "usd:type".into(),
+                    serde_json::Value::String("SkelRoot".into()),
+                );
+            }
             // Recurse children — collect the scene-graph children
             // first, push attribute extras after. Mesh children
             // sharing a common stem fold into a single Mesh per
@@ -1226,6 +1550,7 @@ fn build_mesh_group(
     let mesh_id = ctx.scene.add_mesh(seed_mesh);
     let mut node = Node::new().with_name(head.name.clone()).with_mesh(mesh_id);
     node.transform = read_node_transform(head);
+    node.skin = skel_skin_for_prim(ctx, head);
     stash_extras(&mut node.extras, head);
     Ok(ctx.scene.add_node(node))
 }
@@ -1244,6 +1569,7 @@ fn build_standalone_mesh_node(
     let mesh_id = ctx.scene.add_mesh(mesh);
     let mut node = Node::new().with_name(prim.name.clone()).with_mesh(mesh_id);
     node.transform = read_node_transform(prim);
+    node.skin = skel_skin_for_prim(ctx, prim);
     stash_extras(&mut node.extras, prim);
     Ok(ctx.scene.add_node(node))
 }
@@ -1530,7 +1856,18 @@ fn stash_extras(extras: &mut HashMap<String, serde_json::Value>, prim: &Prim) {
         .metadata
         .iter()
         .filter(|(k, _)| !GEOMETRY_HINT_METADATA_KEYS.contains(&k.as_str()))
-        .map(|(k, v)| (k.clone(), v.clone()))
+        .filter_map(|(k, v)| {
+            // `SkelBindingAPI` is regenerated by the writer on every
+            // skinned geometry prim (from `Primitive::joints` +
+            // `Node::skin`) — stashing it here would double-emit it
+            // AND leave the mesh-carrier node with non-empty prim
+            // metadata, defeating the bare-mesh collapse (one extra
+            // Xform level per encode→decode cycle).
+            if k == "apiSchemas" {
+                return strip_skel_binding_api(v).map(|nv| (k.clone(), nv));
+            }
+            Some((k.clone(), v.clone()))
+        })
         .collect();
     if !filtered.is_empty() {
         let mut obj = serde_json::Map::new();
@@ -1556,6 +1893,50 @@ fn stash_extras(extras: &mut HashMap<String, serde_json::Value>, prim: &Prim) {
     // [`crate::variant_codec`] for the JSON shape.
     if let Some(json) = crate::variant_codec::encode_variant_sets(&prim.variant_sets) {
         extras.insert(crate::variant_codec::EXTRAS_KEY.into(), json);
+    }
+}
+
+/// Remove the `"SkelBindingAPI"` token from an `apiSchemas` opinion
+/// (arrays, scalars, and list-op sublists). Returns `None` when
+/// nothing else remains — the whole key is then dropped from the
+/// stash. See [`stash_extras`].
+fn strip_skel_binding_api(v: &Value) -> Option<Value> {
+    const TOKEN: &str = "SkelBindingAPI";
+    match v {
+        Value::String(s) | Value::Token(s) if s == TOKEN => None,
+        Value::Array(items) => {
+            let kept: Vec<Value> = items
+                .iter()
+                .filter(|item| item.as_text() != Some(TOKEN))
+                .cloned()
+                .collect();
+            if kept.is_empty() {
+                None
+            } else {
+                Some(Value::Array(kept))
+            }
+        }
+        Value::ListOp(list) => {
+            let strip = |slot: &Option<Value>| slot.as_ref().and_then(strip_skel_binding_api);
+            let out = crate::usda::ListOp {
+                prepended: strip(&list.prepended),
+                appended: strip(&list.appended),
+                deleted: list.deleted.clone(),
+                explicit: strip(&list.explicit),
+                reordered: list.reordered.clone(),
+            };
+            if out.prepended.is_none()
+                && out.appended.is_none()
+                && out.deleted.is_none()
+                && out.explicit.is_none()
+                && out.reordered.is_none()
+            {
+                None
+            } else {
+                Some(Value::ListOp(Box::new(out)))
+            }
+        }
+        other => Some(other.clone()),
     }
 }
 
@@ -1770,8 +2151,231 @@ fn build_triangle_primitive(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Pr
         }
     }
 
+    apply_skel_binding(ctx, path, prim, &mut prim_out)?;
     apply_mesh_metadata_to_primitive(prim, &mut prim_out);
     Ok(prim_out)
+}
+
+/// UsdSkel BindingAPI joint influences (§1.5 / §1.6) → the typed
+/// per-vertex `joints` / `weights` quads.
+///
+/// * `primvars:skel:jointIndices` / `primvars:skel:jointWeights` —
+///   parallel arrays whose layout is governed by the primvar
+///   `interpolation` (`constant` = one influence set for every
+///   point, `vertex` = one set per point) and `elementSize` (the
+///   fixed influence count per set). Both knobs must agree between
+///   the two primvars; the stored lengths are validated against
+///   them. When `elementSize` is unauthored it is inferred from the
+///   array length (÷ point count for `vertex`, the whole array for
+///   `constant`).
+/// * `skel:joints` — optional per-geometry joint-order override:
+///   when authored, the indices reference *its* order and are
+///   remapped into the bound Skeleton's canonical `joints` order by
+///   token match (§1.5).
+/// * More than 4 influences per point keep the 4 largest weights
+///   (the typed model's quad width); weights are stored as-authored
+///   — §1.6 leaves normalization to the consumer at skinning time.
+/// * `primvars:skel:geomBindTransform` (matrix4d) and
+///   `primvars:skel:skinningMethod` (token) ride on
+///   `Primitive::extras["usd:skel:*"]` for the writer.
+///
+/// Silently a no-op when the prim has no `skel:skeleton` binding or
+/// no influence primvars.
+fn apply_skel_binding(ctx: &mut Ctx, path: &str, prim: &Prim, out: &mut Primitive) -> Result<()> {
+    let Some(Value::Path(skel_path)) = prim.attrs.get("skel:skeleton").map(|a| &a.value) else {
+        return Ok(());
+    };
+    let Some(info) = ctx.skeletons_by_path.get(skel_path).cloned() else {
+        // Unresolved skeleton target — leave the geometry unskinned;
+        // the binding attrs still round-trip via the prim stash.
+        return Ok(());
+    };
+
+    // Optional per-geometry joint-order override (`skel:joints`):
+    // remap table from override index → skeleton canonical index.
+    let remap: Option<Vec<u16>> = prim
+        .attrs
+        .get("skel:joints")
+        .and_then(|a| a.value.as_seq())
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|v| v.as_text())
+                .map(|token| {
+                    info.joint_tokens
+                        .iter()
+                        .position(|t| t == token)
+                        .map(|i| i as u16)
+                        .ok_or_else(|| {
+                            invalid(format!(
+                                "Mesh `{path}`: skel:joints token `{token}` names no joint \
+                                 of Skeleton `{skel_path}`"
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<u16>>>()
+        })
+        .transpose()?;
+
+    let (Some(idx_attr), Some(w_attr)) = (
+        prim.attrs.get("primvars:skel:jointIndices"),
+        prim.attrs.get("primvars:skel:jointWeights"),
+    ) else {
+        return Ok(());
+    };
+    let indices = read_int_array(&idx_attr.value).ok_or_else(|| {
+        invalid(format!(
+            "Mesh `{path}` has malformed `primvars:skel:jointIndices`"
+        ))
+    })?;
+    let weights: Vec<f32> = w_attr
+        .value
+        .as_seq()
+        .map(|seq| seq.iter().filter_map(|v| v.as_f32()).collect())
+        .unwrap_or_default();
+    if indices.len() != weights.len() {
+        return Err(invalid(format!(
+            "Mesh `{path}`: jointIndices length {} != jointWeights length {} (§1.6 requires \
+             identical layout)",
+            indices.len(),
+            weights.len()
+        )));
+    }
+    let meta_i32 = |attr: &Attr, key: &str| attr.metadata.get(key).and_then(|v| v.as_f32());
+    let meta_text = |attr: &Attr, key: &str| {
+        attr.metadata
+            .get(key)
+            .and_then(|v| v.as_text().map(str::to_string))
+    };
+    // interpolation + elementSize must match across the two primvars;
+    // read from either, preferring jointIndices.
+    let interp = meta_text(idx_attr, "interpolation")
+        .or_else(|| meta_text(w_attr, "interpolation"))
+        .unwrap_or_else(|| "vertex".to_string());
+    let n_points = out.positions.len();
+    let element_size = meta_i32(idx_attr, "elementSize")
+        .or_else(|| meta_i32(w_attr, "elementSize"))
+        .map(|f| f as usize)
+        .unwrap_or_else(|| match interp.as_str() {
+            "constant" => indices.len(),
+            _ => indices.len().checked_div(n_points).unwrap_or(0),
+        });
+    if element_size == 0 {
+        return Err(invalid(format!(
+            "Mesh `{path}`: jointIndices elementSize resolves to 0"
+        )));
+    }
+    let expected = match interp.as_str() {
+        "constant" => element_size,
+        "vertex" => n_points * element_size,
+        other => {
+            return Err(invalid(format!(
+                "Mesh `{path}`: joint-influence interpolation `{other}` is not in the schema \
+                 (`constant` | `vertex`)"
+            )))
+        }
+    };
+    if indices.len() != expected {
+        return Err(invalid(format!(
+            "Mesh `{path}`: jointIndices length {} != {expected} \
+             ({interp} interpolation x elementSize {element_size})",
+            indices.len()
+        )));
+    }
+
+    let n_joints = info.joint_tokens.len();
+    let mut joints_out = Vec::with_capacity(n_points);
+    let mut weights_out = Vec::with_capacity(n_points);
+    for p in 0..n_points {
+        let base = if interp == "constant" {
+            0
+        } else {
+            p * element_size
+        };
+        // Collect this point's influences, remapping through the
+        // skel:joints override when present.
+        let mut influences: Vec<(u16, f32)> = Vec::with_capacity(element_size);
+        for e in 0..element_size {
+            let raw = indices[base + e];
+            let mapped = match &remap {
+                Some(table) => *table.get(raw as usize).ok_or_else(|| {
+                    invalid(format!(
+                        "Mesh `{path}`: jointIndices entry {raw} is outside the \
+                         skel:joints override table"
+                    ))
+                })?,
+                None => {
+                    if raw as usize >= n_joints {
+                        return Err(invalid(format!(
+                            "Mesh `{path}`: jointIndices entry {raw} exceeds Skeleton \
+                             `{skel_path}` joint count {n_joints}"
+                        )));
+                    }
+                    raw as u16
+                }
+            };
+            influences.push((mapped, weights[base + e]));
+        }
+        // Keep the 4 strongest influences (stable order for ties).
+        if influences.len() > 4 {
+            influences.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            influences.truncate(4);
+        }
+        let mut jq = [0u16; 4];
+        let mut wq = [0f32; 4];
+        for (slot, (j, wgt)) in influences.iter().enumerate() {
+            jq[slot] = *j;
+            wq[slot] = *wgt;
+        }
+        joints_out.push(jq);
+        weights_out.push(wq);
+    }
+    out.joints = Some(joints_out);
+    out.weights = Some(weights_out);
+
+    // §1.5 primvars with no typed slot → extras for the writer.
+    if let Some(gbt) = prim
+        .attrs
+        .get("primvars:skel:geomBindTransform")
+        .and_then(|a| read_matrix4(&a.value))
+    {
+        let rows: Vec<serde_json::Value> = gbt.iter().map(|row| f32s_to_json(row)).collect();
+        out.extras.insert(
+            "usd:skel:geomBindTransform".into(),
+            serde_json::Value::Array(rows),
+        );
+    }
+    if let Some(method) = prim
+        .attrs
+        .get("primvars:skel:skinningMethod")
+        .and_then(|a| a.value.as_text())
+    {
+        out.extras.insert(
+            "usd:skel:skinningMethod".into(),
+            serde_json::Value::String(method.to_string()),
+        );
+    }
+    Ok(())
+}
+
+/// Resolve a prim's `rel skel:skeleton` binding to a shared
+/// [`Skin`](oxideav_mesh3d::Skin) (one per skeleton), creating it on
+/// first sight with the skeleton's first root joint as the explicit
+/// scene-graph root.
+fn skel_skin_for_prim(ctx: &mut Ctx, prim: &Prim) -> Option<oxideav_mesh3d::SkinId> {
+    let Value::Path(p) = &prim.attrs.get("skel:skeleton")?.value else {
+        return None;
+    };
+    let info = ctx.skeletons_by_path.get(p)?.clone();
+    if let Some(&sid) = ctx.skins_by_skeleton.get(&info.skeleton.0) {
+        return Some(sid);
+    }
+    let mut skin = oxideav_mesh3d::Skin::new(info.skeleton);
+    if let Some(&root) = info.root_joints.first() {
+        skin = skin.with_root(root);
+    }
+    let sid = ctx.scene.add_skin(skin);
+    ctx.skins_by_skeleton.insert(info.skeleton.0, sid);
+    Some(sid)
 }
 
 /// Build a Lines / LineStrip / LineLoop primitive from a USD

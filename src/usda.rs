@@ -684,6 +684,12 @@ fn parse_metadata_block(t: &mut Tokenizer<'_>) -> Result<BTreeMap<String, Value>
         if t.eof() {
             return Err(invalid("unexpected EOF inside `( ... )` metadata block"));
         }
+        // Tolerate `,` / `;` entry separators — single-line metadata
+        // blocks (`(elementSize = 4, interpolation = "vertex")`) use
+        // them interchangeably with newlines.
+        if t.eat(',') || t.eat(';') {
+            continue;
+        }
         // Read an optional `prepend` / `append` / `delete` / `add` /
         // `reorder` list-edit operator. These select which sublist of
         // an `SdfListOp`-style field the authored value contributes to

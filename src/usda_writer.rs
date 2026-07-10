@@ -443,6 +443,15 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
     } else {
         format!("{parent_path}/{safe_name}")
     };
+
+    // UsdSkel: a skeleton-carrier node (decoder marker
+    // `usd:skeleton` = SkeletonId) re-emits as a `def Skeleton` prim
+    // reconstructed from the typed model; its joint subtree must NOT
+    // be walked as plain Xforms.
+    if let Some(skel_idx) = node.extras.get("usd:skeleton").and_then(|v| v.as_u64()) {
+        write_skeleton_prim(w, scene, node, &safe_name, skel_idx as usize);
+        return;
+    }
     // Round 8: surface the prim's variant declarations on the prim
     // metadata block — `prepend variantSets = [...]` lists the set
     // names we'll emit inside the body, and `variants = {...}` carries
@@ -479,13 +488,21 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
                 && node.audio_emitter.is_none()
                 && node.camera.is_none()
                 && node.light.is_none()
-                && node.skin.is_none()
                 && is_identity(&node.transform)
             {
                 if let Some(mesh) = scene.mesh(mesh_id) {
                     let mesh_name = sanitize_prim_name(mesh.name.as_deref().unwrap_or("Mesh"));
                     if mesh_name == safe_name {
-                        write_mesh(w, scene, mesh, mesh_id, parent_path);
+                        // A skinned carrier still collapses — the
+                        // geometry prim itself carries every §1.5
+                        // BindingAPI opinion, so no Xform wrapper is
+                        // needed (and keeping one would re-grow the
+                        // tree each encode→decode cycle).
+                        let skel_path = node
+                            .skin
+                            .and_then(|sid| scene.skins.get(sid.0 as usize))
+                            .and_then(|skin| skeleton_prim_path(scene, skin.skeleton));
+                        write_mesh(w, scene, mesh, mesh_id, parent_path, skel_path.as_deref());
                         return;
                     }
                 }
@@ -493,15 +510,26 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
         }
     }
 
-    // We always emit `Xform` for now — meshes hang off as inner
-    // `def Mesh` children rather than collapsing into the node's
-    // own prim type. Round-3 work: also synthesise `Camera` /
-    // `Light` prim types when the node carries those references.
+    // Prim schema token: the decoder preserves non-Xform container
+    // schemas (`SkelRoot`, ...) on `extras["usd:type"]`; anything
+    // that doesn't look like a bare schema identifier falls back to
+    // `Xform`. Meshes hang off as inner `def Mesh` children rather
+    // than collapsing into the node's own prim type.
+    let prim_type = node
+        .extras
+        .get("usd:type")
+        .and_then(|v| v.as_str())
+        .filter(|t| {
+            !t.is_empty()
+                && t.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+                && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+        .unwrap_or("Xform");
     w.write_indent();
     if prim_metadata_lines.is_empty() {
-        writeln!(w.s, "def Xform \"{safe_name}\" {{").unwrap();
+        writeln!(w.s, "def {prim_type} \"{safe_name}\" {{").unwrap();
     } else {
-        writeln!(w.s, "def Xform \"{safe_name}\" (").unwrap();
+        writeln!(w.s, "def {prim_type} \"{safe_name}\" (").unwrap();
         w.indent += 1;
         for line in &prim_metadata_lines {
             w.write_indent();
@@ -528,10 +556,16 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
     write_node_transform(w, &node.transform);
 
     // Mesh attachment — emit an inner `def Mesh` so its prim path is
-    // `<parent>/<node_name>/<mesh_name>`.
+    // `<parent>/<node_name>/<mesh_name>`. A skinned node passes its
+    // bound skeleton's emitted prim path down so the geometry prim
+    // carries the §1.5 BindingAPI opinions.
     if let Some(mesh_id) = node.mesh {
         if let Some(mesh) = scene.mesh(mesh_id) {
-            write_mesh(w, scene, mesh, mesh_id, &path);
+            let skel_path = node
+                .skin
+                .and_then(|sid| scene.skins.get(sid.0 as usize))
+                .and_then(|skin| skeleton_prim_path(scene, skin.skeleton));
+            write_mesh(w, scene, mesh, mesh_id, &path, skel_path.as_deref());
         }
     }
 
@@ -1009,7 +1043,14 @@ fn is_identity(t: &Transform) -> bool {
     }
 }
 
-fn write_mesh(w: &mut Out, scene: &Scene3D, mesh: &Mesh, _id: MeshId, parent_path: &str) {
+fn write_mesh(
+    w: &mut Out,
+    scene: &Scene3D,
+    mesh: &Mesh,
+    _id: MeshId,
+    parent_path: &str,
+    skel_path: Option<&str>,
+) {
     let raw_name = mesh.name.clone().unwrap_or_else(|| "Mesh".to_string());
     let mesh_name = sanitize_prim_name(&raw_name);
     let _ = parent_path; // future use for relative material paths
@@ -1049,14 +1090,28 @@ fn write_mesh(w: &mut Out, scene: &Scene3D, mesh: &Mesh, _id: MeshId, parent_pat
             format!("{mesh_name}_{i}")
         };
         match prim.topology {
-            Topology::Triangles => write_one_mesh_prim(w, scene, prim, &prim_name, None),
+            Topology::Triangles => write_one_mesh_prim(w, scene, prim, &prim_name, None, skel_path),
             Topology::TriangleStrip => {
                 let expanded = expand_strip_to_triangle_list(prim);
-                write_one_mesh_prim(w, scene, &expanded, &prim_name, Some("triangleStrip"));
+                write_one_mesh_prim(
+                    w,
+                    scene,
+                    &expanded,
+                    &prim_name,
+                    Some("triangleStrip"),
+                    skel_path,
+                );
             }
             Topology::TriangleFan => {
                 let expanded = expand_fan_to_triangle_list(prim);
-                write_one_mesh_prim(w, scene, &expanded, &prim_name, Some("triangleFan"));
+                write_one_mesh_prim(
+                    w,
+                    scene,
+                    &expanded,
+                    &prim_name,
+                    Some("triangleFan"),
+                    skel_path,
+                );
             }
             Topology::Lines | Topology::LineStrip | Topology::LineLoop => {
                 write_basis_curves_prim(w, scene, prim, &prim_name);
@@ -1081,6 +1136,7 @@ fn write_one_mesh_prim(
     prim: &Primitive,
     prim_name: &str,
     original_topology_hint: Option<&str>,
+    skel_path: Option<&str>,
 ) {
     let mut metadata_lines: Vec<String> = Vec::new();
     if let Some(token) = original_topology_hint {
@@ -1088,6 +1144,12 @@ fn write_one_mesh_prim(
     }
     if extras_no_fold(&prim.extras) {
         metadata_lines.push("usd:no_fold = 1".to_string());
+    }
+    let skinned = skel_path.is_some() && prim.joints.is_some();
+    if skinned {
+        // §1.5: BindingAPI is an applied API schema — declare it on
+        // the skinned geometry prim.
+        metadata_lines.push("prepend apiSchemas = [\"SkelBindingAPI\"]".to_string());
     }
     w.write_indent();
     if metadata_lines.is_empty() {
@@ -1133,6 +1195,248 @@ fn write_one_mesh_prim(
             writeln!(w.s, "rel material:binding = </Materials/{mat_name}>").unwrap();
         }
     }
+    // UsdSkel BindingAPI (§1.5 / §1.6): the skeleton relationship
+    // plus the per-vertex joint influences in the canonical layout
+    // (`vertex` interpolation, `elementSize = 4` matching the typed
+    // quad width, indices in the Skeleton's own joint order — no
+    // `skel:joints` override needed on output).
+    if skinned {
+        if let (Some(joints), Some(weights), Some(skel_path)) =
+            (&prim.joints, &prim.weights, skel_path)
+        {
+            w.write_indent();
+            writeln!(w.s, "rel skel:skeleton = <{skel_path}>").unwrap();
+            w.write_indent();
+            write!(w.s, "int[] primvars:skel:jointIndices = [").unwrap();
+            for (i, q) in joints.iter().enumerate() {
+                for (e, j) in q.iter().enumerate() {
+                    if i > 0 || e > 0 {
+                        w.s.push_str(", ");
+                    }
+                    write!(w.s, "{j}").unwrap();
+                }
+            }
+            writeln!(w.s, "] (elementSize = 4, interpolation = \"vertex\")").unwrap();
+            w.write_indent();
+            write!(w.s, "float[] primvars:skel:jointWeights = [").unwrap();
+            for (i, q) in weights.iter().enumerate() {
+                for (e, wgt) in q.iter().enumerate() {
+                    if i > 0 || e > 0 {
+                        w.s.push_str(", ");
+                    }
+                    write!(w.s, "{}", format_float(*wgt as f64)).unwrap();
+                }
+            }
+            writeln!(w.s, "] (elementSize = 4, interpolation = \"vertex\")").unwrap();
+        }
+        if let Some(rows) = prim
+            .extras
+            .get("usd:skel:geomBindTransform")
+            .and_then(|v| v.as_array())
+        {
+            if let Some(m) = json_matrix4(rows) {
+                w.write_indent();
+                writeln!(
+                    w.s,
+                    "matrix4d primvars:skel:geomBindTransform = {}",
+                    format_matrix4(m)
+                )
+                .unwrap();
+            }
+        }
+        if let Some(method) = prim
+            .extras
+            .get("usd:skel:skinningMethod")
+            .and_then(|v| v.as_str())
+        {
+            w.write_indent();
+            writeln!(
+                w.s,
+                "uniform token primvars:skel:skinningMethod = \"{method}\""
+            )
+            .unwrap();
+        }
+    }
+    w.indent -= 1;
+    w.write_indent();
+    writeln!(w.s, "}}").unwrap();
+}
+
+/// Reconstruct a 4x4 from the row-array JSON stash shape
+/// (`[[a,b,c,d], ...]` — four rows of four numbers).
+fn json_matrix4(rows: &[serde_json::Value]) -> Option<[[f32; 4]; 4]> {
+    if rows.len() != 4 {
+        return None;
+    }
+    let mut m = [[0f32; 4]; 4];
+    for (i, row) in rows.iter().enumerate() {
+        let r = row.as_array()?;
+        if r.len() != 4 {
+            return None;
+        }
+        for (j, c) in r.iter().enumerate() {
+            m[i][j] = c.as_f64()? as f32;
+        }
+    }
+    Some(m)
+}
+
+/// Format a 4x4 as USD's `matrix4d` literal — a tuple of 4 row
+/// tuples.
+fn format_matrix4(m: [[f32; 4]; 4]) -> String {
+    let mut s = String::from("(");
+    for (i, row) in m.iter().enumerate() {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        s.push_str(&format!(
+            "({}, {}, {}, {})",
+            format_float(row[0] as f64),
+            format_float(row[1] as f64),
+            format_float(row[2] as f64),
+            format_float(row[3] as f64)
+        ));
+    }
+    s.push(')');
+    s
+}
+
+/// Emitted prim path of the carrier node marking `skeleton_id` —
+/// found by replaying the writer's deterministic naming over the
+/// node forest. `None` when the scene has no carrier for that
+/// skeleton (e.g. a programmatically built scene without the
+/// decoder's `usd:skeleton` marker).
+fn skeleton_prim_path(scene: &Scene3D, skeleton_id: oxideav_mesh3d::SkeletonId) -> Option<String> {
+    fn walk(scene: &Scene3D, id: NodeId, parent_path: &str, target: u64) -> Option<String> {
+        let node = scene.node(id)?;
+        let name = node
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("node_{}", id.0));
+        let path = format!("{parent_path}/{}", sanitize_prim_name(&name));
+        if node.extras.get("usd:skeleton").and_then(|v| v.as_u64()) == Some(target) {
+            return Some(path);
+        }
+        for &child in &node.children {
+            if let Some(found) = walk(scene, child, &path, target) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    scene
+        .roots
+        .iter()
+        .find_map(|&root| walk(scene, root, "", skeleton_id.0 as u64))
+}
+
+/// Emit a `def Skeleton "<name>" { ... }` prim (§1.2) reconstructed
+/// from the typed model:
+///
+/// * `joints` — the token array rebuilt from the joint nodes' names
+///   walked from the carrier (`Root`, `Root/Hip`, ...), in
+///   `Skeleton::joints` order (the canonical joint index space).
+/// * `bindTransforms` — the inverse of each
+///   `inverse_bind_matrices` entry (world-space bind pose).
+/// * `restTransforms` — each joint node's local transform.
+/// * `jointNames` — replayed from the decoder's extras stash when
+///   present.
+fn write_skeleton_prim(
+    w: &mut Out,
+    scene: &Scene3D,
+    node: &oxideav_mesh3d::Node,
+    safe_name: &str,
+    skel_idx: usize,
+) {
+    let Some(skeleton) = scene.skeletons.get(skel_idx) else {
+        return;
+    };
+    // Token per joint: DFS from the carrier's children building
+    // slash-joined name paths.
+    let mut tokens_by_node: std::collections::HashMap<u32, String> =
+        std::collections::HashMap::new();
+    fn assign_tokens(
+        scene: &Scene3D,
+        id: NodeId,
+        prefix: &str,
+        out: &mut std::collections::HashMap<u32, String>,
+    ) {
+        let Some(n) = scene.node(id) else { return };
+        let name = sanitize_prim_name(n.name.as_deref().unwrap_or("joint"));
+        let token = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        for &child in &n.children {
+            assign_tokens(scene, child, &token, out);
+        }
+        out.insert(id.0, token);
+    }
+    for &root in &node.children {
+        assign_tokens(scene, root, "", &mut tokens_by_node);
+    }
+
+    w.write_indent();
+    writeln!(w.s, "def Skeleton \"{safe_name}\" {{").unwrap();
+    w.indent += 1;
+
+    w.write_indent();
+    write!(w.s, "uniform token[] joints = [").unwrap();
+    for (i, joint) in skeleton.joints.iter().enumerate() {
+        if i > 0 {
+            w.s.push_str(", ");
+        }
+        let fallback = format!("joint_{}", joint.0);
+        let token = tokens_by_node
+            .get(&joint.0)
+            .map(String::as_str)
+            .unwrap_or(&fallback);
+        write!(w.s, "\"{token}\"").unwrap();
+    }
+    writeln!(w.s, "]").unwrap();
+
+    if let Some(names) = node
+        .extras
+        .get("usd:skel:jointNames")
+        .and_then(|v| v.as_array())
+    {
+        w.write_indent();
+        write!(w.s, "uniform token[] jointNames = [").unwrap();
+        for (i, n) in names.iter().enumerate() {
+            if i > 0 {
+                w.s.push_str(", ");
+            }
+            write!(w.s, "\"{}\"", n.as_str().unwrap_or("")).unwrap();
+        }
+        writeln!(w.s, "]").unwrap();
+    }
+
+    w.write_indent();
+    write!(w.s, "uniform matrix4d[] bindTransforms = [").unwrap();
+    for (i, ibm) in skeleton.inverse_bind_matrices.iter().enumerate() {
+        if i > 0 {
+            w.s.push_str(", ");
+        }
+        let bind = crate::usd_to_scene::invert_matrix4(*ibm);
+        write!(w.s, "{}", format_matrix4(bind)).unwrap();
+    }
+    writeln!(w.s, "]").unwrap();
+
+    w.write_indent();
+    write!(w.s, "uniform matrix4d[] restTransforms = [").unwrap();
+    for (i, joint) in skeleton.joints.iter().enumerate() {
+        if i > 0 {
+            w.s.push_str(", ");
+        }
+        let m = scene
+            .node(*joint)
+            .map(|n| crate::usd_to_scene::transform_to_matrix(&n.transform))
+            .unwrap_or(crate::usd_to_scene::IDENTITY4);
+        write!(w.s, "{}", format_matrix4(m)).unwrap();
+    }
+    writeln!(w.s, "]").unwrap();
+
     w.indent -= 1;
     w.write_indent();
     writeln!(w.s, "}}").unwrap();
