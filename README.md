@@ -58,9 +58,33 @@ Full reader and symmetric writer for the `#usda 1.0` text format:
   are fan-triangulated; vertex normals and the first UV set are picked
   up. Multi-primitive meshes serialise as sibling `def Mesh` prims and
   fold back on decode.
-- **Materials** — `UsdPreviewSurface` → `Material` (base color, metallic,
-  roughness, emissive) with `UsdUVTexture` connections for diffuse /
-  normal / emissive / occlusion maps.
+- **Materials** — the full `UsdPreviewSurface` input set → `Material`:
+  base color, metallic, roughness, emissive, opacity +
+  `opacityThreshold` cutout (`AlphaMode::Mask` / `Blend`), occlusion
+  multiplier, specular workflow (`useSpecularWorkflow` +
+  `specularColor`), clearcoat, IOR, displacement, and constant normal
+  (the last five preserved per-input on extras). Texture connections
+  resolve for every input — diffuse / normal / emissive / occlusion
+  into the typed slots, metallic + roughness into the packed slot with
+  the authored-input record, the rest via `usd:tex:*` extras.
+- **Texture network** — `UsdUVTexture` `wrapS`/`wrapT` map to sampler
+  wrap modes; `scale` / `bias` / `fallback` / `sourceColorSpace`
+  round-trip; the `st` connection is followed to its
+  `UsdPrimvarReader_float2` so `varname` selects the UV set
+  (`st` → 0, `st<N>` → N). Meshes read/write multi-UV
+  `primvars:st1..N`, `doubleSided`, and `displayColor` /
+  `displayOpacity` vertex colours.
+- **Skeletal animation (UsdSkel)** — `SkelRoot` / `Skeleton` /
+  `SkelAnimation` / `BlendShape` + `SkelBindingAPI`: joint token
+  trees become joint nodes + a typed `Skeleton` (inverted
+  `bindTransforms`), `jointIndices` / `jointWeights` decode under
+  their `interpolation` / `elementSize` layouts into per-vertex
+  quads (with `skel:joints` remap), animations become per-joint
+  TRS channels (timeCodes → seconds) and blend-shape weight
+  channels, and blend shapes become `MorphTarget`s (sparse
+  `pointIndices` scattered dense). The writer reconstructs the full
+  prim network from the typed model; round trips are a one-cycle
+  fixed point. Inbetween shapes are not yet modelled.
 - **Transforms** — per-node `UsdGeomXformable` xformOps round-trip
   (`translate` + `orient` quatf + `scale`, or a `matrix4d` transform).
 - **Spatial audio** — `UsdMediaSpatialAudio` read and write, mapping to
@@ -224,9 +248,13 @@ Not yet implemented (so USDC files do not fully decode to a scene yet):
 
 ## Not yet supported
 
-- `UsdSkelSkeleton` / `UsdSkelBindingAPI` skeletal-animation skinning,
-  and `UsdGeomSubset` per-face material subsets — both blocked on
-  `UsdSkel` schema docs not yet staged in `docs/3d/usd/`.
+- `UsdGeomSubset` per-face material subsets — blocked on schema docs
+  not yet staged in `docs/3d/usd/`.
+- UsdSkel *inbetween* shapes (`inbetweens:` namespace attributes on a
+  `BlendShape`) — the base + full-shape channels round-trip; the
+  intermediate-weight shapes do not yet.
+- `UsdGeomCamera` / `UsdLux` light schemas — deferred observer rounds
+  per the staged schema doc's coverage table.
 - Cross-package `@foo.usdz[path/within.usd]@` selectors into a sibling
   archive — preserved as side-channel opinions rather than resolved.
 - SubLayer / reference / class-arc structure preservation on the writer

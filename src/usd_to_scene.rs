@@ -77,6 +77,8 @@ pub fn translate(layer: &Layer, archive: Arc<Vec<u8>>, entries: &[ZipEntry]) -> 
         skeletons_by_path: HashMap::new(),
         skins_by_skeleton: HashMap::new(),
         time_codes_per_second: 24.0,
+        blendshapes_by_path: HashMap::new(),
+        pending_blend_weights: Vec::new(),
     };
 
     apply_layer_metadata(&mut ctx.scene, &layer.metadata);
@@ -256,6 +258,10 @@ pub fn translate(layer: &Layer, archive: Arc<Vec<u8>>, entries: &[ZipEntry]) -> 
             ctx.scene.add_root(id);
         }
     }
+
+    // §1.8: attach SkelAnimation blend-shape weight channels now
+    // that every mesh's morph-target roster exists.
+    attach_blend_weight_channels(&mut ctx);
     Ok(ctx.scene)
 }
 
@@ -999,6 +1005,41 @@ struct Ctx {
     /// default 24) — maps SkelAnimation timeCodes onto the typed
     /// model's keyframe seconds.
     time_codes_per_second: f64,
+    /// Every `def BlendShape` indexed by absolute prim path — built
+    /// by the pre-pass so `rel skel:blendShapeTargets` resolves
+    /// regardless of declaration order.
+    blendshapes_by_path: HashMap<String, BlendShapeData>,
+    /// SkelAnimation `blendShapes` / `blendShapeWeights` gathered
+    /// during the node walk; a post-pass attaches the MorphWeights
+    /// channels once every mesh (and its morph-target roster) is
+    /// built.
+    pending_blend_weights: Vec<PendingBlendWeights>,
+}
+
+/// One parsed `def BlendShape` (§1.4).
+#[derive(Clone)]
+struct BlendShapeData {
+    /// Per-point position deltas (dense, or sparse via
+    /// `point_indices`).
+    offsets: Vec<[f32; 3]>,
+    /// Optional per-point normal deltas, parallel to `offsets`.
+    normal_offsets: Option<Vec<[f32; 3]>>,
+    /// Sparse index map: `offsets[i]` applies to base point
+    /// `point_indices[i]`. Dense when absent.
+    point_indices: Option<Vec<u32>>,
+}
+
+/// Blend-shape weight animation gathered from one SkelAnimation
+/// (§1.3 `blendShapes` + `blendShapeWeights`), pending channel
+/// attachment (§1.8 step 1 — match the channel names into each
+/// bound geometry's `skel:blendShapes`).
+struct PendingBlendWeights {
+    anim_idx: usize,
+    channel_names: Vec<String>,
+    /// Keyframe times in seconds.
+    times: Vec<f32>,
+    /// One weight per channel name, per keyframe.
+    frames: Vec<Vec<f32>>,
 }
 
 /// Pre-pass record for one `def Skeleton` (UsdSkel §1.2).
@@ -1140,9 +1181,34 @@ fn index_skeletons(ctx: &mut Ctx, parent: &str, prims: &[Prim]) -> Result<()> {
             let info = build_skeleton(ctx, &path, prim)?;
             ctx.skeletons_by_path.insert(path.clone(), info);
         }
+        // §1.4: BlendShape prims register alongside — their
+        // `rel skel:blendShapeTargets` referrers resolve by path.
+        if prim.spec == "def" && prim.type_name == "BlendShape" {
+            if let Some(data) = read_blend_shape(prim) {
+                ctx.blendshapes_by_path.insert(path.clone(), data);
+            }
+        }
         index_skeletons(ctx, &path, &prim.children)?;
     }
     Ok(())
+}
+
+/// Parse one `def BlendShape` prim's §1.4 attribute set.
+fn read_blend_shape(prim: &Prim) -> Option<BlendShapeData> {
+    let offsets = read_vec3_array(&prim.attrs.get("offsets")?.value)?;
+    let normal_offsets = prim
+        .attrs
+        .get("normalOffsets")
+        .and_then(|a| read_vec3_array(&a.value));
+    let point_indices = prim
+        .attrs
+        .get("pointIndices")
+        .and_then(|a| read_int_array(&a.value));
+    Some(BlendShapeData {
+        offsets,
+        normal_offsets,
+        point_indices,
+    })
 }
 
 /// Materialise one `def Skeleton` prim (see [`index_skeletons`]).
@@ -2197,8 +2263,135 @@ fn build_triangle_primitive(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Pr
     }
 
     apply_skel_binding(ctx, path, prim, &mut prim_out)?;
+    apply_blend_shapes(ctx, path, prim, &mut prim_out)?;
     apply_mesh_metadata_to_primitive(prim, &mut prim_out);
     Ok(prim_out)
+}
+
+/// UsdSkel blend shapes (§1.4 / §1.5 / §1.8): resolve the geometry's
+/// `skel:blendShapes` channel names + positionally matched
+/// `rel skel:blendShapeTargets` into typed
+/// [`MorphTarget`](oxideav_mesh3d::MorphTarget)s.
+///
+/// Each target's `offsets` (and optional `normalOffsets`) expand to
+/// dense per-point deltas — a sparse shape (`pointIndices`) scatters
+/// into a zero-filled buffer. The channel-name roster rides on
+/// `Primitive::extras["usd:skel:blendShapes"]` so (a) the writer
+/// re-authors the names and (b) animation `blendShapeWeights` remap
+/// into the mesh's target order by name (§1.8 step 1).
+fn apply_blend_shapes(ctx: &mut Ctx, path: &str, prim: &Prim, out: &mut Primitive) -> Result<()> {
+    let Some(names_attr) = prim.attrs.get("skel:blendShapes") else {
+        return Ok(());
+    };
+    let names: Vec<String> = names_attr
+        .value
+        .as_seq()
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|v| v.as_text().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let targets: Vec<String> = match prim.attrs.get("skel:blendShapeTargets").map(|a| &a.value) {
+        Some(Value::Path(p)) => vec![p.clone()],
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| match v {
+                Value::Path(p) => Some(p.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    if names.is_empty() || targets.is_empty() {
+        return Ok(());
+    }
+    if names.len() != targets.len() {
+        return Err(invalid(format!(
+            "Mesh `{path}`: skel:blendShapes has {} names for {} blendShapeTargets              (§1.5 requires positional match)",
+            names.len(),
+            targets.len()
+        )));
+    }
+    let n_points = out.positions.len();
+    for (name, target_path) in names.iter().zip(&targets) {
+        let Some(shape) = ctx.blendshapes_by_path.get(target_path) else {
+            return Err(invalid(format!(
+                "Mesh `{path}`: skel:blendShapeTargets entry `{target_path}` names no                  BlendShape prim (channel `{name}`)"
+            )));
+        };
+        let mut morph = oxideav_mesh3d::MorphTarget::new();
+        morph.position = Some(expand_deltas(
+            &shape.offsets,
+            shape.point_indices.as_deref(),
+            n_points,
+            path,
+            name,
+        )?);
+        if let Some(normals) = &shape.normal_offsets {
+            morph.normal = Some(expand_deltas(
+                normals,
+                shape.point_indices.as_deref(),
+                n_points,
+                path,
+                name,
+            )?);
+        }
+        out.targets.push(morph);
+    }
+    out.extras.insert(
+        "usd:skel:blendShapes".into(),
+        serde_json::Value::Array(
+            names
+                .iter()
+                .map(|n| serde_json::Value::String(n.clone()))
+                .collect(),
+        ),
+    );
+    Ok(())
+}
+
+/// Expand a BlendShape delta array to one dense entry per base
+/// point: a sparse shape scatters `deltas[i]` to
+/// `point_indices[i]`; a dense shape must already be one delta per
+/// point (§1.4).
+fn expand_deltas(
+    deltas: &[[f32; 3]],
+    point_indices: Option<&[u32]>,
+    n_points: usize,
+    path: &str,
+    channel: &str,
+) -> Result<Vec<[f32; 3]>> {
+    match point_indices {
+        Some(indices) => {
+            if indices.len() != deltas.len() {
+                return Err(invalid(format!(
+                    "Mesh `{path}` blend shape `{channel}`: pointIndices length {} !=                      offsets length {}",
+                    indices.len(),
+                    deltas.len()
+                )));
+            }
+            let mut dense = vec![[0f32; 3]; n_points];
+            for (i, &pt) in indices.iter().enumerate() {
+                let slot = dense.get_mut(pt as usize).ok_or_else(|| {
+                    invalid(format!(
+                        "Mesh `{path}` blend shape `{channel}`: pointIndices entry {pt}                          exceeds point count {n_points}"
+                    ))
+                })?;
+                *slot = deltas[i];
+            }
+            Ok(dense)
+        }
+        None => {
+            if deltas.len() != n_points {
+                return Err(invalid(format!(
+                    "Mesh `{path}` blend shape `{channel}`: dense offsets length {} !=                      point count {n_points}",
+                    deltas.len()
+                )));
+            }
+            Ok(deltas.to_vec())
+        }
+    }
 }
 
 /// UsdSkel BindingAPI joint influences (§1.5 / §1.6) → the typed
@@ -2456,12 +2649,11 @@ fn build_skel_animation(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Option
                 .collect()
         })
         .unwrap_or_default();
-    if joint_tokens.is_empty() {
-        return Ok(None);
-    }
 
     // Pick the skeleton whose joint set overlaps the animation's
     // tokens the most (typical content has exactly one skeleton).
+    // A blend-shape-only animation carries no joints — TRS decoding
+    // is skipped and the weights ride the pending list below.
     let mut best: Option<(&SkelInfo, usize)> = None;
     for info in ctx.skeletons_by_path.values() {
         let matches = joint_tokens
@@ -2472,20 +2664,20 @@ fn build_skel_animation(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Option
             best = Some((info, matches));
         }
     }
-    let Some((info, _)) = best else {
-        return Ok(None);
-    };
     // Target node per animation joint (skipping unmatched tokens —
     // §1.3 says consumers remap by matching path tokens).
-    let targets: Vec<Option<oxideav_mesh3d::NodeId>> = joint_tokens
-        .iter()
-        .map(|t| {
-            info.joint_tokens
-                .iter()
-                .position(|jt| jt == t)
-                .map(|i| info.joint_nodes[i])
-        })
-        .collect();
+    let targets: Vec<Option<oxideav_mesh3d::NodeId>> = match best {
+        Some((info, _)) => joint_tokens
+            .iter()
+            .map(|t| {
+                info.joint_tokens
+                    .iter()
+                    .position(|jt| jt == t)
+                    .map(|i| info.joint_nodes[i])
+            })
+            .collect(),
+        None => Vec::new(),
+    };
 
     let tcps = ctx.time_codes_per_second;
     // Materialise `<name>.timeSamples` (or the non-sampled default
@@ -2519,6 +2711,9 @@ fn build_skel_animation(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Option
         ),
         ("scales", oxideav_mesh3d::AnimationProperty::Scale),
     ] {
+        if targets.is_empty() {
+            break;
+        }
         let Some((times, frames)) = read_samples(attr_name) else {
             continue;
         };
@@ -2557,7 +2752,7 @@ fn build_skel_animation(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Option
     }
 
     // Rotations: quatf authored (w, x, y, z) → internal xyzw.
-    if let Some((times, frames)) = read_samples("rotations") {
+    if let Some((times, frames)) = read_samples("rotations").filter(|_| !targets.is_empty()) {
         for frame in &frames {
             if frame.len() != n_joints {
                 return Err(invalid(format!(
@@ -2592,14 +2787,127 @@ fn build_skel_animation(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Option
         }
     }
 
-    if channels.is_empty() {
+    // §1.3 blend-shape weight channels: gather now, attach after the
+    // node walk (the bound geometry's morph-target roster may not be
+    // built yet). Weight per channel name, per keyframe.
+    let blend_names: Vec<String> = prim
+        .attrs
+        .get("blendShapes")
+        .and_then(|a| a.value.as_seq())
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|v| v.as_text().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut pending_blend: Option<PendingBlendWeights> = None;
+    if !blend_names.is_empty() {
+        if let Some((times, frames)) = read_samples("blendShapeWeights") {
+            let mut weight_frames = Vec::with_capacity(frames.len());
+            for frame in &frames {
+                if frame.len() != blend_names.len() {
+                    return Err(invalid(format!(
+                        "SkelAnimation `{path}`: a `blendShapeWeights` sample has {} \
+                         entries for {} blendShapes channels",
+                        frame.len(),
+                        blend_names.len()
+                    )));
+                }
+                weight_frames.push(
+                    frame
+                        .iter()
+                        .filter_map(|v| v.as_f32())
+                        .collect::<Vec<f32>>(),
+                );
+            }
+            pending_blend = Some(PendingBlendWeights {
+                anim_idx: 0, // patched below once the index is known
+                channel_names: blend_names,
+                times,
+                frames: weight_frames,
+            });
+        }
+    }
+
+    if channels.is_empty() && pending_blend.is_none() {
         return Ok(None);
     }
     let idx = ctx.scene.add_animation(oxideav_mesh3d::Animation {
         name: Some(prim.name.clone()),
         channels,
     });
+    if let Some(mut pending) = pending_blend {
+        pending.anim_idx = idx;
+        ctx.pending_blend_weights.push(pending);
+    }
     Ok(Some(idx))
+}
+
+/// Post-pass (§1.8 step 1): for every gathered SkelAnimation
+/// blend-weight table, find each mesh node whose morph-channel
+/// roster (`Primitive::extras["usd:skel:blendShapes"]`) intersects
+/// the animation's channel names, remap the per-frame weights into
+/// the mesh's target order, and attach one `MorphWeights` channel
+/// targeting that node. Channels the animation doesn't drive hold
+/// weight 0.
+fn attach_blend_weight_channels(ctx: &mut Ctx) {
+    let pending = std::mem::take(&mut ctx.pending_blend_weights);
+    for entry in &pending {
+        for node_idx in 0..ctx.scene.nodes.len() {
+            let Some(mesh_id) = ctx.scene.nodes[node_idx].mesh else {
+                continue;
+            };
+            let Some(mesh) = ctx.scene.meshes.get(mesh_id.0 as usize) else {
+                continue;
+            };
+            let Some(prim) = mesh.primitives.first() else {
+                continue;
+            };
+            let mesh_names: Vec<String> = prim
+                .extras
+                .get("usd:skel:blendShapes")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if mesh_names.is_empty() || !mesh_names.iter().any(|n| entry.channel_names.contains(n))
+            {
+                continue;
+            }
+            // Per keyframe: one weight per mesh morph target, in the
+            // mesh's channel order.
+            let stride = mesh_names.len();
+            let mut values = Vec::with_capacity(entry.times.len() * stride);
+            for frame in &entry.frames {
+                for name in &mesh_names {
+                    let w = entry
+                        .channel_names
+                        .iter()
+                        .position(|c| c == name)
+                        .and_then(|i| frame.get(i).copied())
+                        .unwrap_or(0.0);
+                    values.push(w);
+                }
+            }
+            let channel = oxideav_mesh3d::AnimationChannel {
+                target: oxideav_mesh3d::AnimationTarget {
+                    node: oxideav_mesh3d::NodeId(node_idx as u32),
+                    property: oxideav_mesh3d::AnimationProperty::MorphWeights,
+                },
+                sampler: oxideav_mesh3d::AnimationSampler {
+                    keyframes: entry.times.clone(),
+                    values: oxideav_mesh3d::AnimationValues::Scalar(values),
+                    interpolation: oxideav_mesh3d::Interpolation::Linear,
+                },
+            };
+            if let Some(anim) = ctx.scene.animations.get_mut(entry.anim_idx) {
+                anim.channels.push(channel);
+            }
+        }
+    }
 }
 
 /// Build a Lines / LineStrip / LineLoop primitive from a USD

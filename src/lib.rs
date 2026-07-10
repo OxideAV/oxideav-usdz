@@ -506,12 +506,9 @@
 //!   flag bits (and so deciding inline-value vs offset) is a separate
 //!   fact-table extraction (gap tracker's Round B) that the [`usdc`]
 //!   primitives don't yet carry.
-//! * `UsdSkelSkeleton` + `UsdSkelBindingAPI` skinning — UsdSkel
-//!   schema docs are not in our `docs/3d/usd/` (the spec README
-//!   notes UsdSkel sits behind a per-schema URL pattern not yet
-//!   staged).
-//! * `UsdGeomSubset` per-face material binding subsets — same
-//!   schema-doc gap as UsdSkel.
+//! * `UsdGeomSubset` per-face material binding subsets — schema-doc
+//!   gap. (UsdSkel skinning + animation + blend shapes landed in
+//!   r407 from the staged schema tables; inbetween shapes remain.)
 //! * Cross-package `@foo.usdz[path/within.usd]@` package-relative
 //!   references — round 11 resolves `references` / `payload` targets
 //!   that live as their own entries in the *same* archive; nested

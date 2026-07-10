@@ -115,6 +115,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tests/usdskel_animation.rs`, including round-trip fidelity and
   the one-cycle fixed point.
 
+- **UsdSkel blend shapes (staged schema §1.4 / §1.5 / §1.8).**
+  `def BlendShape` prims resolve through the geometry's positional
+  `skel:blendShapes` / `skel:blendShapeTargets` pair into typed
+  `MorphTarget`s — dense `offsets` / `normalOffsets` verbatim, a
+  sparse shape (`pointIndices`) scattered into zero-filled per-point
+  delta buffers. The channel-name roster rides on
+  `Primitive::extras["usd:skel:blendShapes"]`. SkelAnimation
+  `blendShapes` + `blendShapeWeights` decode into one `MorphWeights`
+  channel per bound mesh node, with per-frame weights remapped from
+  the animation's channel order into the mesh's target order by
+  name (§1.8 step 1; blend-only animations — no `joints` — are
+  supported). The writer re-emits `def BlendShape` children on the
+  mesh prim, the positional binding pair, and the animation's
+  `blendShapes` / `blendShapeWeights.timeSamples`. Inbetween shapes
+  (`inbetweens:` namespace) are not yet modelled. 7 integration
+  tests in `tests/usdskel_blendshapes.rs`; additionally,
+  `tests/skel_fixture_tokens.rs` pins all 19 staged UsdSkel schema
+  token spellings against the committed real-production Crate
+  fixture's TOKENS pool.
+
 ### Fixed
 
 - **round-trip drift: bare-mesh-carrier collapse.** A `Scene3D` whose

@@ -1059,7 +1059,6 @@ fn write_mesh(
 ) {
     let raw_name = mesh.name.clone().unwrap_or_else(|| "Mesh".to_string());
     let mesh_name = sanitize_prim_name(&raw_name);
-    let _ = parent_path; // future use for relative material paths
     if mesh.primitives.is_empty() {
         return;
     }
@@ -1096,14 +1095,35 @@ fn write_mesh(
             format!("{mesh_name}_{i}")
         };
         match prim.topology {
-            Topology::Triangles => write_one_mesh_prim(w, scene, prim, &prim_name, None, skel),
+            Topology::Triangles => {
+                let prim_path = format!("{parent_path}/{prim_name}");
+                write_one_mesh_prim(w, scene, prim, &prim_name, &prim_path, None, skel)
+            }
             Topology::TriangleStrip => {
                 let expanded = expand_strip_to_triangle_list(prim);
-                write_one_mesh_prim(w, scene, &expanded, &prim_name, Some("triangleStrip"), skel);
+                let prim_path = format!("{parent_path}/{prim_name}");
+                write_one_mesh_prim(
+                    w,
+                    scene,
+                    &expanded,
+                    &prim_name,
+                    &prim_path,
+                    Some("triangleStrip"),
+                    skel,
+                );
             }
             Topology::TriangleFan => {
                 let expanded = expand_fan_to_triangle_list(prim);
-                write_one_mesh_prim(w, scene, &expanded, &prim_name, Some("triangleFan"), skel);
+                let prim_path = format!("{parent_path}/{prim_name}");
+                write_one_mesh_prim(
+                    w,
+                    scene,
+                    &expanded,
+                    &prim_name,
+                    &prim_path,
+                    Some("triangleFan"),
+                    skel,
+                );
             }
             Topology::Lines | Topology::LineStrip | Topology::LineLoop => {
                 write_basis_curves_prim(w, scene, prim, &prim_name);
@@ -1127,6 +1147,7 @@ fn write_one_mesh_prim(
     scene: &Scene3D,
     prim: &Primitive,
     prim_name: &str,
+    prim_path: &str,
     original_topology_hint: Option<&str>,
     skel: Option<&SkelBindingPaths>,
 ) {
@@ -1252,9 +1273,107 @@ fn write_one_mesh_prim(
             .unwrap();
         }
     }
+    write_blend_shapes(w, prim, prim_path);
     w.indent -= 1;
     w.write_indent();
     writeln!(w.s, "}}").unwrap();
+}
+
+/// UsdSkel blend shapes (§1.4 / §1.5): emit the geometry's
+/// morph-target roster back as `def BlendShape` children of the
+/// mesh prim plus the positional `skel:blendShapes` /
+/// `skel:blendShapeTargets` pair. Channel names replay from the
+/// decoder's `usd:skel:blendShapes` extras roster (falling back to
+/// `shape_<i>`); targets emit dense (a decoded sparse shape was
+/// already scattered into per-point deltas).
+fn write_blend_shapes(w: &mut Out, prim: &Primitive, prim_path: &str) {
+    if prim.targets.is_empty() {
+        return;
+    }
+    let names: Vec<String> = {
+        let stashed: Vec<String> = prim
+            .extras
+            .get("usd:skel:blendShapes")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(sanitize_prim_name))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (0..prim.targets.len())
+            .map(|i| {
+                stashed
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| format!("shape_{i}"))
+            })
+            .collect()
+    };
+
+    w.write_indent();
+    write!(w.s, "uniform token[] skel:blendShapes = [").unwrap();
+    for (i, name) in names.iter().enumerate() {
+        if i > 0 {
+            w.s.push_str(", ");
+        }
+        write!(w.s, "\"{name}\"").unwrap();
+    }
+    writeln!(w.s, "]").unwrap();
+    w.write_indent();
+    write!(w.s, "rel skel:blendShapeTargets = [").unwrap();
+    for (i, name) in names.iter().enumerate() {
+        if i > 0 {
+            w.s.push_str(", ");
+        }
+        write!(w.s, "<{prim_path}/{name}>").unwrap();
+    }
+    writeln!(w.s, "]").unwrap();
+
+    for (target, name) in prim.targets.iter().zip(&names) {
+        w.write_indent();
+        writeln!(w.s, "def BlendShape \"{name}\" {{").unwrap();
+        w.indent += 1;
+        if let Some(offsets) = &target.position {
+            w.write_indent();
+            write!(w.s, "uniform vector3f[] offsets = [").unwrap();
+            for (i, o) in offsets.iter().enumerate() {
+                if i > 0 {
+                    w.s.push_str(", ");
+                }
+                write!(
+                    w.s,
+                    "({}, {}, {})",
+                    format_float(o[0] as f64),
+                    format_float(o[1] as f64),
+                    format_float(o[2] as f64)
+                )
+                .unwrap();
+            }
+            writeln!(w.s, "]").unwrap();
+        }
+        if let Some(normals) = &target.normal {
+            w.write_indent();
+            write!(w.s, "uniform vector3f[] normalOffsets = [").unwrap();
+            for (i, o) in normals.iter().enumerate() {
+                if i > 0 {
+                    w.s.push_str(", ");
+                }
+                write!(
+                    w.s,
+                    "({}, {}, {})",
+                    format_float(o[0] as f64),
+                    format_float(o[1] as f64),
+                    format_float(o[2] as f64)
+                )
+                .unwrap();
+            }
+            writeln!(w.s, "]").unwrap();
+        }
+        w.indent -= 1;
+        w.write_indent();
+        writeln!(w.s, "}}").unwrap();
+    }
 }
 
 /// Reconstruct a 4x4 from the row-array JSON stash shape
@@ -1549,6 +1668,64 @@ fn write_skel_animation_prim(w: &mut Out, scene: &Scene3D, safe_name: &str, anim
             w.s.push(']');
         }
         writeln!(w.s, " }}").unwrap();
+    }
+
+    // §1.3 blend-shape weights: a MorphWeights channel re-emits as
+    // the `blendShapes` channel-name roster (from the target mesh's
+    // `usd:skel:blendShapes` extras) + the per-keyframe
+    // `blendShapeWeights` map.
+    if let Some(morph_ch) = anim
+        .channels
+        .iter()
+        .find(|ch| ch.target.property == AnimationProperty::MorphWeights)
+    {
+        let names: Vec<String> = scene
+            .node(morph_ch.target.node)
+            .and_then(|n| n.mesh)
+            .and_then(|mid| scene.meshes.get(mid.0 as usize))
+            .and_then(|m| m.primitives.first())
+            .and_then(|p| p.extras.get("usd:skel:blendShapes"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let AnimationValues::Scalar(weights) = &morph_ch.sampler.values {
+            let n_frames = morph_ch.sampler.keyframes.len();
+            let stride = weights.len().checked_div(n_frames).unwrap_or(0);
+            if stride > 0 {
+                w.write_indent();
+                write!(w.s, "uniform token[] blendShapes = [").unwrap();
+                for i in 0..stride {
+                    if i > 0 {
+                        w.s.push_str(", ");
+                    }
+                    let fallback = format!("shape_{i}");
+                    let name = names.get(i).map(String::as_str).unwrap_or(&fallback);
+                    write!(w.s, "\"{name}\"").unwrap();
+                }
+                writeln!(w.s, "]").unwrap();
+                w.write_indent();
+                write!(w.s, "float[] blendShapeWeights.timeSamples = {{").unwrap();
+                for (k, t) in morph_ch.sampler.keyframes.iter().enumerate() {
+                    if k > 0 {
+                        w.s.push(',');
+                    }
+                    write!(w.s, " {}: [", format_float((*t as f64) * tcps)).unwrap();
+                    for i in 0..stride {
+                        if i > 0 {
+                            w.s.push_str(", ");
+                        }
+                        let val = weights.get(k * stride + i).copied().unwrap_or(0.0);
+                        write!(w.s, "{}", format_float(val as f64)).unwrap();
+                    }
+                    w.s.push(']');
+                }
+                writeln!(w.s, " }}").unwrap();
+            }
+        }
     }
 
     w.indent -= 1;
