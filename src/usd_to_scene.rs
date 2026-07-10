@@ -2135,7 +2135,7 @@ fn apply_preview_surface(
     }
     // A constant (unconnected) normal opinion other than the
     // unperturbed default (0, 0, 1) has no typed slot — preserve it.
-    if surface.attrs.get("inputs:normal.connect").is_none() {
+    if !surface.attrs.contains_key("inputs:normal.connect") {
         if let Some(nrm) = color("inputs:normal") {
             if nrm != [0.0, 0.0, 1.0] {
                 mat.extras.insert(
