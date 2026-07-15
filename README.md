@@ -61,12 +61,17 @@ Full reader and symmetric writer for the `#usda 1.0` text format:
 - **Materials** — the full `UsdPreviewSurface` input set → `Material`:
   base color, metallic, roughness, emissive, opacity +
   `opacityThreshold` cutout (`AlphaMode::Mask` / `Blend`), occlusion
-  multiplier, specular workflow (`useSpecularWorkflow` +
-  `specularColor`), clearcoat, IOR, displacement, and constant normal
-  (the last five preserved per-input on extras). Texture connections
-  resolve for every input — diffuse / normal / emissive / occlusion
-  into the typed slots, metallic + roughness into the packed slot with
-  the authored-input record, the rest via `usd:tex:*` extras.
+  multiplier, plus the typed `MaterialExt` extension slots — the
+  specular workflow (`useSpecularWorkflow` + `specularColor` →
+  `MaterialExt::specular`; an inert color authored with the workflow
+  off stays on extras), the clearcoat lobe
+  (`clearcoat` / `clearcoatRoughness` → `MaterialExt::clearcoat`), and
+  IOR (`MaterialExt::ior`). Displacement and a constant normal are
+  preserved per-input on extras. Texture connections resolve for
+  every input — diffuse / normal / emissive / occlusion into the
+  typed core slots, metallic + roughness into the packed slot with
+  the authored-input record, the specular-F0 and clearcoat maps into
+  the typed extension slots, the rest via `usd:tex:*` extras.
 - **Texture network** — `UsdUVTexture` `wrapS`/`wrapT` map to sampler
   wrap modes; `scale` / `bias` / `fallback` / `sourceColorSpace`
   round-trip; the `st` connection is followed to its
