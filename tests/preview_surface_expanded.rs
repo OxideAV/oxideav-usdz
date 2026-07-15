@@ -95,8 +95,56 @@ fn clearcoat_ior_occlusion_mapped() {
         extras_f32(mat, "usd:inputs:clearcoatRoughness").unwrap(),
         0.2
     ));
-    assert!(approx(extras_f32(mat, "usd:inputs:ior").unwrap(), 1.45));
+    assert!(
+        approx(mat.ext.ior.expect("authored ior on the typed slot"), 1.45),
+        "ior lands on MaterialExt::ior"
+    );
+    assert!(
+        !mat.extras.contains_key("usd:inputs:ior"),
+        "typed slot replaces the extras shim"
+    );
     assert!(approx(mat.occlusion_strength, 0.75));
+}
+
+#[test]
+fn unauthored_ior_stays_none() {
+    let usda = r#"#usda 1.0
+def Material "Mat" {
+    def Shader "Surface" {
+        uniform token info:id = "UsdPreviewSurface"
+        color3f inputs:diffuseColor = (1, 0, 0)
+        token outputs:surface
+    }
+}
+"#;
+    let scene = decode(usda);
+    let mat = &scene.materials[0];
+    assert_eq!(
+        mat.ext.ior, None,
+        "unauthored ior must not synthesise the schema default"
+    );
+    assert!(approx(mat.effective_ior(), 1.5), "consumer-side default");
+}
+
+#[test]
+fn explicit_default_ior_round_trips() {
+    // An explicit `ior = 1.5` (the schema default) is an authored
+    // opinion — the Option-shaped typed slot keeps it distinguishable
+    // from absence, so the writer re-emits it.
+    let usda = r#"#usda 1.0
+def Material "Mat" {
+    def Shader "Surface" {
+        uniform token info:id = "UsdPreviewSurface"
+        float inputs:ior = 1.5
+        token outputs:surface
+    }
+}
+"#;
+    let scene = decode(usda);
+    assert!(approx(scene.materials[0].ext.ior.unwrap(), 1.5));
+    let bytes = UsdzEncoder::new().encode_bytes(&scene).expect("encode ok");
+    let s2 = UsdzDecoder::new().decode(&bytes).expect("re-decode ok");
+    assert!(approx(s2.materials[0].ext.ior.unwrap(), 1.5));
 }
 
 #[test]
@@ -229,12 +277,12 @@ fn expanded_material_round_trips() {
         "usd:inputs:specularColor",
         "usd:inputs:clearcoat",
         "usd:inputs:clearcoatRoughness",
-        "usd:inputs:ior",
         "usd:inputs:displacement",
         "usd:inputs:normal",
     ] {
         assert_eq!(a.extras.get(key), b.extras.get(key), "extras `{key}`");
     }
+    assert_eq!(a.ext.ior, b.ext.ior, "typed ior survives the round trip");
 }
 
 #[test]

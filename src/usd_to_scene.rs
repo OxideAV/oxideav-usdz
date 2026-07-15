@@ -3329,9 +3329,17 @@ fn apply_preview_surface(
             .insert("usd:tex:specularColor".into(), texref_to_json(tref));
     }
 
-    // Clearcoat lobe, IOR, displacement — scalar inputs preserved
+    // Index of refraction — typed extension slot. The typed model's
+    // `MaterialExt::ior` is `Option`-shaped, so an unauthored input
+    // stays `None` (the schema default 1.5 is the consumer's job via
+    // `effective_ior()`), and only an authored opinion re-emits.
+    if let Some(f) = scalar("inputs:ior") {
+        mat.ext.ior = Some(f);
+    }
+
+    // Clearcoat lobe, displacement — scalar inputs preserved
     // per-input so only the authored opinions re-emit.
-    for input in ["clearcoat", "clearcoatRoughness", "ior", "displacement"] {
+    for input in ["clearcoat", "clearcoatRoughness", "displacement"] {
         if let Some(f) = scalar(&format!("inputs:{input}")) {
             if let Some(n) = serde_json::Number::from_f64(f as f64) {
                 mat.extras

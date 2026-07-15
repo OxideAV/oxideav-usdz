@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`UsdPreviewSurface` extras shims migrated onto the typed
+  `oxideav-mesh3d` material-extension surface (published 0.0.4).**
+  The parked extras/HashMap side-channels for the expanded §2.1
+  inputs now land on `Material::ext`:
+  - `inputs:ior` → `MaterialExt::ior` (`Option`-shaped, so an
+    authored opinion — including an explicit `1.5` — stays
+    distinguishable from absence; `usd:inputs:ior` extras retired).
+
 ### Added
 
 - **USDA `timeSamples` parsing.** The parser now understands the

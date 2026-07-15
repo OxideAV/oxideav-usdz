@@ -2590,7 +2590,14 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
             .unwrap();
         }
     }
-    for input in ["clearcoat", "clearcoatRoughness", "ior", "displacement"] {
+    // Index of refraction — the typed `MaterialExt::ior` slot is
+    // `Option`-shaped, so `Some` is exactly "the source authored an
+    // opinion" and re-emits verbatim (including an explicit 1.5).
+    if let Some(ior) = mat.ext.ior {
+        w.write_indent();
+        writeln!(w.s, "float inputs:ior = {}", format_float(ior as f64)).unwrap();
+    }
+    for input in ["clearcoat", "clearcoatRoughness", "displacement"] {
         if let Some(f) = mat
             .extras
             .get(&format!("usd:inputs:{input}"))
