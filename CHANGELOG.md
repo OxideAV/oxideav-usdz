@@ -16,6 +16,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `inputs:ior` → `MaterialExt::ior` (`Option`-shaped, so an
     authored opinion — including an explicit `1.5` — stays
     distinguishable from absence; `usd:inputs:ior` extras retired).
+  - `inputs:clearcoat` / `inputs:clearcoatRoughness` + their texture
+    connections → `MaterialExt::clearcoat` (the typed `Clearcoat`
+    lobe: factor / roughness / factor_texture / roughness_texture).
+    The lobe materialises only when at least one clearcoat opinion is
+    authored; unauthored inputs inside it evaluate to the schema §2.1
+    defaults (`0` / `0.01`) so consumers read the value the shader
+    would use, and the writer skips default-valued fields so no
+    synthetic opinion lands in the output file. The
+    `usd:inputs:clearcoat*` and `usd:tex:clearcoat*` extras are
+    retired.
+
+### Fixed
+
+- **texture asset filename drift across repack.** A decoded texture
+  was named after its `UsdUVTexture` shader prim; since the writer
+  derives both the output archive entry name and the `inputs:file`
+  reference from `Texture::name`, a decode → encode repack renamed
+  `cc.png` to `<ShaderPrim>.png` on the first cycle and to
+  `Texture_<id>.png` on the second — a two-cycle drift breaking the
+  one-cycle round-trip fixed point for textured materials. Textures
+  are now named after the archive entry's basename stem, so the
+  original asset filename survives the repack verbatim and the text
+  round trip is a fixed point after one cycle.
 
 ### Added
 

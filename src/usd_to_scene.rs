@@ -3233,10 +3233,17 @@ fn build_material(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Material> {
 ///   extension model is deferred until the published
 ///   `oxideav-mesh3d` release carries it — the current release's
 ///   `Material` has no extension surface.)
-/// * `clearcoat` / `clearcoatRoughness` / `ior` / `displacement` —
-///   scalar inputs preserved per-input on
-///   `extras["usd:inputs:<name>"]`, so only authored opinions
-///   re-emit.
+/// * `clearcoat` / `clearcoatRoughness` (+ their texture
+///   connections) — the typed
+///   [`MaterialExt::clearcoat`](oxideav_mesh3d::MaterialExt::clearcoat)
+///   lobe, materialised only when at least one clearcoat opinion is
+///   authored (unauthored inputs inside it take the schema
+///   defaults).
+/// * `ior` — the typed `Option`-shaped
+///   [`MaterialExt::ior`](oxideav_mesh3d::MaterialExt::ior) slot.
+/// * `displacement` — scalar input preserved on
+///   `extras["usd:inputs:displacement"]`, so only an authored
+///   opinion re-emits.
 /// * `occlusion` — constant ambient-occlusion multiplier, mapped
 ///   onto [`Material::occlusion_strength`].
 /// * constant (non-default) `normal` — preserved on
@@ -3337,27 +3344,49 @@ fn apply_preview_surface(
         mat.ext.ior = Some(f);
     }
 
-    // Clearcoat lobe, displacement — scalar inputs preserved
-    // per-input so only the authored opinions re-emit.
-    for input in ["clearcoat", "clearcoatRoughness", "displacement"] {
+    // Clearcoat lobe — typed extension slot. The lobe materialises
+    // only when the source authored at least one clearcoat opinion
+    // (either scalar or texture connection); unauthored inputs inside
+    // it take the schema §2.1 defaults (`clearcoat` 0, `clearcoatRoughness`
+    // 0.01) so a consumer reading the struct gets the value the shader
+    // would evaluate. The writer re-emits only non-default values, so
+    // no synthetic opinion lands in the output file.
+    let cc_factor = scalar("inputs:clearcoat");
+    let cc_roughness = scalar("inputs:clearcoatRoughness");
+    let cc_factor_tex = resolve_texture_connect(
+        ctx,
+        parent_path,
+        parent,
+        surface.attrs.get("inputs:clearcoat.connect"),
+    )?;
+    let cc_roughness_tex = resolve_texture_connect(
+        ctx,
+        parent_path,
+        parent,
+        surface.attrs.get("inputs:clearcoatRoughness.connect"),
+    )?;
+    if cc_factor.is_some()
+        || cc_roughness.is_some()
+        || cc_factor_tex.is_some()
+        || cc_roughness_tex.is_some()
+    {
+        mat.ext.clearcoat = Some(oxideav_mesh3d::Clearcoat {
+            factor: cc_factor.unwrap_or(0.0),
+            factor_texture: cc_factor_tex,
+            roughness: cc_roughness.unwrap_or(0.01),
+            roughness_texture: cc_roughness_tex,
+            ..Default::default()
+        });
+    }
+
+    // Displacement — scalar input preserved per-input so only the
+    // authored opinion re-emits (no typed slot in the model).
+    for input in ["displacement"] {
         if let Some(f) = scalar(&format!("inputs:{input}")) {
             if let Some(n) = serde_json::Number::from_f64(f as f64) {
                 mat.extras
                     .insert(format!("usd:inputs:{input}"), serde_json::Value::Number(n));
             }
-        }
-    }
-    for input in ["clearcoat", "clearcoatRoughness"] {
-        if let Some(tref) = resolve_texture_connect(
-            ctx,
-            parent_path,
-            parent,
-            surface
-                .attrs
-                .get(format!("inputs:{input}.connect").as_str()),
-        )? {
-            mat.extras
-                .insert(format!("usd:tex:{input}"), texref_to_json(tref));
         }
     }
 
@@ -3648,8 +3677,18 @@ fn resolve_texture_connect(
     }
 
     let asset_arc: Arc<dyn AssetSource> = Arc::new(asset);
+    // Name the texture after its archive entry's basename stem, not
+    // the shader prim name: the writer derives the output entry name
+    // (and the `inputs:file` reference) from `Texture::name`, so the
+    // stem keeps the original asset filename stable across a
+    // decode → encode repack. It also makes the text round trip a
+    // one-cycle fixed point — a re-decoded scene reproduces the same
+    // stem, where the prim-name scheme drifted onto the writer's
+    // `Texture_<id>` prim name on the second cycle.
+    let base = entry.name.rsplit('/').next().unwrap_or(&entry.name);
+    let stem = base.rsplit_once('.').map_or(base, |(s, _)| s);
     let texture = Texture {
-        name: Some(rel.to_string()),
+        name: Some(if stem.is_empty() { rel } else { stem }.to_string()),
         image: ImageData::Source(asset_arc),
         sampler,
     };

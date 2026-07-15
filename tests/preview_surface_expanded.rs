@@ -53,13 +53,6 @@ fn approx(a: f32, b: f32) -> bool {
     (a - b).abs() < 1e-5
 }
 
-fn extras_f32(mat: &oxideav_mesh3d::Material, key: &str) -> Option<f32> {
-    mat.extras
-        .get(key)
-        .and_then(|v| v.as_f64())
-        .map(|f| f as f32)
-}
-
 #[test]
 fn specular_workflow_preserved_on_extras() {
     let scene = decode(EXPANDED_USDA);
@@ -87,14 +80,18 @@ fn specular_workflow_preserved_on_extras() {
 fn clearcoat_ior_occlusion_mapped() {
     let scene = decode(EXPANDED_USDA);
     let mat = &scene.materials[0];
-    assert!(approx(
-        extras_f32(mat, "usd:inputs:clearcoat").unwrap(),
-        0.6
-    ));
-    assert!(approx(
-        extras_f32(mat, "usd:inputs:clearcoatRoughness").unwrap(),
-        0.2
-    ));
+    let cc = mat
+        .ext
+        .clearcoat
+        .as_ref()
+        .expect("authored clearcoat on the typed slot");
+    assert!(approx(cc.factor, 0.6));
+    assert!(approx(cc.roughness, 0.2));
+    assert!(
+        !mat.extras.contains_key("usd:inputs:clearcoat")
+            && !mat.extras.contains_key("usd:inputs:clearcoatRoughness"),
+        "typed slot replaces the extras shim"
+    );
     assert!(
         approx(mat.ext.ior.expect("authored ior on the typed slot"), 1.45),
         "ior lands on MaterialExt::ior"
@@ -187,9 +184,10 @@ fn displacement_and_constant_normal_preserved_on_extras() {
 
 #[test]
 fn only_authored_clearcoat_inputs_preserved() {
-    // Only `clearcoat` authored — the unauthored roughness must not
-    // materialise a synthetic opinion (the schema default 0.01 is the
-    // consumer's job, not the file's).
+    // Only `clearcoat` authored — the typed lobe carries the schema
+    // default roughness (0.01) for the consumer, but the writer must
+    // not materialise a synthetic `clearcoatRoughness` opinion in the
+    // output file.
     let usda = r#"#usda 1.0
 def Material "Mat" {
     def Shader "Surface" {
@@ -201,14 +199,112 @@ def Material "Mat" {
 "#;
     let scene = decode(usda);
     let mat = &scene.materials[0];
-    assert!(approx(
-        extras_f32(mat, "usd:inputs:clearcoat").unwrap(),
-        1.0
-    ));
+    let cc = mat.ext.clearcoat.as_ref().expect("typed clearcoat lobe");
+    assert!(approx(cc.factor, 1.0));
     assert!(
-        !mat.extras.contains_key("usd:inputs:clearcoatRoughness"),
-        "unauthored input must not be synthesised"
+        approx(cc.roughness, 0.01),
+        "unauthored roughness evaluates to the schema default"
     );
+    let out = UsdzEncoder::new()
+        .encode_with_report(&scene)
+        .expect("encode ok")
+        .usda;
+    assert!(out.contains("inputs:clearcoat = 1"));
+    assert!(
+        !out.contains("inputs:clearcoatRoughness"),
+        "unauthored input must not be synthesised in the output"
+    );
+}
+
+#[test]
+fn unauthored_clearcoat_stays_none() {
+    let usda = r#"#usda 1.0
+def Material "Mat" {
+    def Shader "Surface" {
+        uniform token info:id = "UsdPreviewSurface"
+        color3f inputs:diffuseColor = (1, 0, 0)
+        token outputs:surface
+    }
+}
+"#;
+    let scene = decode(usda);
+    assert_eq!(
+        scene.materials[0].ext.clearcoat, None,
+        "no clearcoat opinion, no lobe"
+    );
+}
+
+#[test]
+fn clearcoat_texture_connections_land_on_typed_slot() {
+    let usda = r#"#usda 1.0
+def Xform "Root" {
+    def Mesh "M" {
+        rel material:binding = </Root/Mat>
+        int[] faceVertexCounts = [3]
+        int[] faceVertexIndices = [0, 1, 2]
+        point3f[] points = [(0,0,0), (1,0,0), (0,1,0)]
+    }
+    def Material "Mat" {
+        def Shader "Surface" {
+            uniform token info:id = "UsdPreviewSurface"
+            float inputs:clearcoat.connect = </Root/Mat/CcTex.outputs:r>
+            float inputs:clearcoatRoughness.connect = </Root/Mat/CcTex.outputs:g>
+            token outputs:surface
+        }
+        def Shader "CcTex" {
+            uniform token info:id = "UsdUVTexture"
+            asset inputs:file = @cc.png@
+            float outputs:r
+            float outputs:g
+        }
+    }
+}
+"#;
+    let usdz = common::build_usdz(&[
+        common::UsdzEntry {
+            name: "scene.usda",
+            payload: usda.as_bytes(),
+        },
+        common::UsdzEntry {
+            name: "cc.png",
+            payload: b"CC-PIXEL-DATA",
+        },
+    ]);
+    let scene = UsdzDecoder::new().decode_bytes(&usdz).unwrap();
+    let mat = &scene.materials[0];
+    let cc = mat.ext.clearcoat.as_ref().expect("typed clearcoat lobe");
+    assert!(cc.factor_texture.is_some(), "factor map on the typed slot");
+    assert!(
+        cc.roughness_texture.is_some(),
+        "roughness map on the typed slot"
+    );
+    assert!(
+        !mat.extras.contains_key("usd:tex:clearcoat")
+            && !mat.extras.contains_key("usd:tex:clearcoatRoughness"),
+        "typed slots replace the extras shims"
+    );
+    assert_eq!(scene.textures.len(), 1);
+
+    // Write → re-read: connections and the shared UsdUVTexture prim
+    // survive, and the second encode is a fixed point.
+    let bytes = UsdzEncoder::new().encode_bytes(&scene).expect("encode ok");
+    let s2 = UsdzDecoder::new().decode(&bytes).expect("re-decode ok");
+    let cc2 = s2.materials[0]
+        .ext
+        .clearcoat
+        .as_ref()
+        .expect("typed lobe survives");
+    assert!(cc2.factor_texture.is_some() && cc2.roughness_texture.is_some());
+    assert_eq!(s2.textures.len(), 1);
+    let first = UsdzEncoder::new()
+        .encode_with_report(&scene)
+        .expect("encode ok")
+        .usda;
+    let second = UsdzEncoder::new()
+        .encode_with_report(&s2)
+        .expect("encode ok")
+        .usda;
+    assert_eq!(first, second, "clearcoat-texture round trip fixed point");
 }
 
 #[test]
@@ -275,14 +371,16 @@ fn expanded_material_round_trips() {
     for key in [
         "usd:useSpecularWorkflow",
         "usd:inputs:specularColor",
-        "usd:inputs:clearcoat",
-        "usd:inputs:clearcoatRoughness",
         "usd:inputs:displacement",
         "usd:inputs:normal",
     ] {
         assert_eq!(a.extras.get(key), b.extras.get(key), "extras `{key}`");
     }
     assert_eq!(a.ext.ior, b.ext.ior, "typed ior survives the round trip");
+    assert_eq!(
+        a.ext.clearcoat, b.ext.clearcoat,
+        "typed clearcoat survives the round trip"
+    );
 }
 
 #[test]

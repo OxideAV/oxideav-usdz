@@ -2597,7 +2597,32 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
         w.write_indent();
         writeln!(w.s, "float inputs:ior = {}", format_float(ior as f64)).unwrap();
     }
-    for input in ["clearcoat", "clearcoatRoughness", "displacement"] {
+    // Clearcoat lobe — re-emit from the typed slot. Values equal to
+    // the schema §2.1 defaults (`clearcoat` 0, `clearcoatRoughness`
+    // 0.01) are skipped so an unauthored input never materialises a
+    // synthetic opinion in the output; an authored default collapses
+    // to absence, which evaluates identically.
+    if let Some(cc) = &mat.ext.clearcoat {
+        if cc.factor != 0.0 {
+            w.write_indent();
+            writeln!(
+                w.s,
+                "float inputs:clearcoat = {}",
+                format_float(cc.factor as f64)
+            )
+            .unwrap();
+        }
+        if cc.roughness != 0.01 {
+            w.write_indent();
+            writeln!(
+                w.s,
+                "float inputs:clearcoatRoughness = {}",
+                format_float(cc.roughness as f64)
+            )
+            .unwrap();
+        }
+    }
+    for input in ["displacement"] {
         if let Some(f) = mat
             .extras
             .get(&format!("usd:inputs:{input}"))
@@ -2666,6 +2691,17 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
             write_tex_connect(w, &mat_path, "roughness", tref, "g");
         }
     }
+    // Typed clearcoat texture connections (factor = R, roughness = G,
+    // the channels the packed-map documentation on the typed slots
+    // records).
+    if let Some(cc) = &mat.ext.clearcoat {
+        if let Some(tref) = cc.factor_texture {
+            write_tex_connect(w, &mat_path, "clearcoat", tref, "r");
+        }
+        if let Some(tref) = cc.roughness_texture {
+            write_tex_connect(w, &mat_path, "clearcoatRoughness", tref, "g");
+        }
+    }
     // No-typed-slot texture inputs preserved on extras
     // (`usd:tex:<input>` → {"texture": N, "uv_set": M}).
     for (input, channel) in EXTRAS_TEX_INPUTS {
@@ -2680,6 +2716,13 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
     writeln!(w.s, "}}").unwrap();
 
     // One UsdUVTexture child per bound texture (deduped on TextureId).
+    // Only slots this writer actually connects participate — typed
+    // extension slots USD cannot express (sheen, volume, …) must not
+    // materialise an orphan UsdUVTexture prim with no connection.
+    let ext_texrefs = [
+        mat.ext.clearcoat.as_ref().and_then(|c| c.factor_texture),
+        mat.ext.clearcoat.as_ref().and_then(|c| c.roughness_texture),
+    ];
     let extras_texrefs: Vec<Option<TextureRef>> = EXTRAS_TEX_INPUTS
         .iter()
         .map(|(input, _)| texref_from_extras(&mat.extras, input))
@@ -2693,6 +2736,7 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
         mat.metallic_roughness_texture,
     ]
     .into_iter()
+    .chain(ext_texrefs)
     .chain(extras_texrefs)
     .flatten()
     {
@@ -2834,13 +2878,11 @@ fn type_for_slot(slot: &str) -> &'static str {
 /// Shader inputs whose texture connection has no typed model slot;
 /// each round-trips through `Material::extras["usd:tex:<input>"]`
 /// with the listed output channel.
-const EXTRAS_TEX_INPUTS: [(&str, &str); 6] = [
+const EXTRAS_TEX_INPUTS: [(&str, &str); 4] = [
     ("opacity", "a"),
     ("displacement", "r"),
     ("roughness", "g"),
     ("specularColor", "rgb"),
-    ("clearcoat", "r"),
-    ("clearcoatRoughness", "g"),
 ];
 
 /// Decode a `usd:tex:<input>` extras entry back into a [`TextureRef`]
