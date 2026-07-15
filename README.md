@@ -76,7 +76,13 @@ Full reader and symmetric writer for the `#usda 1.0` text format:
   wrap modes; `scale` / `bias` / `fallback` / `sourceColorSpace`
   round-trip; the `st` connection is followed to its
   `UsdPrimvarReader_float2` so `varname` selects the UV set
-  (`st` → 0, `st<N>` → N). Meshes read/write multi-UV
+  (`st` → 0, `st<N>` → N). A `file` path carrying the `<UDIM>` token
+  (a tile set — no single archive entry) decodes to an
+  `ImageData::External` reference and re-emits the URI verbatim.
+  Material inputs connected to a `UsdPrimvarReader_<T>` (any of the
+  ten §2.3 typed variants — e.g. `diffuseColor` reading
+  `displayColor`) round-trip through `extras["usd:primvar:<input>"]`,
+  reader prim included. Meshes read/write multi-UV
   `primvars:st1..N`, `doubleSided`, and `displayColor` /
   `displayOpacity` vertex colours.
 - **Skeletal animation (UsdSkel)** — `SkelRoot` / `Skeleton` /
@@ -92,6 +98,11 @@ Full reader and symmetric writer for the `#usda 1.0` text format:
   fixed point. Inbetween shapes are not yet modelled.
 - **Transforms** — per-node `UsdGeomXformable` xformOps round-trip
   (`translate` + `orient` quatf + `scale`, or a `matrix4d` transform).
+  `matrix4d` literals (row-vector, translation in the last row)
+  transpose into the typed model's column-vector convention and back,
+  so `Skeleton::inverse_bind_matrices` and node matrices satisfy the
+  model's affine contract (`Scene3D::validate`-clean; guarded by the
+  `decode_validates` suite).
 - **Spatial audio** — `UsdMediaSpatialAudio` read and write, mapping to
   `AudioEmitter` / `AudioSource` with `auralMode`, gain, and timing
   fields preserved for byte-faithful round-trip.
