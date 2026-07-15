@@ -26,6 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     synthetic opinion lands in the output file. The
     `usd:inputs:clearcoat*` and `usd:tex:clearcoat*` extras are
     retired.
+  - `useSpecularWorkflow = 1` + `specularColor` (+ its texture
+    connection) → `MaterialExt::specular` (the typed `Specular`
+    slot): `Some` is exactly "the specular workflow is active", the
+    authored color (or the schema default black) is the F0
+    `color_factor`, and `specularColor.connect` lands on
+    `color_texture`. A `specularColor` authored while the workflow is
+    off is inert per schema §2.1 and keeps riding on extras so it
+    re-emits without activating the workflow. The
+    `usd:useSpecularWorkflow` extras key is retired;
+    `usd:inputs:specularColor` / `usd:tex:specularColor` survive for
+    the inert case only.
 
 ### Fixed
 

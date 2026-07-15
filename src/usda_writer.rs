@@ -2563,16 +2563,28 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
         )
         .unwrap();
     }
-    if mat
-        .extras
-        .get("usd:useSpecularWorkflow")
-        .and_then(|v| v.as_i64())
-        == Some(1)
-    {
+    // Specular workflow — the typed slot's presence IS the workflow
+    // selector. The F0 color re-emits unless it equals the schema
+    // default black (an authored default collapses to absence, which
+    // evaluates identically); the color map is connected further
+    // below with the other texture connections. An inert
+    // `specularColor` (workflow off) re-emits from extras.
+    if let Some(spec) = &mat.ext.specular {
         w.write_indent();
         writeln!(w.s, "int inputs:useSpecularWorkflow = 1").unwrap();
-    }
-    if let Some(sc) = mat
+        if spec.color_factor != [0.0, 0.0, 0.0] {
+            let c = spec.color_factor;
+            w.write_indent();
+            writeln!(
+                w.s,
+                "color3f inputs:specularColor = ({}, {}, {})",
+                format_float(c[0] as f64),
+                format_float(c[1] as f64),
+                format_float(c[2] as f64)
+            )
+            .unwrap();
+        }
+    } else if let Some(sc) = mat
         .extras
         .get("usd:inputs:specularColor")
         .and_then(|v| v.as_array())
@@ -2691,6 +2703,10 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
             write_tex_connect(w, &mat_path, "roughness", tref, "g");
         }
     }
+    // Typed specular F0-color map (RGB channels).
+    if let Some(tref) = mat.ext.specular.as_ref().and_then(|s| s.color_texture) {
+        write_tex_connect(w, &mat_path, "specularColor", tref, "rgb");
+    }
     // Typed clearcoat texture connections (factor = R, roughness = G,
     // the channels the packed-map documentation on the typed slots
     // records).
@@ -2720,6 +2736,7 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
     // extension slots USD cannot express (sheen, volume, …) must not
     // materialise an orphan UsdUVTexture prim with no connection.
     let ext_texrefs = [
+        mat.ext.specular.as_ref().and_then(|s| s.color_texture),
         mat.ext.clearcoat.as_ref().and_then(|c| c.factor_texture),
         mat.ext.clearcoat.as_ref().and_then(|c| c.roughness_texture),
     ];

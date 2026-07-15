@@ -54,26 +54,134 @@ fn approx(a: f32, b: f32) -> bool {
 }
 
 #[test]
-fn specular_workflow_preserved_on_extras() {
+fn specular_workflow_lands_on_typed_slot() {
     let scene = decode(EXPANDED_USDA);
     let mat = &scene.materials[0];
-    assert_eq!(
-        mat.extras
-            .get("usd:useSpecularWorkflow")
-            .and_then(|v| v.as_i64()),
-        Some(1)
+    let spec = mat
+        .ext
+        .specular
+        .as_ref()
+        .expect("active workflow on the typed slot");
+    assert!(approx(spec.color_factor[0], 0.9));
+    assert!(approx(spec.color_factor[1], 0.8));
+    assert!(approx(spec.color_factor[2], 0.7));
+    assert!(
+        approx(spec.factor, 1.0),
+        "no USD counterpart — neutral default"
     );
-    let sc: Vec<f64> = mat
+    assert!(
+        !mat.extras.contains_key("usd:useSpecularWorkflow")
+            && !mat.extras.contains_key("usd:inputs:specularColor"),
+        "typed slot replaces the extras shims"
+    );
+}
+
+#[test]
+fn inert_specular_color_stays_on_extras() {
+    // `specularColor` authored while the workflow is off is inert
+    // (schema §2.1: ignored when `useSpecularWorkflow = 0`) — it must
+    // not activate the typed slot, but the authored opinion still
+    // round-trips via extras.
+    let usda = r#"#usda 1.0
+def Material "Mat" {
+    def Shader "Surface" {
+        uniform token info:id = "UsdPreviewSurface"
+        color3f inputs:specularColor = (0.3, 0.2, 0.1)
+        token outputs:surface
+    }
+}
+"#;
+    let scene = decode(usda);
+    let mat = &scene.materials[0];
+    assert_eq!(
+        mat.ext.specular, None,
+        "inert color must not activate the workflow"
+    );
+    let sc = mat
         .extras
         .get("usd:inputs:specularColor")
         .and_then(|v| v.as_array())
-        .expect("specularColor preserved")
-        .iter()
-        .filter_map(|v| v.as_f64())
-        .collect();
-    assert!(approx(sc[0] as f32, 0.9));
-    assert!(approx(sc[1] as f32, 0.8));
-    assert!(approx(sc[2] as f32, 0.7));
+        .expect("inert color preserved on extras");
+    assert!(approx(sc[0].as_f64().unwrap() as f32, 0.3));
+
+    let bytes = UsdzEncoder::new().encode_bytes(&scene).expect("encode ok");
+    let s2 = UsdzDecoder::new().decode(&bytes).expect("re-decode ok");
+    assert_eq!(s2.materials[0].ext.specular, None);
+    assert!(s2.materials[0]
+        .extras
+        .contains_key("usd:inputs:specularColor"));
+    let out = UsdzEncoder::new()
+        .encode_with_report(&scene)
+        .expect("encode ok")
+        .usda;
+    assert!(
+        !out.contains("useSpecularWorkflow"),
+        "workflow selector must not be synthesised"
+    );
+}
+
+#[test]
+fn specular_color_texture_lands_on_typed_slot() {
+    let usda = r#"#usda 1.0
+def Xform "Root" {
+    def Mesh "M" {
+        rel material:binding = </Root/Mat>
+        int[] faceVertexCounts = [3]
+        int[] faceVertexIndices = [0, 1, 2]
+        point3f[] points = [(0,0,0), (1,0,0), (0,1,0)]
+    }
+    def Material "Mat" {
+        def Shader "Surface" {
+            uniform token info:id = "UsdPreviewSurface"
+            int inputs:useSpecularWorkflow = 1
+            color3f inputs:specularColor.connect = </Root/Mat/SpecTex.outputs:rgb>
+            token outputs:surface
+        }
+        def Shader "SpecTex" {
+            uniform token info:id = "UsdUVTexture"
+            asset inputs:file = @spec.png@
+            float3 outputs:rgb
+        }
+    }
+}
+"#;
+    let usdz = common::build_usdz(&[
+        common::UsdzEntry {
+            name: "scene.usda",
+            payload: usda.as_bytes(),
+        },
+        common::UsdzEntry {
+            name: "spec.png",
+            payload: b"SPEC-PIXEL-DATA",
+        },
+    ]);
+    let scene = UsdzDecoder::new().decode_bytes(&usdz).unwrap();
+    let mat = &scene.materials[0];
+    let spec = mat.ext.specular.as_ref().expect("typed workflow");
+    assert!(spec.color_texture.is_some(), "F0 map on the typed slot");
+    assert!(
+        !mat.extras.contains_key("usd:tex:specularColor"),
+        "typed slot replaces the extras shim"
+    );
+
+    let bytes = UsdzEncoder::new().encode_bytes(&scene).expect("encode ok");
+    let s2 = UsdzDecoder::new().decode(&bytes).expect("re-decode ok");
+    assert!(s2.materials[0]
+        .ext
+        .specular
+        .as_ref()
+        .expect("workflow survives")
+        .color_texture
+        .is_some());
+    let first = UsdzEncoder::new()
+        .encode_with_report(&scene)
+        .expect("encode ok")
+        .usda;
+    let second = UsdzEncoder::new()
+        .encode_with_report(&s2)
+        .expect("encode ok")
+        .usda;
+    assert_eq!(first, second, "specular-texture round trip fixed point");
 }
 
 #[test]
@@ -368,18 +476,17 @@ fn expanded_material_round_trips() {
     }
     assert_eq!(a.alpha_mode, b.alpha_mode);
     assert!(approx(a.occlusion_strength, b.occlusion_strength));
-    for key in [
-        "usd:useSpecularWorkflow",
-        "usd:inputs:specularColor",
-        "usd:inputs:displacement",
-        "usd:inputs:normal",
-    ] {
+    for key in ["usd:inputs:displacement", "usd:inputs:normal"] {
         assert_eq!(a.extras.get(key), b.extras.get(key), "extras `{key}`");
     }
     assert_eq!(a.ext.ior, b.ext.ior, "typed ior survives the round trip");
     assert_eq!(
         a.ext.clearcoat, b.ext.clearcoat,
         "typed clearcoat survives the round trip"
+    );
+    assert_eq!(
+        a.ext.specular, b.ext.specular,
+        "typed specular survives the round trip"
     );
 }
 

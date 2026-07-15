@@ -3226,13 +3226,12 @@ fn build_material(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Material> {
 ///   opaque. Maps onto [`AlphaMode::Mask`] with the threshold as
 ///   `cutoff`. `0` (the default) disables cutout; an authored
 ///   `opacity < 1` then selects [`AlphaMode::Blend`].
-/// * `useSpecularWorkflow = 1` + `specularColor` — the specular
-///   workflow. Both ride on extras (`usd:useSpecularWorkflow`,
-///   `usd:inputs:specularColor`) so the writer re-authors exactly
-///   the source inputs. (A typed-slot mapping onto the material-
-///   extension model is deferred until the published
-///   `oxideav-mesh3d` release carries it — the current release's
-///   `Material` has no extension surface.)
+/// * `useSpecularWorkflow = 1` + `specularColor` (+ its texture
+///   connection) — the typed
+///   [`MaterialExt::specular`](oxideav_mesh3d::MaterialExt::specular)
+///   slot; `Some` is exactly "the specular workflow is active". An
+///   inert `specularColor` (workflow off) stays on
+///   `extras["usd:inputs:specularColor"]` / `extras["usd:tex:specularColor"]`.
 /// * `clearcoat` / `clearcoatRoughness` (+ their texture
 ///   connections) — the typed
 ///   [`MaterialExt::clearcoat`](oxideav_mesh3d::MaterialExt::clearcoat)
@@ -3308,32 +3307,43 @@ fn apply_preview_surface(
     }
 
     // Specular workflow (`useSpecularWorkflow = 1`): `specularColor`
-    // is the reflectivity at normal incidence. Both ride on extras —
-    // the workflow selector plus the authored color — so the writer
-    // re-authors exactly the source inputs. (A typed-slot mapping is
-    // deferred until the published typed model grows an extension
-    // surface.)
+    // is the reflectivity at normal incidence. An active workflow
+    // lands on the typed
+    // [`MaterialExt::specular`](oxideav_mesh3d::MaterialExt::specular)
+    // slot — `Some` is exactly "the source selected the specular
+    // workflow", with the authored color (or the schema default
+    // black) as the F0 `color_factor` and the `specularColor.connect`
+    // map as `color_texture`. `Specular::factor` has no USD
+    // counterpart and stays at its neutral default 1. A
+    // `specularColor` authored while the workflow is off is inert
+    // per schema §2.1 ("ignored when `useSpecularWorkflow = 0`") and
+    // keeps riding on extras so the writer re-authors it without
+    // activating the workflow.
     let use_specular = scalar("inputs:useSpecularWorkflow")
         .map(|f| f as i32)
         .unwrap_or(0);
-    if use_specular == 1 {
-        mat.extras.insert(
-            "usd:useSpecularWorkflow".into(),
-            serde_json::Value::Number(1.into()),
-        );
-    }
-    if let Some(sc) = color("inputs:specularColor") {
-        mat.extras
-            .insert("usd:inputs:specularColor".into(), f32s_to_json(&sc));
-    }
-    if let Some(tref) = resolve_texture_connect(
+    let specular_color = color("inputs:specularColor");
+    let specular_tex = resolve_texture_connect(
         ctx,
         parent_path,
         parent,
         surface.attrs.get("inputs:specularColor.connect"),
-    )? {
-        mat.extras
-            .insert("usd:tex:specularColor".into(), texref_to_json(tref));
+    )?;
+    if use_specular == 1 {
+        mat.ext.specular = Some(oxideav_mesh3d::Specular {
+            color_factor: specular_color.unwrap_or([0.0, 0.0, 0.0]),
+            color_texture: specular_tex,
+            ..Default::default()
+        });
+    } else {
+        if let Some(sc) = specular_color {
+            mat.extras
+                .insert("usd:inputs:specularColor".into(), f32s_to_json(&sc));
+        }
+        if let Some(tref) = specular_tex {
+            mat.extras
+                .insert("usd:tex:specularColor".into(), texref_to_json(tref));
+        }
     }
 
     // Index of refraction — typed extension slot. The typed model's
