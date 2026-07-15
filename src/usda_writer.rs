@@ -251,6 +251,13 @@ fn read_via_open(asset: &dyn oxideav_mesh3d::AssetSource) -> Vec<u8> {
 /// Mirror of [`collect_texture_assets`] for the per-texture filename
 /// the USDA `inputs:file` reference uses.
 fn texture_filename(tex: &Texture, idx: usize) -> String {
+    // An external URI reference (`<UDIM>` tile sets, cross-file
+    // references) re-emits the authored path verbatim — no archive
+    // entry backs it (`collect_texture_assets` skips it), so no
+    // entry-name sanitisation applies.
+    if let ImageData::External { uri, .. } = &tex.image {
+        return uri.clone();
+    }
     if let Some(name) = tex.name.as_deref() {
         let stem = sanitize_filename(name);
         let ext = match &tex.image {

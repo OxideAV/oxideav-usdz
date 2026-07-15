@@ -53,6 +53,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`<UDIM>` tile-set texture references (staged schema §2.2).** A
+  `UsdUVTexture` whose `file` input carries the `<UDIM>` token names
+  a UDIM *tile set* — no single archive entry can back it, so the
+  decode previously failed with *"not present in the USDZ archive"*.
+  Such a texture now decodes to `ImageData::External` with the
+  authored URI preserved verbatim (MIME inferred from the extension;
+  sampler/wrap/stash decode unchanged), and the writer re-emits the
+  URI unchanged with no phantom archive entry — a one-cycle
+  round-trip fixed point. Only the `<UDIM>` token opts into the
+  external fallback: a plain missing path is still a self-contained-
+  container violation with the precise diagnostic.
+
 - **`UsdPrimvarReader_<T>`-connected preview-surface inputs (staged
   schema §2.3).** A material input connected to a
   `UsdPrimvarReader_<T>` (e.g. `diffuseColor` reading the

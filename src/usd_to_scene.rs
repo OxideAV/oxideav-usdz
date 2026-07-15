@@ -3657,18 +3657,35 @@ fn resolve_shader_connect(
                 "UsdUVTexture `{prim_path}` is missing `inputs:file` asset path"
             ))
         })?;
-    let entry = lookup_zip_entry(&ctx.entries, asset_path).ok_or_else(|| {
-        invalid(format!(
-            "UsdUVTexture `{prim_path}` references `{asset_path}` which is not present in the USDZ archive"
-        ))
-    })?;
-    let mime = mime_from_filename(&entry.name);
-    let asset = ZipStoredAsset::new(
-        ctx.archive.clone(),
-        entry.payload_offset,
-        entry.payload_len,
-        mime,
-    );
+    // §2.2: a `file` path carrying the `<UDIM>` token names a UDIM
+    // *tile set* — no single archive entry can match it, so the
+    // texture is preserved as an external URI reference (the consumer
+    // expands the tile numbering at load). Anything else must
+    // resolve inside the archive (USDZ is self-contained).
+    let is_udim = asset_path.contains("<UDIM>");
+    let (image, entry_name): (ImageData, &str) = if is_udim {
+        (
+            ImageData::External {
+                uri: asset_path.to_string(),
+                mime: mime_from_filename(asset_path),
+            },
+            asset_path,
+        )
+    } else {
+        let entry = lookup_zip_entry(&ctx.entries, asset_path).ok_or_else(|| {
+            invalid(format!(
+                "UsdUVTexture `{prim_path}` references `{asset_path}` which is not present in the USDZ archive"
+            ))
+        })?;
+        let mime = mime_from_filename(&entry.name);
+        let asset: Arc<dyn AssetSource> = Arc::new(ZipStoredAsset::new(
+            ctx.archive.clone(),
+            entry.payload_offset,
+            entry.payload_len,
+            mime,
+        ));
+        (ImageData::Source(asset), entry.name.as_str())
+    };
 
     // §2.2 wrap modes → typed sampler. `black` / `useMetadata` have
     // no Sampler equivalent; the stash below preserves the token.
@@ -3716,7 +3733,6 @@ fn resolve_shader_connect(
         stash.insert("varname".into(), serde_json::Value::String(varname));
     }
 
-    let asset_arc: Arc<dyn AssetSource> = Arc::new(asset);
     // Name the texture after its archive entry's basename stem, not
     // the shader prim name: the writer derives the output entry name
     // (and the `inputs:file` reference) from `Texture::name`, so the
@@ -3724,12 +3740,14 @@ fn resolve_shader_connect(
     // decode → encode repack. It also makes the text round trip a
     // one-cycle fixed point — a re-decoded scene reproduces the same
     // stem, where the prim-name scheme drifted onto the writer's
-    // `Texture_<id>` prim name on the second cycle.
-    let base = entry.name.rsplit('/').next().unwrap_or(&entry.name);
+    // `Texture_<id>` prim name on the second cycle. (An External
+    // image re-emits its full URI verbatim; the stem name is
+    // cosmetic there.)
+    let base = entry_name.rsplit('/').next().unwrap_or(entry_name);
     let stem = base.rsplit_once('.').map_or(base, |(s, _)| s);
     let texture = Texture {
         name: Some(if stem.is_empty() { rel } else { stem }.to_string()),
-        image: ImageData::Source(asset_arc),
+        image,
         sampler,
     };
     let tex_id = ctx.scene.add_texture(texture);
