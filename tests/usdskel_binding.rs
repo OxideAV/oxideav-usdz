@@ -432,3 +432,46 @@ fn skelroot_prim_type_survives() {
     assert!(report.usda.contains("def Skeleton \"Skel\""));
     assert!(report.usda.contains("rel skel:skeleton = </Model/Skel>"));
 }
+
+#[test]
+fn mismatched_influence_interpolation_rejected() {
+    // §1.6 consistency constraint: `interpolation` must be identical
+    // between `jointIndices` and `jointWeights` — a mismatch means
+    // the two arrays describe different layouts, so pairing them
+    // would fabricate influences.
+    let usda = SKEL_USDA.replace(
+        "float[] primvars:skel:jointWeights = [0.75, 0.25, 0.5, 0.5, 0.9, 0.1] (\n            elementSize = 2\n            interpolation = \"vertex\"\n        )",
+        "float[] primvars:skel:jointWeights = [0.75, 0.25, 0.5, 0.5, 0.9, 0.1] (\n            elementSize = 2\n            interpolation = \"constant\"\n        )",
+    );
+    assert!(
+        usda.contains("interpolation = \"constant\""),
+        "replace fired"
+    );
+    let usdz = common::build_usdz(&[common::UsdzEntry {
+        name: "scene.usda",
+        payload: usda.as_bytes(),
+    }]);
+    let err = UsdzDecoder::new().decode_bytes(&usdz).unwrap_err();
+    assert!(
+        format!("{err}").contains("§1.6 requires identical layout"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn mismatched_influence_element_size_rejected() {
+    let usda = SKEL_USDA.replace(
+        "float[] primvars:skel:jointWeights = [0.75, 0.25, 0.5, 0.5, 0.9, 0.1] (\n            elementSize = 2",
+        "float[] primvars:skel:jointWeights = [0.75, 0.25, 0.5, 0.5, 0.9, 0.1] (\n            elementSize = 3",
+    );
+    assert!(usda.contains("elementSize = 3"), "replace fired");
+    let usdz = common::build_usdz(&[common::UsdzEntry {
+        name: "scene.usda",
+        payload: usda.as_bytes(),
+    }]);
+    let err = UsdzDecoder::new().decode_bytes(&usdz).unwrap_err();
+    assert!(
+        format!("{err}").contains("§1.6 requires identical layout"),
+        "unexpected error: {err}"
+    );
+}

@@ -2484,8 +2484,35 @@ fn apply_skel_binding(ctx: &mut Ctx, path: &str, prim: &Prim, out: &mut Primitiv
             .get(key)
             .and_then(|v| v.as_text().map(str::to_string))
     };
-    // interpolation + elementSize must match across the two primvars;
-    // read from either, preferring jointIndices.
+    // §1.6 consistency constraint: `interpolation` and `elementSize`
+    // "must be identical between `jointIndices` and `jointWeights`" —
+    // a mismatch means the two arrays describe different layouts and
+    // any pairing of them fabricates influences, so it is rejected
+    // rather than resolved in favour of one primvar.
+    if let (Some(a), Some(b)) = (
+        meta_text(idx_attr, "interpolation"),
+        meta_text(w_attr, "interpolation"),
+    ) {
+        if a != b {
+            return Err(invalid(format!(
+                "Mesh `{path}`: jointIndices interpolation `{a}` != jointWeights \
+                 interpolation `{b}` (§1.6 requires identical layout)"
+            )));
+        }
+    }
+    if let (Some(a), Some(b)) = (
+        meta_i32(idx_attr, "elementSize"),
+        meta_i32(w_attr, "elementSize"),
+    ) {
+        if a != b {
+            return Err(invalid(format!(
+                "Mesh `{path}`: jointIndices elementSize {a} != jointWeights elementSize \
+                 {b} (§1.6 requires identical layout)"
+            )));
+        }
+    }
+    // Read the (now known-consistent) knobs from either primvar,
+    // preferring jointIndices.
     let interp = meta_text(idx_attr, "interpolation")
         .or_else(|| meta_text(w_attr, "interpolation"))
         .unwrap_or_else(|| "vertex".to_string());

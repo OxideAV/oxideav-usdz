@@ -40,6 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **UsdSkel §1.6 cross-primvar consistency enforced.** The schema
+  requires `interpolation` and `elementSize` to be identical between
+  `primvars:skel:jointIndices` and `primvars:skel:jointWeights`; the
+  decoder silently resolved a mismatch in favour of `jointIndices`,
+  pairing arrays that describe different layouts (fabricated
+  influences). Both knobs are now cross-validated when authored on
+  both primvars, and a mismatch is a precise `InvalidData` refusal.
+
 - **texture asset filename drift across repack.** A decoded texture
   was named after its `UsdUVTexture` shader prim; since the writer
   derives both the output archive entry name and the `inputs:file`
