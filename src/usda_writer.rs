@@ -1002,6 +1002,8 @@ fn write_node_transform(w: &mut Out, t: &Transform) {
             .unwrap();
         }
         Transform::Matrix(m) => {
+            // Typed column-vector matrix → USD row-vector literal.
+            let m = crate::usd_to_scene::transpose4(m);
             w.write_indent();
             write!(w.s, "matrix4d xformOp:transform = (").unwrap();
             for (i, row) in m.iter().enumerate() {
@@ -1831,7 +1833,9 @@ fn write_skeleton_prim(
         if i > 0 {
             w.s.push_str(", ");
         }
-        let bind = crate::usd_to_scene::invert_matrix4(*ibm);
+        // Typed column-vector inverse-bind → bind, then into the USD
+        // row-vector literal layout.
+        let bind = crate::usd_to_scene::transpose4(crate::usd_to_scene::invert_matrix4(*ibm));
         write!(w.s, "{}", format_matrix4(bind)).unwrap();
     }
     writeln!(w.s, "]").unwrap();
@@ -1895,7 +1899,11 @@ fn transform_from_extras(
                 m[i][j] = c.as_f64()? as f32;
             }
         }
-        return Some(Transform::Matrix(m));
+        // The extras stash keeps the USD literal layout (row-vector);
+        // the typed Transform is column-vector, so transpose here and
+        // let `write_node_transform` transpose back — the replayed
+        // literal is byte-identical to the authored one.
+        return Some(Transform::Matrix(crate::usd_to_scene::transpose4(m)));
     }
     if let Some(trs) = v.get("trs") {
         let t = json_array_n::<3>(trs.get("translation"))?;
@@ -3306,15 +3314,22 @@ mod tests {
     #[test]
     fn write_node_transform_matrix_emits_4x4_then_order() {
         let mut w = Out::default();
+        // Typed column-vector convention: translation in the last
+        // *column*. The emitted USD `matrix4d` literal is the
+        // row-vector transpose — translation in the last row.
         let m = [
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [10.0, 20.0, 30.0, 1.0],
+            [1.0, 0.0, 0.0, 10.0],
+            [0.0, 1.0, 0.0, 20.0],
+            [0.0, 0.0, 1.0, 30.0],
+            [0.0, 0.0, 0.0, 1.0],
         ];
         write_node_transform(&mut w, &Transform::Matrix(m));
         assert!(w.s.contains("matrix4d xformOp:transform = ("));
-        assert!(w.s.contains("(10, 20, 30, 1)"));
+        assert!(
+            w.s.contains("(1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (10, 20, 30, 1)"),
+            "translation lands in the literal's last row: {}",
+            w.s
+        );
         assert!(w.s.contains("xformOpOrder = [\"xformOp:transform\"]"));
     }
 }

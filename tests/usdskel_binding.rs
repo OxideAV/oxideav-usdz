@@ -93,7 +93,11 @@ fn rest_transforms_land_on_joint_nodes() {
     let knee = &scene.nodes[skel.joints[2].0 as usize];
     match knee.transform {
         Transform::Matrix(m) => {
-            assert!(approx(m[3][1], 1.0), "knee local Y offset");
+            // Typed column-vector convention: translation lives in
+            // the last *column* (`m[i][3]`), transposed from USD's
+            // row-vector `matrix4d` literal.
+            assert!(approx(m[1][3], 1.0), "knee local Y offset");
+            assert_eq!(m[3], [0.0, 0.0, 0.0, 1.0], "affine last row");
         }
         ref other => panic!("expected Matrix transform, got {other:?}"),
     }
@@ -103,9 +107,13 @@ fn rest_transforms_land_on_joint_nodes() {
 fn inverse_bind_matrices_invert_bind_transforms() {
     let scene = decode(SKEL_USDA);
     let skel = &scene.skeletons[0];
-    // Hip bind translates (0, 2, 0) → its inverse translates (0, -2, 0).
+    // Hip bind translates (0, 2, 0) → its inverse translates
+    // (0, -2, 0). Typed column-vector convention: translation in the
+    // last column, affine `[0,0,0,1]` last row (what
+    // `Scene3D::validate` checks).
     let ibm = skel.inverse_bind_matrices[1];
-    assert!(approx(ibm[3][1], -2.0), "ibm hip: {ibm:?}");
+    assert!(approx(ibm[1][3], -2.0), "ibm hip: {ibm:?}");
+    assert_eq!(ibm[3], [0.0, 0.0, 0.0, 1.0], "affine last row");
     // Rotation part stays identity.
     assert!(approx(ibm[0][0], 1.0));
     assert!(approx(ibm[1][1], 1.0));

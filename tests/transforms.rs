@@ -206,5 +206,13 @@ def Xform "Root" {
     let Transform::Matrix(m) = scene.nodes[0].transform else {
         panic!("expected matrix");
     };
-    assert_eq!(m[3], [4.0, 5.0, 6.0, 1.0]);
+    // USD's row-vector literal carries the translation in its last
+    // row; the typed column-vector convention transposes it into the
+    // last column.
+    assert_eq!(
+        [m[0][3], m[1][3], m[2][3]],
+        [4.0, 5.0, 6.0],
+        "translation in the last column"
+    );
+    assert_eq!(m[3], [0.0, 0.0, 0.0, 1.0], "affine last row");
 }

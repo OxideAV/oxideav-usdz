@@ -40,6 +40,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`matrix4d` convention boundary: USD row-vector literals now
+  transpose into the typed model's column-vector `Transform::Matrix`
+  (and back on write).** USD's `matrix4d` is row-vector maths
+  (`p' = p · M`, translation in the last *row*); the typed model
+  documents column-vector maths (`p' = M · p`, translation in the
+  last *column*, matching its glTF-layout `node.matrix` contract).
+  The decoder previously stored the USD rows verbatim — internally
+  self-consistent (the writer replayed them verbatim), but every
+  matrix handed to or taken from the typed model was transposed:
+  `Skeleton::inverse_bind_matrices` carried translation in the
+  fourth row (failing `Scene3D::validate`'s glTF §5.28.1 affine
+  last-row check), joint rest / `xformOp:transform` node matrices
+  were transposed for any typed-model consumer, and a scene authored
+  through the typed model emitted a *projective* `matrix4d` literal
+  instead of a translation. All USD-literal ↔ typed-model crossings
+  now transpose (`transpose4`, its own inverse): skeleton
+  bind/rest, `xformOp:transform` decode, `write_node_transform`,
+  the skel writer's bind/rest re-emission, and the
+  `usd:mesh_transform` extras replay (the extras stash itself stays
+  in USD literal layout, documented). Round trips remain
+  byte-identical; the emitted USD for typed-model scenes is now
+  semantically correct. A new `decode_validates` suite pins every
+  decoded scene (expanded materials with ext-slot textures, skel
+  scenes) through `Scene3D::validate()` on both first decode and
+  repack.
+
 - **UsdSkel §1.6 cross-primvar consistency enforced.** The schema
   requires `interpolation` and `elementSize` to be identical between
   `primvars:skel:jointIndices` and `primvars:skel:jointWeights`; the

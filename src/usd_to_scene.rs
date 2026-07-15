@@ -1267,7 +1267,8 @@ fn build_skeleton(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<SkelInfo> {
         let name = token.rsplit('/').next().unwrap_or(token);
         let mut node = Node::new().with_name(name.to_string());
         if let Some(r) = &rest {
-            node.transform = Transform::Matrix(r[i]);
+            // USD row-vector literal → typed column-vector matrix.
+            node.transform = Transform::Matrix(transpose4(r[i]));
         }
         let id = ctx.scene.add_node(node);
         nodes_by_token.insert(token.as_str(), id);
@@ -1288,8 +1289,12 @@ fn build_skeleton(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<SkelInfo> {
         }
     }
 
+    // USD row-vector literals → typed column-vector matrices, then
+    // invert (the typed model stores the *inverse* bind matrices with
+    // an affine `[0,0,0,1]` fourth row — `Scene3D::validate` checks
+    // exactly that).
     let inverse_bind_matrices: Vec<[[f32; 4]; 4]> = match &bind {
-        Some(b) => b.iter().map(|m| invert_matrix4(*m)).collect(),
+        Some(b) => b.iter().map(|m| invert_matrix4(transpose4(*m))).collect(),
         None => joint_tokens.iter().map(|_| IDENTITY4).collect(),
     };
     let skeleton = oxideav_mesh3d::Skeleton {
@@ -1304,6 +1309,23 @@ fn build_skeleton(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<SkelInfo> {
         joint_nodes,
         root_joints,
     })
+}
+
+/// Transpose a 4x4 matrix — the conversion between USD's `matrix4d`
+/// convention (row-vector maths, `p' = p · M`, translation in the
+/// last *row*) and the typed model's [`Transform::Matrix`]
+/// convention (column-vector maths, `p' = M · p`, translation in the
+/// last *column*). The two are exact transposes of each other, so
+/// this one helper is its own inverse and is applied at every
+/// USD-literal ↔ typed-model boundary.
+pub(crate) fn transpose4(m: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    let mut out = [[0f32; 4]; 4];
+    for (i, row) in m.iter().enumerate() {
+        for (j, cell) in row.iter().enumerate() {
+            out[j][i] = *cell;
+        }
+    }
+    out
 }
 
 /// Row-major 4x4 identity.
@@ -1366,10 +1388,12 @@ pub(crate) fn invert_matrix4(m: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
 
 /// Compose a [`Transform`] into the row-major, row-vector-convention
 /// 4x4 matrix USD's `matrix4d` literal uses (translation in the last
-/// row): `p' = p · S · R · T` for TRS semantics.
+/// row): `p' = p · S · R · T` for TRS semantics. A typed
+/// [`Transform::Matrix`] (column-vector convention) transposes into
+/// the literal layout.
 pub(crate) fn transform_to_matrix(t: &Transform) -> [[f32; 4]; 4] {
     match *t {
-        Transform::Matrix(m) => m,
+        Transform::Matrix(m) => transpose4(m),
         Transform::Trs {
             translation,
             rotation,
@@ -1898,7 +1922,8 @@ fn read_node_transform(prim: &Prim) -> Transform {
             .get("xformOp:transform")
             .and_then(|a| read_matrix4(&a.value))
         {
-            return Transform::Matrix(m);
+            // USD row-vector literal → typed column-vector matrix.
+            return Transform::Matrix(transpose4(m));
         }
         return Transform::identity();
     }
