@@ -53,6 +53,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`UsdPrimvarReader_<T>`-connected preview-surface inputs (staged
+  schema §2.3).** A material input connected to a
+  `UsdPrimvarReader_<T>` (e.g. `diffuseColor` reading the
+  `displayColor` primvar off the bound geometry) previously killed
+  the whole decode with *"only `UsdUVTexture` is supported"*. The
+  connection resolver now recognises all ten §2.3 typed reader
+  variants and preserves the reader's authored inputs — variant
+  type, `varname` (with its `string`/`token` type spelling), and
+  `fallback` as an exact USDA literal — on
+  `Material::extras["usd:primvar:<input>"]`. The writer re-emits the
+  connection plus a `UsdPrimvarReader_<T>` shader prim per input
+  (correct `outputs:result` element type per the §2.3 table), and
+  the encode → decode → encode cycle is a fixed point. Unknown
+  shader ids and non-§2.3 reader variants still refuse precisely.
+
 - **USDA `timeSamples` parsing.** The parser now understands the
   time-sampled attribute value form
   `<attr>.timeSamples = { 0: VALUE, 10: VALUE, ... }` — the shape

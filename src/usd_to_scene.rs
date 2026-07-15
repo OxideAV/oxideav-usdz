@@ -3323,12 +3323,7 @@ fn apply_preview_surface(
         .map(|f| f as i32)
         .unwrap_or(0);
     let specular_color = color("inputs:specularColor");
-    let specular_tex = resolve_texture_connect(
-        ctx,
-        parent_path,
-        parent,
-        surface.attrs.get("inputs:specularColor.connect"),
-    )?;
+    let specular_tex = connect_input(ctx, mat, parent_path, parent, surface, "specularColor")?;
     if use_specular == 1 {
         mat.ext.specular = Some(oxideav_mesh3d::Specular {
             color_factor: specular_color.unwrap_or([0.0, 0.0, 0.0]),
@@ -3363,18 +3358,9 @@ fn apply_preview_surface(
     // no synthetic opinion lands in the output file.
     let cc_factor = scalar("inputs:clearcoat");
     let cc_roughness = scalar("inputs:clearcoatRoughness");
-    let cc_factor_tex = resolve_texture_connect(
-        ctx,
-        parent_path,
-        parent,
-        surface.attrs.get("inputs:clearcoat.connect"),
-    )?;
-    let cc_roughness_tex = resolve_texture_connect(
-        ctx,
-        parent_path,
-        parent,
-        surface.attrs.get("inputs:clearcoatRoughness.connect"),
-    )?;
+    let cc_factor_tex = connect_input(ctx, mat, parent_path, parent, surface, "clearcoat")?;
+    let cc_roughness_tex =
+        connect_input(ctx, mat, parent_path, parent, surface, "clearcoatRoughness")?;
     if cc_factor.is_some()
         || cc_roughness.is_some()
         || cc_factor_tex.is_some()
@@ -3424,54 +3410,24 @@ fn apply_preview_surface(
     }
 
     // Texture connections — `inputs:diffuseColor.connect = </path/to/Tex.outputs:rgb>`.
-    if let Some(tex_ref) = resolve_texture_connect(
-        ctx,
-        parent_path,
-        parent,
-        surface.attrs.get("inputs:diffuseColor.connect"),
-    )? {
+    if let Some(tex_ref) = connect_input(ctx, mat, parent_path, parent, surface, "diffuseColor")? {
         mat.base_color_texture = Some(tex_ref);
     }
-    if let Some(tex_ref) = resolve_texture_connect(
-        ctx,
-        parent_path,
-        parent,
-        surface.attrs.get("inputs:normal.connect"),
-    )? {
+    if let Some(tex_ref) = connect_input(ctx, mat, parent_path, parent, surface, "normal")? {
         mat.normal_texture = Some(tex_ref);
     }
-    if let Some(tex_ref) = resolve_texture_connect(
-        ctx,
-        parent_path,
-        parent,
-        surface.attrs.get("inputs:emissiveColor.connect"),
-    )? {
+    if let Some(tex_ref) = connect_input(ctx, mat, parent_path, parent, surface, "emissiveColor")? {
         mat.emissive_texture = Some(tex_ref);
     }
-    if let Some(tex_ref) = resolve_texture_connect(
-        ctx,
-        parent_path,
-        parent,
-        surface.attrs.get("inputs:occlusion.connect"),
-    )? {
+    if let Some(tex_ref) = connect_input(ctx, mat, parent_path, parent, surface, "occlusion")? {
         mat.occlusion_texture = Some(tex_ref);
     }
 
     // `metallic` / `roughness` maps share the glTF-packed slot; the
     // authored-input record lets the writer re-emit exactly what the
     // source wired.
-    let metallic_tex = resolve_texture_connect(
-        ctx,
-        parent_path,
-        parent,
-        surface.attrs.get("inputs:metallic.connect"),
-    )?;
-    let roughness_tex = resolve_texture_connect(
-        ctx,
-        parent_path,
-        parent,
-        surface.attrs.get("inputs:roughness.connect"),
-    )?;
+    let metallic_tex = connect_input(ctx, mat, parent_path, parent, surface, "metallic")?;
+    let roughness_tex = connect_input(ctx, mat, parent_path, parent, surface, "roughness")?;
     match (metallic_tex, roughness_tex) {
         (Some(m), Some(r)) if m == r => {
             mat.metallic_roughness_texture = Some(m);
@@ -3510,14 +3466,7 @@ fn apply_preview_surface(
 
     // Inputs with no typed texture slot round-trip via extras.
     for input in ["opacity", "displacement"] {
-        if let Some(tex_ref) = resolve_texture_connect(
-            ctx,
-            parent_path,
-            parent,
-            surface
-                .attrs
-                .get(format!("inputs:{input}.connect").as_str()),
-        )? {
+        if let Some(tex_ref) = connect_input(ctx, mat, parent_path, parent, surface, input)? {
             mat.extras
                 .insert(format!("usd:tex:{input}"), texref_to_json(tex_ref));
         }
@@ -3550,9 +3499,55 @@ fn texref_to_json(tref: TextureRef) -> serde_json::Value {
     serde_json::Value::Object(obj)
 }
 
+/// A resolved `inputs:<x>.connect` target under a material.
+enum ShaderConnect {
+    /// A `UsdUVTexture` (§2.2) — the input samples a texture.
+    Texture(TextureRef),
+    /// A `UsdPrimvarReader_<T>` (§2.3) — the input reads a primvar
+    /// off the bound geometry. Carried as the writer-ready stash
+    /// object (`type` / `varname` / `varname_type` /
+    /// `fallback` + `fallback_type`).
+    PrimvarReader(serde_json::Value),
+}
+
+/// The ten §2.3 `UsdPrimvarReader_<T>` typed variants.
+const PRIMVAR_READER_VARIANTS: [&str; 10] = [
+    "float", "float2", "float3", "float4", "int", "string", "normal", "point", "vector", "matrix",
+];
+
+/// Resolve a preview-surface `inputs:<input>.connect` for `mat`:
+/// a `UsdUVTexture` target comes back as a [`TextureRef`]; a
+/// `UsdPrimvarReader_<T>` target (§2.3 — e.g. `diffuseColor`
+/// reading `displayColor` off the geometry) is preserved on
+/// `mat.extras["usd:primvar:<input>"]` for the writer's replay and
+/// returns `None` (the typed model has no primvar-driven material
+/// slot).
+fn connect_input(
+    ctx: &mut Ctx,
+    mat: &mut Material,
+    parent_path: &str,
+    parent: &Prim,
+    surface: &Prim,
+    input: &str,
+) -> Result<Option<TextureRef>> {
+    let attr = surface
+        .attrs
+        .get(format!("inputs:{input}.connect").as_str());
+    match resolve_shader_connect(ctx, parent_path, parent, attr)? {
+        Some(ShaderConnect::Texture(tref)) => Ok(Some(tref)),
+        Some(ShaderConnect::PrimvarReader(stash)) => {
+            mat.extras.insert(format!("usd:primvar:{input}"), stash);
+            Ok(None)
+        }
+        None => Ok(None),
+    }
+}
+
 /// Resolve an `inputs:foo.connect = </path/Tex.outputs:rgb>`
-/// statement into a `TextureRef`, materialising the underlying
-/// `Texture` (and its `ZipStoredAsset`) on first sight.
+/// statement into a [`ShaderConnect`], materialising the underlying
+/// `Texture` (and its `ZipStoredAsset`) on first sight of a
+/// `UsdUVTexture`, or capturing a `UsdPrimvarReader_<T>`'s authored
+/// inputs (§2.3). Any other `info:id` is refused.
 ///
 /// Full §2.2 `UsdUVTexture` input coverage (staged schema tables):
 ///
@@ -3575,12 +3570,12 @@ fn texref_to_json(tref: TextureRef) -> serde_json::Value {
 /// `Scene3D::extras["usd:uvtexture:<TextureId>"]` as a JSON object
 /// of the authored inputs, and the writer replays each entry onto
 /// the emitted `UsdUVTexture` shader.
-fn resolve_texture_connect(
+fn resolve_shader_connect(
     ctx: &mut Ctx,
     parent_path: &str,
     parent: &Prim,
     attr: Option<&Attr>,
-) -> Result<Option<TextureRef>> {
+) -> Result<Option<ShaderConnect>> {
     let Some(attr) = attr else { return Ok(None) };
     let Value::Path(p) = &attr.value else {
         return Ok(None);
@@ -3592,7 +3587,7 @@ fn resolve_texture_connect(
         None => p.as_str(),
     };
     if let Some(&tref) = ctx.textures_by_path.get(prim_path) {
-        return Ok(Some(tref));
+        return Ok(Some(ShaderConnect::Texture(tref)));
     }
     // Locate the shader prim under the enclosing material.
     let Some(rel) = prim_path.strip_prefix(&format!("{parent_path}/")) else {
@@ -3602,7 +3597,7 @@ fn resolve_texture_connect(
     };
     let shader = find_child_by_name(parent, rel).ok_or_else(|| {
         invalid(format!(
-            "UsdUVTexture shader `{rel}` not found under material `{parent_path}`"
+            "connected shader `{rel}` not found under material `{parent_path}`"
         ))
     })?;
     let info_id = shader
@@ -3610,9 +3605,44 @@ fn resolve_texture_connect(
         .get("info:id")
         .and_then(|a| a.value.as_text())
         .unwrap_or_default();
+    // §2.3 UsdPrimvarReader_<T> — the input reads a primvar off the
+    // bound geometry. Preserve the reader's authored inputs (variant
+    // type, `varname` with its type spelling, `fallback` as an exact
+    // USDA literal) so the writer re-emits the reader prim verbatim.
+    if let Some(variant) = info_id.strip_prefix("UsdPrimvarReader_") {
+        if PRIMVAR_READER_VARIANTS.contains(&variant) {
+            let mut stash = serde_json::Map::new();
+            stash.insert(
+                "type".into(),
+                serde_json::Value::String(variant.to_string()),
+            );
+            if let Some(vn_attr) = shader.attrs.get("inputs:varname") {
+                if let Some(vn) = vn_attr.value.as_text() {
+                    stash.insert("varname".into(), serde_json::Value::String(vn.to_string()));
+                    stash.insert(
+                        "varname_type".into(),
+                        serde_json::Value::String(vn_attr.type_token.clone()),
+                    );
+                }
+            }
+            if let Some(fb) = shader.attrs.get("inputs:fallback") {
+                stash.insert(
+                    "fallback".into(),
+                    serde_json::Value::String(crate::usda_writer::format_metadata_value(&fb.value)),
+                );
+                stash.insert(
+                    "fallback_type".into(),
+                    serde_json::Value::String(fb.type_token.clone()),
+                );
+            }
+            return Ok(Some(ShaderConnect::PrimvarReader(
+                serde_json::Value::Object(stash),
+            )));
+        }
+    }
     if info_id != "UsdUVTexture" {
         return Err(unsupported(format!(
-            "shader `{rel}` has info:id `{info_id}` — only `UsdUVTexture` is supported in round 1"
+            "shader `{rel}` has info:id `{info_id}` — only `UsdUVTexture` and `UsdPrimvarReader_<T>` connections are supported"
         )));
     }
     let asset_path = shader
@@ -3714,7 +3744,7 @@ fn resolve_texture_connect(
         uv_set,
     };
     ctx.textures_by_path.insert(prim_path.to_string(), tref);
-    Ok(Some(tref))
+    Ok(Some(ShaderConnect::Texture(tref)))
 }
 
 /// Follow a `UsdUVTexture`'s `inputs:st.connect` to its

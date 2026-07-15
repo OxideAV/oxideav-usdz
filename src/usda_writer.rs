@@ -2725,11 +2725,76 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
             write_tex_connect(w, &mat_path, input, tref, channel);
         }
     }
+    // §2.3 UsdPrimvarReader-driven inputs preserved on extras
+    // (`usd:primvar:<input>`): connect each input to the reader prim
+    // emitted after the surface shader. Sorted for deterministic
+    // output (extras is a HashMap).
+    let mut primvar_inputs: Vec<(&str, &serde_json::Map<String, serde_json::Value>)> = mat
+        .extras
+        .iter()
+        .filter_map(|(k, v)| Some((k.strip_prefix("usd:primvar:")?, v.as_object()?)))
+        .collect();
+    primvar_inputs.sort_by_key(|(input, _)| *input);
+    for (input, _) in &primvar_inputs {
+        w.write_indent();
+        writeln!(
+            w.s,
+            "{} inputs:{input}.connect = <{mat_path}/PrimvarReader_{input}.outputs:result>",
+            type_for_slot(input)
+        )
+        .unwrap();
+    }
     w.write_indent();
     writeln!(w.s, "token outputs:surface").unwrap();
     w.indent -= 1;
     w.write_indent();
     writeln!(w.s, "}}").unwrap();
+
+    // One UsdPrimvarReader_<T> shader child per reader-driven input
+    // (§2.3): variant type, `varname` (authored type spelling), and
+    // the `fallback` literal replay verbatim from the decoder's
+    // stash.
+    for (input, stash) in &primvar_inputs {
+        let variant = stash
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("float2");
+        w.write_indent();
+        writeln!(w.s, "def Shader \"PrimvarReader_{input}\" {{").unwrap();
+        w.indent += 1;
+        w.write_indent();
+        writeln!(
+            w.s,
+            "uniform token info:id = \"UsdPrimvarReader_{variant}\""
+        )
+        .unwrap();
+        if let Some(vn) = stash.get("varname").and_then(|v| v.as_str()) {
+            let vn_type = stash
+                .get("varname_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("string");
+            w.write_indent();
+            writeln!(w.s, "{vn_type} inputs:varname = \"{vn}\"").unwrap();
+        }
+        if let Some(fb) = stash.get("fallback").and_then(|v| v.as_str()) {
+            let fb_type = stash
+                .get("fallback_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or(variant);
+            w.write_indent();
+            writeln!(w.s, "{fb_type} inputs:fallback = {fb}").unwrap();
+        }
+        w.write_indent();
+        writeln!(
+            w.s,
+            "{} outputs:result",
+            primvar_reader_result_type(variant)
+        )
+        .unwrap();
+        w.indent -= 1;
+        w.write_indent();
+        writeln!(w.s, "}}").unwrap();
+    }
 
     // One UsdUVTexture child per bound texture (deduped on TextureId).
     // Only slots this writer actually connects participate — typed
@@ -2892,6 +2957,25 @@ fn type_for_slot(slot: &str) -> &'static str {
     }
 }
 
+/// The `outputs:result` element type token for each §2.3
+/// `UsdPrimvarReader_<T>` typed variant (schema table: variant
+/// suffix → `result` type).
+fn primvar_reader_result_type(variant: &str) -> &'static str {
+    match variant {
+        "float" => "float",
+        "float2" => "float2",
+        "float3" => "float3",
+        "float4" => "float4",
+        "int" => "int",
+        "string" => "string",
+        "normal" => "normal3f",
+        "point" => "point3f",
+        "vector" => "vector3f",
+        "matrix" => "matrix4d",
+        _ => "float2",
+    }
+}
+
 /// Shader inputs whose texture connection has no typed model slot;
 /// each round-trips through `Material::extras["usd:tex:<input>"]`
 /// with the listed output channel.
@@ -2961,7 +3045,7 @@ fn sanitize_prim_name(s: &str) -> String {
 /// Float arrays inside [`Value::Array`] / [`Value::Tuple`] use the
 /// same compact `format_float` rules as the rest of the writer for
 /// determinism.
-fn format_metadata_value(value: &Value) -> String {
+pub(crate) fn format_metadata_value(value: &Value) -> String {
     match value {
         Value::Token(s) => format!("\"{s}\""),
         Value::String(s) => format!("\"{}\"", escape_usda_string(s)),
