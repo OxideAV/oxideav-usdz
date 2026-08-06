@@ -544,6 +544,7 @@ pub mod usd_to_scene;
 pub mod usda;
 pub mod usda_writer;
 pub mod usdc;
+pub mod usdc_layer;
 pub mod usdc_values;
 pub mod usdc_writer;
 pub mod variant_codec;

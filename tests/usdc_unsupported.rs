@@ -1,13 +1,16 @@
-//! USDZ archive whose only Default Layer is binary `.usdc` →
-//! decoder now validates the Crate bootstrap + TOC at the
-//! boundary and surfaces:
+//! USDZ archive whose Default Layer is binary `.usdc` — boundary
+//! behaviour of the Crate reader inside the USDZ pipeline:
 //!
-//! * `Error::Unsupported` once the boundary check has succeeded
-//!   (full payload materialisation is still pending — the
-//!   message records the parsed version + section catalogue),
+//! * a structurally valid `.usdc` proceeds into the full
+//!   materialisation path (`usdc_layer`) — a file whose *sections*
+//!   are garbage therefore fails with a precise `InvalidData` from
+//!   the section decoders, not a generic refusal,
 //! * `Error::InvalidData` for malformed `.usdc` (truncated
 //!   bootstrap, wrong magic, oversized TOC, …) — these used
 //!   to leak past the layer-extension dispatch.
+//!
+//! The happy-path end-to-end decode (real fixture → `Scene3D`)
+//! lives in `usdc_scene_decode.rs`.
 
 mod common;
 
@@ -52,8 +55,12 @@ fn synthetic_usdc(sections: &[(&[u8], usize)]) -> Vec<u8> {
 }
 
 #[test]
-fn binary_usdc_with_valid_bootstrap_returns_unsupported() {
-    // A well-formed USDC carrying the canonical six-section TOC.
+fn binary_usdc_with_garbage_sections_fails_precisely() {
+    // A USDC whose bootstrap + TOC frame correctly but whose section
+    // payloads are `0xAB` filler: the decoder now proceeds past the
+    // boundary into full materialisation, so the failure is a precise
+    // InvalidData from the section decoders (the TOKENS header is the
+    // first thing read), not a blanket Unsupported refusal.
     let usdc = synthetic_usdc(&[
         (b"TOKENS", 64),
         (b"STRINGS", 8),
@@ -68,28 +75,15 @@ fn binary_usdc_with_valid_bootstrap_returns_unsupported() {
     }]);
     let err = UsdzDecoder::new()
         .decode_bytes(&usdz)
-        .expect_err("decode_bytes should error on .usdc default layer");
+        .expect_err("garbage section payloads must fail");
     match err {
-        Error::Unsupported(msg) => {
+        Error::InvalidData(msg) => {
             assert!(
-                msg.contains("usdc") || msg.contains("USDC") || msg.contains("crate"),
-                "expected unsupported message to mention usdc/crate, got: {msg}"
+                msg.contains("TOKENS") || msg.contains("USDC"),
+                "expected a section-decoder diagnostic, got: {msg}"
             );
-            assert!(
-                msg.contains("usdcat") || msg.contains("usda"),
-                "expected message to suggest a workaround, got: {msg}"
-            );
-            // Boundary check parsed the version — the message now records it.
-            assert!(msg.contains("0.8.0"), "expected version in message: {msg}");
-            // …and the section catalogue.
-            for name in ["TOKENS", "STRINGS", "FIELDS", "FIELDSETS", "PATHS", "SPECS"] {
-                assert!(
-                    msg.contains(name),
-                    "expected section '{name}' in message: {msg}"
-                );
-            }
         }
-        other => panic!("expected Error::Unsupported, got {other:?}"),
+        other => panic!("expected Error::InvalidData, got {other:?}"),
     }
 }
 
@@ -138,9 +132,9 @@ fn binary_usdc_wrong_magic_returns_invalid_data() {
 
 /// Real-fixture cross-check: the Elephant sample from the trace doc.
 ///
-/// The fixture is shipped under `docs/3d/usd/fixtures/`. We re-wrap
-/// it in a USDZ here and confirm the boundary check pulls the
-/// trace-doc's published facts (v0.8.0, six sections in the order
+/// The fixture is shipped under `docs/3d/usd/fixtures/`. The direct
+/// primitive surface reports the trace-doc's published structural
+/// facts (v0.8.0, six sections in the order
 /// `TOKENS / STRINGS / FIELDS / FIELDSETS / PATHS / SPECS`).
 #[test]
 fn binary_usdc_real_fixture_reports_trace_doc_facts() {
@@ -200,21 +194,25 @@ fn binary_usdc_real_fixture_reports_trace_doc_facts() {
         "TOC offset from trace doc §1"
     );
 
-    // End-to-end through the USDZ decoder — should surface
-    // Unsupported with the parsed facts in the message.
+    // End-to-end through the USDZ decoder the fixture now *decodes*
+    // (its texture/audio references stubbed in) — covered by
+    // `usdc_scene_decode.rs`. Here we only re-confirm that without
+    // the referenced companion assets the failure is the precise
+    // self-contained-container diagnostic, not a Crate-level error.
     let usdz = common::build_usdz(&[common::UsdzEntry {
         name: "default.usdc",
         payload: &payload,
     }]);
     let err = UsdzDecoder::new()
         .decode_bytes(&usdz)
-        .expect_err("decode_bytes should error on .usdc default layer");
+        .expect_err("missing companion assets must fail the container rule");
     match err {
-        Error::Unsupported(msg) => {
-            assert!(msg.contains("0.8.0"), "expected version in message: {msg}");
-            assert!(msg.contains("TOKENS"), "expected TOKENS in message: {msg}");
-            assert!(msg.contains("SPECS"), "expected SPECS in message: {msg}");
+        Error::InvalidData(msg) => {
+            assert!(
+                msg.contains("archive") || msg.contains("present"),
+                "expected a missing-asset diagnostic, got: {msg}"
+            );
         }
-        other => panic!("expected Error::Unsupported, got {other:?}"),
+        other => panic!("expected Error::InvalidData, got {other:?}"),
     }
 }

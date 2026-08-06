@@ -309,24 +309,16 @@ impl Version {
     };
 
     /// Read 8 bytes from `bytes[0..8]` and extract the version triple
-    /// from the first three. Bytes `[3..8]` are required to be zero
-    /// (the trace observed all zeros and a non-zero would mean the
-    /// file is from a writer we have no observed behaviour for).
+    /// from the first three. Bytes `[3..8]` are unused; §16.3.8.1
+    /// *recommends* they be zero but does not require it ("they may be
+    /// used in future versions of the specification"), so non-zero
+    /// values are tolerated rather than rejected.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < 8 {
             return Err(invalid(format!(
                 "USDC version slot truncated: need 8 bytes, got {}",
                 bytes.len()
             )));
-        }
-        for (i, &b) in bytes[3..8].iter().enumerate() {
-            if b != 0 {
-                return Err(invalid(format!(
-                    "USDC version reserved byte {} = 0x{:02x}, expected 0x00",
-                    3 + i,
-                    b,
-                )));
-            }
         }
         Ok(Self {
             major: bytes[0],
@@ -335,15 +327,23 @@ impl Version {
         })
     }
 
+    /// Crate 0.10.0 — the newest version whose §16.3.8.2 feature set
+    /// this reader fully implements: 0.9.0 added the TimeCode value
+    /// types and 0.10.0 the PathExpression value type, both decoded
+    /// by `usdc_values`. (0.11.0 Relocates and 0.12.0 Splines are not
+    /// yet implemented, so the ceiling stays below them.)
+    pub const V0_10_0: Version = Version {
+        major: 0,
+        minor: 10,
+        patch: 0,
+    };
+
     /// The highest `(major, minor)` this reader knows how to
-    /// interpret. The trace doc records `0.8.0` as the version both
-    /// observed real `.usdc` samples carry; that is the newest layout
-    /// we have behaviour for, so it is also the ceiling
-    /// [`Self::is_readable`] compares against. (Patch is *not* part of
-    /// the gate — the trace doc names `(major, minor)` as the sole
-    /// dispatch key, so a higher patch within a known `(major, minor)`
-    /// is read on a best-effort basis.)
-    pub const READER_MAX: Version = Version::V0_8_0;
+    /// interpret — the ceiling [`Self::is_readable`] compares
+    /// against. (Patch is *not* part of the gate — §16.3.8.2 keys
+    /// dispatch on `(major, minor)`, so a higher patch within a known
+    /// `(major, minor)` is read on a best-effort basis.)
+    pub const READER_MAX: Version = Version::V0_10_0;
 
     /// `(major, minor)` — the trace doc names this the dispatch key
     /// a reader compares against to decide it understands the file.
@@ -4462,18 +4462,21 @@ mod tests {
     }
 
     #[test]
-    fn version_rejects_nonzero_reserved() {
-        let err = Version::parse(&[0, 8, 0, 1, 0, 0, 0, 0]).expect_err("reserved nonzero");
-        let msg = format!("{err:?}");
-        assert!(msg.contains("reserved"), "{msg}");
+    fn version_tolerates_nonzero_reserved() {
+        // §16.3.8.1: the five unused header bytes are recommended to
+        // be zero but "are not required to be so"; a writer using them
+        // must not make the file unreadable.
+        let v = Version::parse(&[0, 8, 0, 1, 0xAB, 0, 0, 0]).expect("reserved bytes tolerated");
+        assert_eq!(v, Version::V0_8_0);
     }
 
     #[test]
-    fn version_reader_ceiling_is_observed_0_8_0() {
-        // The trace doc records 0.8.0 as the only observed version, so
-        // the reader's understood ceiling is exactly that.
-        assert_eq!(Version::READER_MAX, Version::V0_8_0);
-        assert_eq!(Version::READER_MAX.dispatch_key(), (0, 8));
+    fn version_reader_ceiling_is_0_10_0() {
+        // §16.3.8.2: 0.9.0 adds TimeCode, 0.10.0 adds PathExpression —
+        // both implemented — while 0.11.0 Relocates / 0.12.0 Splines
+        // are not, so the ceiling sits at 0.10.0.
+        assert_eq!(Version::READER_MAX, Version::V0_10_0);
+        assert_eq!(Version::READER_MAX.dispatch_key(), (0, 10));
     }
 
     #[test]
@@ -4495,10 +4498,19 @@ mod tests {
             patch: 0,
         }
         .is_readable());
-        // Newer minor within same major: refused.
-        assert!(!Version {
+        // Newer minor within same major (9 and 10 are within the
+        // ceiling now): readable.
+        assert!(Version {
             major: 0,
             minor: 9,
+            patch: 0,
+        }
+        .is_readable());
+        assert!(Version::V0_10_0.is_readable());
+        // Past the ceiling: refused.
+        assert!(!Version {
+            major: 0,
+            minor: 11,
             patch: 0,
         }
         .is_readable());
@@ -4588,11 +4600,11 @@ mod tests {
     #[test]
     fn usdc_parse_refuses_forward_incompatible_version() {
         // A file claiming a (major, minor) newer than the reader
-        // understands is refused at the bootstrap gate (trace §1)
-        // before the TOC is even read.
+        // understands (past the 0.10.0 ceiling) is refused at the
+        // bootstrap gate before the TOC is even read.
         let newer = Version {
             major: 0,
-            minor: 9,
+            minor: 11,
             patch: 0,
         };
         let bytes = synthetic_usdc(newer, &[(b"TOKENS", &[0; 16])]);

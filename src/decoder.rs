@@ -7,10 +7,11 @@
 //! 1. Walk the ZIP central directory ([`zip::walk`](crate::zip::walk))
 //!    to enumerate entries with verified 64-byte alignment.
 //! 2. Pick the Default Layer — the first entry whose extension is
-//!    `.usd` / `.usda` / `.usdc`. `.usdc` (binary crate format)
-//!    surfaces as `Error::Unsupported` per the round-1 scope.
-//! 3. Parse the ASCII USDA layer
-//!    ([`usda::parse`](crate::usda::parse)).
+//!    `.usd` / `.usda` / `.usdc` (a generic `.usd` dispatches on the
+//!    header byte run per spec §16.1).
+//! 3. Parse the layer — the ASCII text form via
+//!    [`usda::parse`](crate::usda::parse), the binary Crate form via
+//!    [`usdc_layer::layer_from_usdc`](crate::usdc_layer::layer_from_usdc).
 //! 4. Translate the prim tree into a
 //!    [`Scene3D`](oxideav_mesh3d::Scene3D) via
 //!    [`usd_to_scene::translate`](crate::usd_to_scene::translate).
@@ -20,7 +21,7 @@ use std::sync::Arc;
 use oxideav_mesh3d::{Mesh3DDecoder, Scene3D};
 
 use crate::error::unsupported;
-use crate::{usd_to_scene, usda, usdc, zip, Result};
+use crate::{usd_to_scene, usda, usdc_layer, zip, Result};
 
 /// USDZ decoder. Constructed via [`UsdzDecoder::new`] (state is
 /// reset on every `decode()` call so a single instance can be
@@ -52,40 +53,26 @@ impl UsdzDecoder {
         let payload_start = default.payload_offset as usize;
         let payload_end = payload_start + default.payload_len as usize;
         let payload = &archive[payload_start..payload_end];
-        match extension.as_str() {
-            "usd" | "usda" => {
-                let layer = usda::parse(payload)?;
-                usd_to_scene::translate(&layer, archive.clone(), &entries)
-            }
-            "usdc" => {
-                // Validate the Crate bootstrap + TOC so a malformed
-                // `.usdc` is caught at the boundary as InvalidData
-                // instead of silently being deferred. The full
-                // scene-materialisation path (TOKENS / STRINGS /
-                // FIELDS / FIELDSETS / PATHS / SPECS payload
-                // decompression + decoding) is still pending — we
-                // surface the parsed version and section catalogue
-                // in the Unsupported message so callers can see how
-                // far the boundary check got.
-                let file = usdc::UsdcFile::parse(payload)?;
-                let mut sections = String::new();
-                for (i, entry) in file.toc.entries.iter().enumerate() {
-                    if i > 0 {
-                        sections.push_str(", ");
-                    }
-                    sections.push_str(&entry.name);
-                }
-                Err(unsupported(format!(
-                    "USDZ default layer is in `.usdc` (binary crate) format \
-                     v{} with sections [{sections}]; full USDC scene materialisation \
-                     is pending. Re-package with `usdcat -o foo.usda` to convert.",
-                    file.bootstrap.version,
+        // §16.1: the generic `.usd` extension is dispatched on the
+        // header byte run — `PXR-USDC` magic selects the Crate binary
+        // format, a `#usda` banner the text format — while `.usda` /
+        // `.usdc` assert their format directly.
+        let is_crate = match extension.as_str() {
+            "usda" => false,
+            "usdc" => true,
+            "usd" => usdc_layer::is_usdc_magic(payload),
+            other => {
+                return Err(unsupported(format!(
+                    "unrecognised USDZ default-layer extension `{other}` (expected .usd / .usda / .usdc)"
                 )))
             }
-            other => Err(unsupported(format!(
-                "unrecognised USDZ default-layer extension `{other}` (expected .usd / .usda / .usdc)"
-            ))),
-        }
+        };
+        let layer = if is_crate {
+            usdc_layer::layer_from_usdc(payload)?
+        } else {
+            usda::parse(payload)?
+        };
+        usd_to_scene::translate(&layer, archive.clone(), &entries)
     }
 }
 

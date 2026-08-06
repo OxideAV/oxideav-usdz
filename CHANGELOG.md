@@ -27,6 +27,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/SoC_ElephantWithMonochord.xformOp:transform`), pairwise
   distinct, parent-closed, and each ending in its spec's leaf token.
 
+- **`.usdc` layers now decode to full scenes — the Crate reader is
+  wired end-to-end.** `usdc_layer::layer_from_usdc` materialises a
+  Crate file into the same `usda::Layer` prim-tree model the text
+  parser produces, per the §16.3.8.4.6 spec join: the pseudo-root
+  Layer spec becomes the layer metadata, Prim specs become typed
+  `Prim`s (specifier / typeName; `primChildren` ordering honoured;
+  remaining fields as prim metadata), Attribute specs become `Attr`s
+  with their authored `custom` / `uniform` type spelling plus
+  `<name>.timeSamples` and `<name>.connect` companion statements, and
+  Relationship specs become `rel` statements (an explicit single
+  target flattens to the bare path form the text parser yields).
+  Variant/VariantSet spec forms (10/11) refuse precisely; the
+  §16.3.8.4.6 compatibility forms are inert per the spec. The decoder
+  routes `.usdc` default layers through the bridge into the ordinary
+  `usd_to_scene` pipeline, and a generic `.usd` layer now dispatches
+  on its header byte run (§16.1: `PXR-USDC` magic = Crate, `#usda`
+  banner = text) instead of assuming text. **End-to-end proof:** the
+  committed Elephant Crate fixture bridges to a complete stage
+  (UsdPreviewSurface networks with texture connections, a
+  1312-vertex / 2064-triangle skinned mesh, 27-joint skeleton,
+  3023-sample SkelAnimation tracks, SpatialAudio), and a USDZ whose
+  default layer is that `.usdc` decodes through `UsdzDecoder` to a
+  `Scene3D` that passes `validate()` — meshes, materials, skeleton
+  and animations all materialised. The old "`.usdc` scene
+  materialisation is pending" `Unsupported` refusal is gone.
+
+- **usdc: reader version ceiling raised to Crate 0.10.0.** Per the
+  §16.3.8.2 version table, 0.9.0 added the TimeCode value types and
+  0.10.0 the PathExpression value type — both implemented by the
+  value decoder — so `Version::READER_MAX` is now 0.10.0 (0.11.0
+  Relocates / 0.12.0 Splines stay above the ceiling and keep
+  refusing up front). Also per §16.3.8.1 the five unused header
+  bytes are only *recommended* zero; a file using them is now read
+  rather than rejected.
+
 - **usdc: §16.3.9/§16.3.10 typed value decoding
   (`usdc_values::ValueDecoder`) — every Crate field value now decodes
   to a concrete `usda::Value`.** The decoder implements the spec's
