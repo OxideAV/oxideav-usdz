@@ -2922,54 +2922,37 @@ impl<'a> PathsSection<'a> {
     }
 
     /// Decode the three §4.5 PATHS buffers and join them into one
-    /// [`PathElement`] per tree-walk slot — the observer-grounded
-    /// structural decode of the section, one step beyond the three raw
-    /// `Vec<i32>` accessors above.
+    /// [`PathElement`] per tree-walk slot.
     ///
-    /// ## What the bytes pin (verifiable against the fixture)
+    /// The buffer roles are normative per the AOUSD Core Specification
+    /// §16.3.8.4.5:
     ///
-    /// Decoding the Elephant fixture's three buffers and inspecting the
-    /// three parallel `num_paths`-element streams reveals their concrete
-    /// roles, which are **tighter than the trace doc §4.5 "holds"
-    /// column**:
+    /// * **Buffer 1 — Path Indices** (§16.3.8.4.5.1): the Index of the
+    ///   path each walk entry constructs — i.e. which final `SdfPath`
+    ///   table slot the i-th tree-walk node fills
+    ///   ([`PathElement::target_index`]). Across a section these form
+    ///   an exact permutation of `0..num_paths` (verified on the
+    ///   fixture), the same index space a §4.6 SPECS row's `path_index`
+    ///   addresses.
+    /// * **Buffer 2 — Element Token Indices** (§16.3.8.4.5.2): a signed
+    ///   value whose **absolute value** is the §4.1 TOKENS pool index of
+    ///   this element's name token ([`PathElement::element_token_index`]).
+    ///   The **sign** selects the delimiter used to join the token onto
+    ///   its parent path: positive is a prim-path component (`/`),
+    ///   negative a property-path component (`.`) —
+    ///   [`PathElement::is_property`]. The spec forbids the word from
+    ///   pointing at token index `0` ("different languages have
+    ///   difficulties delineating between positive and negative zero"),
+    ///   which this decode enforces.
+    /// * **Buffer 3 — Jumps** (§16.3.8.4.5.3): the tree-walk navigation
+    ///   word ([`PathElement::jump`]): `-2` = leaf (no child, no
+    ///   sibling), `-1` = has a child only, `0` = has a sibling only,
+    ///   positive = has both — the child chain continues at the next
+    ///   walk entry and the sibling subtree starts `jump` entries ahead.
     ///
-    /// * **Buffer 1** is *not* a token-index array as the trace's column
-    ///   header suggests — it is the **target-slot permutation**: an
-    ///   exact permutation of `0..num_paths` saying which final
-    ///   `SdfPath` slot the i-th tree-walk node fills.
-    ///   [`PathElement::target_index`] carries it. (The doc's caveat that
-    ///   "the raw path-token values exceed the TOKENS pool size" is the
-    ///   symptom of reading this permutation as token indices; it is the
-    ///   *element-token* buffer, below, that indexes TOKENS.)
-    /// * **Buffer 2** is the **element-token word**: a signed value whose
-    ///   magnitude packs `(tokenIndex << 1) | lowFlag`. The recovered
-    ///   `tokenIndex` ([`PathElement::element_token_index`],
-    ///   `abs(word) >> 1`) is in range of the §4.1 TOKENS pool for
-    ///   **all** `num_paths` elements on the fixture (zero out-of-range),
-    ///   so it resolves to a concrete element name — the path component
-    ///   token (`Xform`, `Material`, `xformOp:transform`, …). The raw
-    ///   signed word is preserved verbatim
-    ///   ([`PathElement::element_token_word`]) because its **sign** and
-    ///   **low bit** are two further flags (a prim-vs-property /
-    ///   target-path discriminator) whose exact meaning the trace doc
-    ///   does not pin — see "What stays deferred" below.
-    /// * **Buffer 3** is the **jump** word ([`PathElement::jump`]): the
-    ///   sibling/child tree-walk navigation offset, preserved verbatim.
-    ///
-    /// ## What stays deferred (gap-tracker §1 / Round B)
-    ///
-    /// This method performs the **join and the name resolution**, not
-    /// the tree walk. The exact arithmetic that turns the (target,
-    /// element-token, jump) triples into reconstructed `SdfPath` strings
-    /// — how the absolute root is seeded, how `jump`'s sign cases
-    /// (`-1` / `-2` / `0` / positive) drive the has-child / has-sibling
-    /// descent, and what the element-token sign + low bit ultimately
-    /// distinguish — is **not** grounded by
-    /// `docs/3d/usd/usdc-crate-format-trace.md`; the trace records the
-    /// three-buffer structure and the per-buffer roles but explicitly
-    /// defers per-element tree-walk reconstruction. Decoding stops at
-    /// the verified parallel-array join so no un-grounded path string is
-    /// fabricated.
+    /// The walk that turns these triples into full `SdfPath` strings is
+    /// §16.3.8.4.5.4 — see [`construct_paths`] /
+    /// [`UsdcFile::decode_paths`].
     ///
     /// On the committed Elephant fixture this returns 248
     /// [`PathElement`]s; [`PathElement::target_index`] across the result
@@ -2983,7 +2966,9 @@ impl<'a> PathsSection<'a> {
     ///   buffers' §3a → LZ4 → §3b decode,
     /// * [`Error::InvalidData`] if any buffer 1 (`target_index`) value is
     ///   negative (it is a slot index into the path table, so it must be
-    ///   `>= 0`).
+    ///   `>= 0`),
+    /// * [`Error::InvalidData`] if any buffer 2 word is `0`
+    ///   (§16.3.8.4.5.2 forbids the zero index).
     pub fn decode_path_elements(&self) -> Result<Vec<PathElement>> {
         let targets = self.decode_path_token_ints()?;
         let element_words = self.decode_element_token_ints()?;
@@ -3002,11 +2987,15 @@ impl<'a> PathsSection<'a> {
                 ))
             })?;
             let word = element_words[i];
-            // The element-token index is the magnitude shifted right by
-            // one: the low bit and the sign are separate flags the trace
-            // does not pin, so they are preserved in `element_token_word`
-            // rather than interpreted here.
-            let element_token_index = word.unsigned_abs() >> 1;
+            if word == 0 {
+                return Err(invalid(format!(
+                    "USDC PATHS element {i}: element token index 0 is forbidden (spec §16.3.8.4.5.2)"
+                )));
+            }
+            // §16.3.8.4.5.2: the absolute value of the signed word is
+            // the TOKENS pool index; the sign is the prim-vs-property
+            // delimiter selector.
+            let element_token_index = word.unsigned_abs();
             out.push(PathElement {
                 target_index,
                 element_token_index,
@@ -3018,44 +3007,154 @@ impl<'a> PathsSection<'a> {
     }
 }
 
+/// Reconstruct the full `SdfPath` strings from a section's decoded
+/// [`PathElement`]s — the AOUSD Core Specification §16.3.8.4.5.4
+/// *Path Construction Algorithm*.
+///
+/// The walk starts at entry 0 with an empty parent path (which seeds
+/// the absolute root `/`), then repeatedly appends each entry's
+/// element token to its parent using the prim (`/`) or property (`.`)
+/// delimiter selected by the element-token word's sign, storing the
+/// result at [`PathElement::target_index`] in the output. The
+/// [`PathElement::jump`] word drives the descent: `-2` ends a run
+/// (leaf), `-1` descends into a child chain at the next entry, `0`
+/// continues to a sibling at the next entry under the *same* parent,
+/// and a positive value does both — the child chain continues at the
+/// next entry while the sibling subtree (processed under the current
+/// entry's parent) starts `jump` entries ahead.
+///
+/// Returns the constructed paths **indexed by path index** (the slot
+/// space §4.6 SPECS rows address), e.g. on the committed Elephant
+/// fixture slot 0 is `/`, slot 1 `/SoC_ElephantWithMonochord`, slot 2
+/// `/SoC_ElephantWithMonochord/CharacterAudioSource`, and slot 228
+/// `/SoC_ElephantWithMonochord.xformOp:transform`.
+///
+/// Errors with [`Error::InvalidData`](crate::Error) when the walk is
+/// structurally corrupt: a jump leads outside the element table, an
+/// entry is visited twice (a cycle), two entries claim the same output
+/// slot, a slot is never filled, an element token index is outside the
+/// `tokens` pool, or a jump word below `-2` (unassigned by the spec)
+/// is encountered.
+pub fn construct_paths(elements: &[PathElement], tokens: &[String]) -> Result<Vec<String>> {
+    let n = elements.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<Option<String>> = vec![None; n];
+    let mut visited = vec![false; n];
+    // Explicit sibling stack instead of the spec's recursion: each
+    // entry is `(walk index to resume at, parent path at that point)`.
+    let mut stack: Vec<(usize, String)> = vec![(0, String::new())];
+    while let Some((mut x, mut parent)) = stack.pop() {
+        loop {
+            if x >= n {
+                return Err(invalid(format!(
+                    "USDC PATHS walk: jump target {x} outside the {n}-element table"
+                )));
+            }
+            if visited[x] {
+                return Err(invalid(format!(
+                    "USDC PATHS walk: element {x} visited twice (cyclic jump table)"
+                )));
+            }
+            visited[x] = true;
+            let e = &elements[x];
+            // §16.3.8.4.5.4 step 1: an empty parent seeds the absolute
+            // root `/` (the entry's own token is not consulted);
+            // otherwise the element token joins the parent with the
+            // sign-selected delimiter.
+            let current = if parent.is_empty() {
+                "/".to_owned()
+            } else {
+                let tok = e.element_token(tokens).ok_or_else(|| {
+                    invalid(format!(
+                        "USDC PATHS walk: element {x} token index {} outside the {}-atom pool",
+                        e.element_token_index,
+                        tokens.len()
+                    ))
+                })?;
+                let sep = if e.is_property() { '.' } else { '/' };
+                if parent == "/" {
+                    format!("/{}{tok}", if e.is_property() { "." } else { "" })
+                } else {
+                    format!("{parent}{sep}{tok}")
+                }
+            };
+            // Step 2: store at the path index.
+            let slot = e.target_index as usize;
+            if slot >= n {
+                return Err(invalid(format!(
+                    "USDC PATHS walk: element {x} targets slot {slot} outside 0..{n}"
+                )));
+            }
+            if out[slot].is_some() {
+                return Err(invalid(format!(
+                    "USDC PATHS walk: two elements fill path slot {slot}"
+                )));
+            }
+            out[slot] = Some(current.clone());
+            // Steps 3–6: the jump word.
+            match e.jump {
+                -2 => break,
+                -1 => {
+                    parent = current;
+                    x += 1;
+                }
+                0 => {
+                    x += 1;
+                }
+                j if j > 0 => {
+                    let sibling = x.checked_add(j as usize).ok_or_else(|| {
+                        invalid(format!("USDC PATHS walk: jump {j} at {x} overflows"))
+                    })?;
+                    stack.push((sibling, parent.clone()));
+                    parent = current;
+                    x += 1;
+                }
+                j => {
+                    return Err(invalid(format!(
+                        "USDC PATHS walk: jump {j} at element {x} is unassigned (spec §16.3.8.4.5.3 defines -2, -1, 0, and positive offsets)"
+                    )));
+                }
+            }
+        }
+    }
+    out.into_iter()
+        .enumerate()
+        .map(|(i, p)| {
+            p.ok_or_else(|| invalid(format!("USDC PATHS walk: path slot {i} never filled")))
+        })
+        .collect()
+}
+
 /// One node of the §4.5 PATHS namespace tree, as recovered by
 /// [`PathsSection::decode_path_elements`] from the section's three
-/// parallel §3b integer buffers.
-///
-/// A `PathElement` is the **observer-grounded join** of the three
-/// buffers at one tree-walk position — it carries the facts the
-/// Elephant fixture's bytes pin directly, and preserves the raw words
-/// whose finer semantics the trace doc defers (the tree walk itself;
-/// gap-tracker §1 / Round B). See
-/// [`PathsSection::decode_path_elements`] for the buffer-by-buffer
-/// grounding.
+/// parallel §3b integer buffers — the per-entry join defined by the
+/// AOUSD Core Specification §16.3.8.4.5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PathElement {
-    /// Buffer-1 value: the final `SdfPath` table slot this tree-walk
-    /// node fills. Across a section these form an exact permutation of
-    /// `0..num_paths` (verified on the fixture), so they map tree-walk
-    /// order onto stable path-table indices — the same indices a §4.6
-    /// SPECS row's `path_index` refers to.
+    /// Buffer-1 value (§16.3.8.4.5.1 *Path Indices*): the final
+    /// `SdfPath` table slot this tree-walk node fills. Across a section
+    /// these form an exact permutation of `0..num_paths` (verified on
+    /// the fixture), so they map tree-walk order onto stable path-table
+    /// indices — the same indices a §4.6 SPECS row's `path_index`
+    /// refers to.
     pub target_index: u32,
-    /// Buffer-2 value, magnitude-shifted: the §4.1 TOKENS pool index of
-    /// this element's **name** token (`abs(element_token_word) >> 1`).
-    /// In range of the pool for every element on the fixture, so it
-    /// resolves to a concrete path-component string
-    /// (`Xform`, `Material`, `xformOp:transform`, …).
+    /// Buffer-2 value, absolute: the §4.1 TOKENS pool index of this
+    /// element's **name** token (§16.3.8.4.5.2 — "the absolute value of
+    /// the token_index is a lookup into the Tokens index"). Resolves to
+    /// the path-component string (`Materials`, `xformOp:transform`, …).
     pub element_token_index: u32,
     /// Buffer-2 value, verbatim: the signed element-token word. Its
-    /// **magnitude** packs the token index (see
-    /// [`Self::element_token_index`]); its **sign** and **low bit** are
-    /// two further flags (a prim-vs-property / target-path
-    /// discriminator) whose exact meaning the trace doc does not pin, so
-    /// the raw word is preserved for the eventual tree-walk consumer
-    /// rather than interpreted here.
+    /// **magnitude** is [`Self::element_token_index`]; its **sign** is
+    /// the delimiter selector (§16.3.8.4.5.2): positive = prim-path
+    /// component (`/`), negative = property-path component (`.`) — see
+    /// [`Self::is_property`]. Never `0` in a conforming file.
     pub element_token_word: i32,
-    /// Buffer-3 value, verbatim: the sibling/child tree-walk navigation
-    /// "jump" offset for this node (`0` is by far the most common on the
-    /// fixture; `-1`, `-2`, and positive offsets also occur). The walk
-    /// that consumes these to reconstruct full `SdfPath` strings is
-    /// deferred (gap-tracker §1 / Round B).
+    /// Buffer-3 value (§16.3.8.4.5.3 *Jumps*): the tree-walk navigation
+    /// word — `-2` = leaf, `-1` = has a child only, `0` = has a sibling
+    /// only, positive = has both (sibling subtree starts this many
+    /// entries ahead). Consumed by [`construct_paths`].
     pub jump: i32,
 }
 
@@ -3072,6 +3171,15 @@ impl PathElement {
         tokens
             .get(self.element_token_index as usize)
             .map(|s| s.as_str())
+    }
+
+    /// `true` when this element is a **property-path** component —
+    /// §16.3.8.4.5.2: a negative element-token word joins its parent
+    /// with the `.` property delimiter, a positive one with the `/`
+    /// prim delimiter.
+    #[inline]
+    pub fn is_property(&self) -> bool {
+        self.element_token_word < 0
     }
 }
 
@@ -3671,9 +3779,10 @@ impl UsdcFile {
     /// returned [`PathElement`] carries its target slot index (a
     /// permutation of `0..numPaths`), the §4.1 TOKENS pool index of its
     /// element-name token, and the raw element-token / jump words the
-    /// (deferred) tree walk consumes. See
+    /// §16.3.8.4.5.4 tree walk ([`construct_paths`] /
+    /// [`UsdcFile::decode_paths`]) consumes. See
     /// [`PathsSection::decode_path_elements`] for the per-buffer
-    /// observer grounding and the precise deferral boundary.
+    /// spec grounding.
     ///
     /// `file_bytes` must be the same buffer [`UsdcFile::parse`] was
     /// called on. The `PATHS` section is decoded once.
@@ -3694,6 +3803,33 @@ impl UsdcFile {
                 invalid("USDC §4.5: PATHS section absent — cannot decode path elements")
             })?;
         PathsSection::parse(paths_bytes)?.decode_path_elements()
+    }
+
+    /// Reconstruct every `SdfPath` in the file — the §16.3.8.4.5.4
+    /// *Path Construction Algorithm* run over the decoded PATHS
+    /// section, with the element tokens resolved against the §4.1
+    /// TOKENS pool. The result is indexed by **path index** (the slot
+    /// space §4.6 SPECS rows address): `result[spec.path_index]` is the
+    /// full path string of that spec.
+    ///
+    /// On the committed Elephant fixture this yields 248 paths — slot 0
+    /// is the absolute root `/`, slot 1 the root prim
+    /// `/SoC_ElephantWithMonochord`, and property paths join with the
+    /// `.` delimiter (`/SoC_ElephantWithMonochord.xformOp:transform`).
+    ///
+    /// `file_bytes` must be the same buffer [`UsdcFile::parse`] was
+    /// called on. TOKENS and PATHS are each decoded once.
+    ///
+    /// Errors with [`Error::InvalidData`](crate::Error) when either
+    /// section is absent or fails to decode, or when the walk is
+    /// structurally corrupt (see [`construct_paths`]).
+    pub fn decode_paths(&self, file_bytes: &[u8]) -> Result<Vec<String>> {
+        let tokens_bytes = self
+            .section_bytes(SectionName::Tokens, file_bytes)
+            .ok_or_else(|| invalid("USDC: TOKENS section absent — cannot construct paths"))?;
+        let tokens = TokensSection::parse(tokens_bytes)?.decode()?;
+        let elements = self.decode_path_elements(file_bytes)?;
+        construct_paths(&elements, &tokens)
     }
 
     /// Index a §4.5 PATHS decode by **target slot**: the returned
@@ -3752,9 +3888,8 @@ impl UsdcFile {
     }
 
     /// Join the §4.6 SPECS table with the §4.5 PATHS elements to give
-    /// every spec row its **leaf namespace-component name** — the one
-    /// segment of its `SdfPath` the bytes pin without the deferred tree
-    /// walk.
+    /// every spec row its **leaf namespace-component name** — the last
+    /// segment of its `SdfPath`.
     ///
     /// Each [`ResolvedSpec::path_index`] (a permutation index into the
     /// path table) selects exactly one [`PathElement`] via
@@ -3762,17 +3897,18 @@ impl UsdcFile {
     /// that element's [`element_token`](PathElement::element_token) is
     /// the spec's own path component (its prim/property name), resolved
     /// against the §4.1 TOKENS pool. The result pairs each
-    /// [`NamedSpec`] with that leaf name.
+    /// [`NamedSpec`] with that leaf name. For the **full** path string
+    /// use [`decode_paths`](Self::decode_paths) and index it with
+    /// `spec.path_index` instead.
     ///
-    /// This is the furthest the namespace join can go on grounded
-    /// footing: it names *what each spec is* (its leaf component +
-    /// fields), but **not its full ancestor path** — assembling
-    /// `/Foo/Bar/leaf` needs the deferred jump-walk (gap-tracker §1 /
-    /// Round B). On the Elephant fixture the pseudo-root spec
-    /// (`path_index == 0`, `spec_type == 7`) carries the stage metadata
-    /// fields, and each prim spec (`spec_type == 6`) gets its type/name
-    /// token (`Xform`, `Materials`, `CharacterAudioSource`, …) as its
-    /// leaf.
+    /// On the Elephant fixture the pseudo-root spec (`path_index == 0`,
+    /// `spec_type == 7`) carries the stage metadata fields and its
+    /// "leaf" is the root's (ignored) empty element token; each prim
+    /// spec (`spec_type == 6`) gets its own prim name
+    /// (`SoC_ElephantWithMonochord`, `CharacterAudioSource`,
+    /// `Elefant_Mat_68050`, …) and each attribute/relationship spec its
+    /// property name (`xformOp:transform`, `inputs:diffuseColor`, …) as
+    /// its leaf.
     ///
     /// `file_bytes` must be the same buffer [`UsdcFile::parse`] was
     /// called on. `TOKENS`, the SPECS join, and the PATHS section are
@@ -8019,5 +8155,132 @@ mod tests {
             expected.iter().copied().collect(),
             "the fixture's empirical type roster changed"
         );
+    }
+
+    // ---- §16.3.8.4.5.4 path construction --------------------------
+
+    fn pe(target: u32, word: i32, jump: i32) -> PathElement {
+        PathElement {
+            target_index: target,
+            element_token_index: word.unsigned_abs(),
+            element_token_word: word,
+            jump,
+        }
+    }
+
+    fn toks(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn construct_paths_builds_spec_example_tree() {
+        // Root -> prim A (property b, child prim d) and sibling prim C.
+        // Walk order exercises all four jump codes: -1 (root: child
+        // only), positive (A: child chain at +1, sibling subtree at
+        // +3), 0 (b: sibling only), -2 (leaves).
+        let tokens = toks(&["!", "A", "b", "d", "C"]);
+        let elements = [
+            pe(0, 1, -1), // root; token ignored
+            pe(1, 1, 3),  // /A — child at next, sibling at +3
+            pe(2, -2, 0), // /A.b — property, sibling next
+            pe(3, 3, -2), // /A/d — leaf
+            pe(4, 4, -2), // /C — leaf
+        ];
+        let paths = construct_paths(&elements, &tokens).expect("walk");
+        assert_eq!(paths, ["/", "/A", "/A.b", "/A/d", "/C"]);
+    }
+
+    #[test]
+    fn construct_paths_empty_input_is_empty() {
+        assert_eq!(construct_paths(&[], &[]).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn construct_paths_rejects_unassigned_jump() {
+        let tokens = toks(&["!", "A"]);
+        let elements = [pe(0, 1, -3)];
+        let err = construct_paths(&elements, &tokens).expect_err("jump -3");
+        assert!(format!("{err:?}").contains("unassigned"), "{err:?}");
+    }
+
+    #[test]
+    fn construct_paths_rejects_out_of_table_jump() {
+        let tokens = toks(&["!", "A"]);
+        // Sibling jump way past the table.
+        let elements = [pe(0, 1, -1), pe(1, 1, 9)];
+        let err = construct_paths(&elements, &tokens).expect_err("jump out");
+        assert!(format!("{err:?}").contains("outside"), "{err:?}");
+    }
+
+    #[test]
+    fn construct_paths_rejects_cycle() {
+        let tokens = toks(&["!", "A", "b"]);
+        // Element 1's sibling jump points back at... itself via 2->1 is
+        // impossible with positive-only jumps, so build the revisit by
+        // running off the end of a chain into an already-visited slot:
+        // element 2 continues (jump 0) to element 3 which does not
+        // exist -> out-of-table; instead pin the visited-twice error
+        // with a sibling jump landing on the still-unvisited element 1
+        // *after* the main chain has already consumed it? The walk
+        // consumes 0,1,2 linearly; a positive jump of +0 is not
+        // encodable (0 means sibling-only). Use two stacked runs both
+        // starting at element 2.
+        let elements = [
+            pe(0, 1, -1),  // root, child only
+            pe(1, 1, 1),   // /A - child at 2 AND sibling at 2 (jump 1)
+            pe(2, -2, -2), // /A.b leaf - but also claimed as sibling run
+        ];
+        let err = construct_paths(&elements, &tokens).expect_err("revisit");
+        assert!(format!("{err:?}").contains("visited twice"), "{err:?}");
+    }
+
+    #[test]
+    fn construct_paths_rejects_duplicate_slot() {
+        let tokens = toks(&["!", "A", "b"]);
+        let elements = [
+            pe(0, 1, -1),
+            pe(1, 1, 0),  // /A, sibling next
+            pe(1, 2, -2), // duplicate target slot 1
+        ];
+        let err = construct_paths(&elements, &tokens).expect_err("dup slot");
+        assert!(format!("{err:?}").contains("fill path slot"), "{err:?}");
+    }
+
+    #[test]
+    fn construct_paths_rejects_unfilled_slot() {
+        let tokens = toks(&["!", "A"]);
+        // Two elements, but the walk ends at element 0 (leaf): slot 1
+        // is never filled.
+        let elements = [pe(0, 1, -2), pe(1, 1, -2)];
+        let err = construct_paths(&elements, &tokens).expect_err("unfilled");
+        assert!(format!("{err:?}").contains("never filled"), "{err:?}");
+    }
+
+    #[test]
+    fn construct_paths_rejects_out_of_pool_token() {
+        let tokens = toks(&["!"]);
+        let elements = [pe(0, 9, -1), pe(1, 9, -2)];
+        let err = construct_paths(&elements, &tokens).expect_err("token OOR");
+        assert!(format!("{err:?}").contains("pool"), "{err:?}");
+    }
+
+    #[test]
+    fn decode_path_elements_rejects_zero_token_word() {
+        // §16.3.8.4.5.2: the element token index must never be zero.
+        // Synthesise a one-path section whose element-token buffer
+        // holds a single 0.
+        let targets = encode_compressed_buffer(&encode_int_coded(&[0]));
+        let words = encode_compressed_buffer(&encode_int_coded(&[0]));
+        let jumps = encode_compressed_buffer(&encode_int_coded(&[-2]));
+        let mut section = Vec::new();
+        section.extend_from_slice(&1u64.to_le_bytes());
+        section.extend_from_slice(&1u64.to_le_bytes());
+        for buf in [&targets, &words, &jumps] {
+            section.extend_from_slice(&(buf.len() as u64).to_le_bytes());
+            section.extend_from_slice(buf);
+        }
+        let sec = PathsSection::parse(&section).expect("framing parses");
+        let err = sec.decode_path_elements().expect_err("zero word");
+        assert!(format!("{err:?}").contains("forbidden"), "{err:?}");
     }
 }

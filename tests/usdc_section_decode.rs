@@ -252,21 +252,33 @@ fn paths_section_decodes_to_248_path_elements() {
             e.element_token(&tokens).is_some(),
             "path element {i} resolves to a token string"
         );
-        // The magnitude/shift relation the decoder applies.
+        // §16.3.8.4.5.2: the token index is the |word| itself, and a
+        // zero word is forbidden.
         assert_eq!(
             e.element_token_index,
-            e.element_token_word.unsigned_abs() >> 1,
-            "element_token_index == abs(word) >> 1"
+            e.element_token_word.unsigned_abs(),
+            "element_token_index == abs(word)"
         );
+        assert_ne!(e.element_token_word, 0, "zero token index is forbidden");
     }
 
-    // Spot-check three observed first-rows against the fixture bytes
-    // (these are facts the decode is pinned to, not new semantic
-    // claims): row 0's element name token resolves to "metersPerUnit",
-    // row 1 to "defaultPrim", row 4 to "upAxis".
-    assert_eq!(elems[0].element_token(&tokens), Some("metersPerUnit"));
-    assert_eq!(elems[1].element_token(&tokens), Some("defaultPrim"));
-    assert_eq!(elems[4].element_token(&tokens), Some("upAxis"));
+    // Spot-check the first walk rows against the fixture bytes under
+    // the §16.3.8.4.5.2 mapping: row 0 is the absolute root (its
+    // element token — the pool's empty atom — is ignored by the walk),
+    // row 1 is the root prim name, row 4 the first child prim under
+    // it, and rows 2/3 are property components (negative words).
+    assert_eq!(elems[0].element_token(&tokens), Some(""));
+    assert_eq!(
+        elems[1].element_token(&tokens),
+        Some("SoC_ElephantWithMonochord")
+    );
+    assert_eq!(
+        elems[4].element_token(&tokens),
+        Some("CharacterAudioSource")
+    );
+    assert!(!elems[1].is_property());
+    assert!(elems[2].is_property());
+    assert_eq!(elems[2].element_token(&tokens), Some("xformOp:transform"));
 
     // The jump words observed on the first rows (verbatim from buffer 3).
     assert_eq!(elems[0].jump, -1);
@@ -302,10 +314,13 @@ fn path_elements_by_slot_and_spec_leaf_names() {
     assert_eq!(leaves.len(), 248, "one leaf name per spec row");
 
     // Row 0 is the pseudo-root (spec_type 7) with its metadata fields.
+    // Its "leaf" is the walk root's element token, which the fixture
+    // points at the pool's empty atom (the walk ignores it and seeds
+    // the absolute root `/`).
     let (root_spec, root_leaf) = &leaves[0];
     assert_eq!(root_spec.path_index, 0);
     assert_eq!(root_spec.spec_type, 7, "pseudo-root spec type");
-    assert_eq!(root_leaf, "metersPerUnit");
+    assert_eq!(root_leaf, "");
     assert!(
         root_spec.fields.iter().any(|(n, _)| n == "defaultPrim"),
         "root spec carries defaultPrim metadata"
@@ -322,7 +337,9 @@ fn path_elements_by_slot_and_spec_leaf_names() {
         }
     }
 
-    // Spot-check the first few prim leaves against the observed bytes.
+    // Spot-check the first few prim leaves against the observed bytes
+    // under the spec's |word| token mapping: these are the prims' own
+    // names (the full paths are exercised by the construct-paths test).
     let leaf_at = |pi: i32| -> &str {
         leaves
             .iter()
@@ -330,7 +347,81 @@ fn path_elements_by_slot_and_spec_leaf_names() {
             .map(|(_, l)| l.as_str())
             .unwrap()
     };
-    assert_eq!(leaf_at(4), "Xform");
-    assert_eq!(leaf_at(5), "Materials");
-    assert_eq!(leaf_at(6), "CharacterAudioSource");
+    assert_eq!(leaf_at(1), "SoC_ElephantWithMonochord");
+    assert_eq!(leaf_at(2), "CharacterAudioSource");
+    assert_eq!(leaf_at(4), "Elefant_Mat_68050");
+}
+
+#[test]
+fn path_construction_algorithm_rebuilds_all_fixture_paths() {
+    // §16.3.8.4.5.4 Path Construction Algorithm, end-to-end on the
+    // committed Elephant fixture.
+    let Some(bytes) = elephant_bytes() else {
+        return;
+    };
+    let file = UsdcFile::parse(&bytes).expect("parse Elephant USDC");
+    let paths = file.decode_paths(&bytes).expect("decode_paths");
+    assert_eq!(paths.len(), 248, "one path per PATHS slot");
+
+    // Slot 0 is the absolute root.
+    assert_eq!(paths[0], "/");
+    // Spot-checks pinned by the walk over the fixture bytes.
+    assert_eq!(paths[1], "/SoC_ElephantWithMonochord");
+    assert_eq!(paths[2], "/SoC_ElephantWithMonochord/CharacterAudioSource");
+    assert_eq!(paths[3], "/SoC_ElephantWithMonochord/Materials");
+    assert_eq!(
+        paths[4],
+        "/SoC_ElephantWithMonochord/Materials/Elefant_Mat_68050"
+    );
+    assert_eq!(paths[228], "/SoC_ElephantWithMonochord.xformOp:transform");
+
+    // Every path is unique.
+    let set: std::collections::BTreeSet<&str> = paths.iter().map(String::as_str).collect();
+    assert_eq!(set.len(), paths.len(), "paths are pairwise distinct");
+
+    // Structural sanity: every non-root path's parent is also in the
+    // table (tree closure), where a property path's parent is the prim
+    // it hangs off and a prim path's parent is its namespace parent.
+    for p in &paths {
+        if p == "/" {
+            continue;
+        }
+        assert!(p.starts_with('/'), "absolute path: {p}");
+        let parent = if let Some(dot) = p.rfind('.') {
+            &p[..dot]
+        } else if let Some(slash) = p.rfind('/') {
+            if slash == 0 {
+                "/"
+            } else {
+                &p[..slash]
+            }
+        } else {
+            unreachable!("absolute path {p} has a separator");
+        };
+        assert!(
+            set.contains(parent),
+            "parent of {p} ({parent}) must exist in the path table"
+        );
+    }
+
+    // Property components appear only as the final path element, and
+    // each spec's full path ends with its leaf component name.
+    let leaves = file
+        .decode_spec_leaf_names(&bytes)
+        .expect("decode_spec_leaf_names");
+    for (spec, leaf) in &leaves {
+        let p = &paths[spec.path_index as usize];
+        if p == "/" {
+            continue;
+        }
+        let tail: &str = p
+            .rsplit(['/', '.'])
+            .next()
+            .expect("non-root path has a final component");
+        assert_eq!(
+            tail, leaf,
+            "path {p} (slot {}) must end with its spec leaf {leaf}",
+            spec.path_index
+        );
+    }
 }

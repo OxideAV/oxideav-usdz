@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **usdc: §16.3.8.4.5.4 path construction — full `SdfPath`
+  reconstruction (`usdc::construct_paths` /
+  `UsdcFile::decode_paths`).** The AOUSD spec publishes the PATHS
+  tree-walk algorithm the trace doc deferred: entry 0 seeds the
+  absolute root `/`, each entry appends its element token to the
+  parent path with the delimiter selected by the element-token word's
+  sign (positive = prim `/`, negative = property `.`), and the jump
+  word drives descent (`-2` leaf, `-1` child-only, `0` sibling-only,
+  positive = child at the next entry + sibling subtree `jump` entries
+  ahead). The walk is implemented iteratively with a sibling stack
+  and full corruption guards — out-of-table jumps, cycles, duplicate
+  or unfilled output slots, and the spec-forbidden zero token index
+  are each precise `InvalidData` refusals. On the committed Elephant
+  fixture all 248 paths reconstruct (`/`,
+  `/SoC_ElephantWithMonochord`, …,
+  `/SoC_ElephantWithMonochord.xformOp:transform`), pairwise
+  distinct, parent-closed, and each ending in its spec's leaf token.
+
 - **usdc: the §16.3.10.1 value-type table (`usdc::ValueType`).** The
   AOUSD *USD Core Specification* 1.0.1 (staged in `docs/3d/usd/`)
   publishes the Crate value-type enumeration — IDs 1–59 with their
@@ -27,6 +45,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   observer-guessed "`0x0f` = `double[]`" reading is corrected: `0x0f`
   is **matrix4d** (its first element still reads `1.0` — the identity
   diagonal).
+
+### Fixed
+
+- **usdc: PATHS element-token mapping corrected to the normative
+  §16.3.8.4.5.2 rule.** The observer-era decode read the element
+  token index as `abs(word) >> 1` (guessing the low bit was a flag);
+  the spec pins it as **`abs(word)`** with the **sign** as the
+  prim-vs-property delimiter selector — under the old mapping every
+  fixture element still landed in pool range, which is why the guess
+  survived, but the resolved names were wrong (e.g. the root prim's
+  element resolved as `defaultPrim`). `PathElement::element_token_index`
+  now carries the spec mapping, `PathElement::is_property()` exposes
+  the sign, a zero word is rejected per the spec, and the
+  fixture-grounded tests now pin the true names
+  (`SoC_ElephantWithMonochord`, `CharacterAudioSource`, …).
+  `decode_spec_leaf_names` inherits the correction.
 
 ### Changed
 
