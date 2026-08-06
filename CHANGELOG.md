@@ -27,6 +27,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/SoC_ElephantWithMonochord.xformOp:transform`), pairwise
   distinct, parent-closed, and each ending in its spec's leaf token.
 
+- **zip: §16.4 normative container restrictions.** The container
+  walker now enforces the End-of-Central-Directory rules the spec
+  states normatively (§16.4.1.4): non-zero disk-number fields are a
+  precise *"USDZ forbids multi-disk archives"* refusal, and the
+  entries-on-this-disk count must equal the total (a single central
+  directory). The 64-byte rule (§16.4.1.3) is applied under **both**
+  readings — the spec words it as "every file header starts at a
+  multiple of 64 bytes" while packagers observed in the wild align
+  the *payload* via LFH extra padding — so an entry is accepted when
+  either offset sits on the boundary and rejected (naming both
+  offsets) when neither does; a header-aligned file with unaligned
+  payloads, previously refused, now reads. Reading a trailing ZIP
+  comment stays tolerated per §16.4.2's out-of-spec allowance (the
+  writer emits none and already satisfies every §16.4.1.4 field).
+
 - **`.usdc` layers now decode to full scenes — the Crate reader is
   wired end-to-end.** `usdc_layer::layer_from_usdc` materialises a
   Crate file into the same `usda::Layer` prim-tree model the text

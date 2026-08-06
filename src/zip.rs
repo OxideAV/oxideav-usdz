@@ -1,17 +1,28 @@
 //! Minimal PKZIP central-directory walker — STORED entries only.
 //!
-//! USDZ is a PKZIP archive (PKWARE APPNOTE.TXT container) with two
-//! extra constraints, summarised in `docs/3d/usd/GAP-TRACKER.md`
-//! §3 ("USDZ container"):
+//! USDZ is a PKZIP archive (PKWARE APPNOTE.TXT container) with the
+//! extra constraints the AOUSD Core Specification §16.4 states
+//! normatively:
 //!
-//! * **Zero-compression**: every inner file is stored uncompressed
-//!   (PKZIP method `0`). Any other method (deflate `8`, bzip2 `12`,
-//!   lzma `14`, zstd `93`, ...) is non-conforming and rejected here.
-//! * **64-byte alignment**: every inner-file payload begins at a
-//!   byte offset that is a multiple of 64 from the archive start.
-//!   This lets a renderer mmap the package and hand the inner
-//!   payload (notably the `.usdc` Default Layer) straight to USD's
-//!   crate-file mmap path without copying.
+//! * **Zero-compression, no encryption** (§16.4.1.1): every inner
+//!   file is stored uncompressed (PKZIP method `0`). Any other
+//!   method (deflate `8`, bzip2 `12`, lzma `14`, zstd `93`, ...) is
+//!   non-conforming and rejected here.
+//! * **32-bit ZIP only** (§16.4.1.1): no ZIP64 — the sentinels are
+//!   rejected at the EOCD.
+//! * **64-byte alignment** (§16.4.1.3): the spec words the rule as
+//!   "every file header starts at a multiple of 64 bytes", while
+//!   packagers observed in the wild align the *payload* onto the
+//!   boundary (padding the LFH `extra` field) so the inner `.usdc`
+//!   can be handed to an mmap consumer directly. This walker accepts
+//!   an entry when **either** its local-file-header offset or its
+//!   payload offset sits on the 64-byte boundary, covering both
+//!   readings; an entry aligned under neither is rejected.
+//! * **EOCD restrictions** (§16.4.1.4): no multi-disk fields, and a
+//!   single central directory (the two entry counts must agree).
+//!   §16.4.2 permits readers to accept out-of-spec archives, so a
+//!   trailing ZIP comment is tolerated on read (the EOCD is still
+//!   required to end the file); this crate's writer emits none.
 //!
 //! Everything else here — the End-of-Central-Directory (EOCD) record,
 //! the central-directory file headers, the local file headers, and
@@ -69,9 +80,23 @@ pub struct ZipEntry {
 /// violation returns `Error::InvalidData`.
 pub fn walk(archive: &[u8]) -> Result<Vec<ZipEntry>> {
     let eocd = find_eocd(archive)?;
+    let disk_number = u16::from_le_bytes(read2(archive, eocd + 4)?);
+    let cd_disk_number = u16::from_le_bytes(read2(archive, eocd + 6)?);
+    let disk_entries_raw = u16::from_le_bytes(read2(archive, eocd + 8)?);
     let cd_size_raw = u32::from_le_bytes(read4(archive, eocd + 12)?);
     let cd_offset_raw = u32::from_le_bytes(read4(archive, eocd + 16)?);
     let total_entries_raw = u16::from_le_bytes(read2(archive, eocd + 10)?);
+
+    // §16.4.1.4: USDZ does not support multi-disk zips — both disk
+    // number fields must be zero (0xFFFF is additionally the ZIP64
+    // sentinel, caught below with a more specific message).
+    if (disk_number != 0 && disk_number != 0xFFFF)
+        || (cd_disk_number != 0 && cd_disk_number != 0xFFFF)
+    {
+        return Err(unsupported(format!(
+            "USDZ forbids multi-disk archives (spec §16.4.1.4): EOCD disk number {disk_number}, central-directory disk {cd_disk_number}"
+        )));
+    }
 
     // ZIP64 sentinel detection. APPNOTE.TXT §4.4 records that when a
     // count/size/offset field cannot fit the classic 16-/32-bit EOCD
@@ -87,6 +112,14 @@ pub fn walk(archive: &[u8]) -> Result<Vec<ZipEntry>> {
         return Err(unsupported(
             "USDZ forbids ZIP64; EOCD carries a ZIP64 sentinel (0xFFFF entry count or 0xFFFFFFFF central-directory size/offset)",
         ));
+    }
+
+    // §16.4.1.4: "there may only be one central directory" — the
+    // entries-on-this-disk count and the total must agree.
+    if disk_entries_raw != total_entries_raw {
+        return Err(invalid(format!(
+            "USDZ EOCD entry counts disagree (spec §16.4.1.4 permits a single central directory): {disk_entries_raw} on this disk vs {total_entries_raw} total"
+        )));
     }
 
     let cd_size = cd_size_raw as u64;
@@ -148,9 +181,12 @@ pub fn walk(archive: &[u8]) -> Result<Vec<ZipEntry>> {
         if payload_offset.saturating_add(comp_size) > archive.len() as u64 {
             return Err(invalid("ZIP STORED payload extends past archive end"));
         }
-        if payload_offset % USDZ_ALIGNMENT != 0 {
+        // §16.4.1.3 alignment — spec wording aligns the file *header*,
+        // observed packagers align the *payload*; accept either, reject
+        // an entry aligned under neither reading.
+        if payload_offset % USDZ_ALIGNMENT != 0 && lfh_offset % USDZ_ALIGNMENT != 0 {
             return Err(invalid(format!(
-                "USDZ entry '{name}' payload at offset {payload_offset} is not 64-byte aligned"
+                "USDZ entry '{name}' violates the 64-byte alignment rule (spec §16.4.1.3): neither its file header (offset {lfh_offset}) nor its payload (offset {payload_offset}) sits on a 64-byte boundary"
             )));
         }
 
@@ -347,12 +383,66 @@ mod tests {
     }
 
     #[test]
-    fn rejects_misaligned_payload() {
+    fn accepts_header_aligned_but_payload_unaligned_entry() {
+        // A single entry whose LFH sits at offset 0 (a 64-byte
+        // multiple) with a 16-byte-aligned payload: conforming under
+        // the spec's §16.4.1.3 header-alignment wording, so the walk
+        // accepts it even though the payload is off-boundary.
         let zip = build_aligned_zip("hello.usda", b"#usda 1.0\n", 16);
-        // 16-byte alignment — not a multiple of 64.
+        let entries = walk(&zip).expect("header-aligned entry accepted");
+        assert_eq!(entries.len(), 1);
+        assert_ne!(entries[0].payload_offset % 64, 0);
+    }
+
+    #[test]
+    fn rejects_entry_aligned_under_neither_reading() {
+        // Shift the whole single-entry archive by 2 bytes (fixing up
+        // the CD's LFH-offset and the EOCD's CD-offset) so neither
+        // the header nor the payload sits on a 64-byte boundary.
+        let zip = build_aligned_zip("hello.usda", b"#usda 1.0\n", 16);
+        let mut shifted = vec![0xEEu8, 0xEE];
+        shifted.extend_from_slice(&zip);
+        // The single CD record's LFH offset (was 0) is 42 bytes into
+        // the CD record; find the CD by its signature.
+        let cd = shifted
+            .windows(4)
+            .position(|w| w == CDIR_SIGNATURE.to_le_bytes())
+            .expect("CD record present");
+        shifted[cd + 42..cd + 46].copy_from_slice(&2u32.to_le_bytes());
+        let eocd = find_eocd(&shifted).expect("EOCD still findable");
+        let cd_offset = u32::from_le_bytes([
+            shifted[eocd + 16],
+            shifted[eocd + 17],
+            shifted[eocd + 18],
+            shifted[eocd + 19],
+        ]) + 2;
+        shifted[eocd + 16..eocd + 20].copy_from_slice(&cd_offset.to_le_bytes());
+        let err = walk(&shifted).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("64-byte"), "got: {msg}");
+    }
+
+    #[test]
+    fn rejects_multi_disk_eocd() {
+        // §16.4.1.4: non-zero disk numbers are refused.
+        let mut zip = build_aligned_zip("hello.usda", b"#usda 1.0\n", 64);
+        let eocd = find_eocd(&zip).unwrap();
+        zip[eocd + 4] = 0x01; // disk number = 1
         let err = walk(&zip).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("64-byte aligned"), "got: {msg}");
+        assert!(msg.contains("multi-disk"), "got: {msg}");
+    }
+
+    #[test]
+    fn rejects_disagreeing_entry_counts() {
+        // §16.4.1.4: entries-on-this-disk must equal total entries
+        // (single central directory).
+        let mut zip = build_aligned_zip("hello.usda", b"#usda 1.0\n", 64);
+        let eocd = find_eocd(&zip).unwrap();
+        zip[eocd + 8] = 0x02; // entries on this disk = 2, total = 1
+        let err = walk(&zip).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("counts disagree"), "got: {msg}");
     }
 
     #[test]
@@ -400,7 +490,11 @@ mod tests {
         // must be rejected, not silently returning the short list.
         let mut zip = build_aligned_zip("hello.usda", b"#usda 1.0\n", 64);
         let eocd = find_eocd(&zip).unwrap();
-        // Bump total-entries from 1 to 2.
+        // Bump both entry counts from 1 to 2 (keeping them equal so
+        // the §16.4.1.4 single-central-directory check passes and the
+        // walk-count comparison is what fires).
+        zip[eocd + 8] = 0x02;
+        zip[eocd + 9] = 0x00;
         zip[eocd + 10] = 0x02;
         zip[eocd + 11] = 0x00;
         let err = walk(&zip).unwrap_err();
