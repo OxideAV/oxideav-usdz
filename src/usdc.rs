@@ -4224,35 +4224,30 @@ impl UsdcFile {
     }
 
     /// Decode a [`ValueRegion::CompressedArray`] whose elements are a
-    /// §3b **integer-coded** stream, returning the `count` recovered
-    /// `i32`s.
+    /// §16.3.9.3.1 compressed **integral** stream, returning the
+    /// `count` recovered `i32`s.
     ///
-    /// ## Grounding and the caller's obligation
+    /// ## Layout and the caller's obligation
     ///
-    /// The trace doc §3b documents the compressed-integer encoding —
-    /// the §3a LZ4 wrapper around a `[common-delta preamble][control
-    /// stream][payload]` body — as the form **integer** arrays
-    /// (indices, jumps, counts) take on disk. A compressed *float* /
-    /// *double* / *half* array uses a different element coding the trace
-    /// does not pin, so this method is **only** valid when the rep's
-    /// type code is an integral one. That type code is the deferred
-    /// Round-B fact: this method therefore does not (cannot) assert it
-    /// and the caller must establish integrality before calling. Passing
-    /// a compressed non-integer array yields either a decode error (the
-    /// bytes don't satisfy the §3b control/payload invariant) or
-    /// meaningless integers — never a panic or out-of-bounds read.
-    ///
-    /// This decodes the same §3a → LZ4 → §3b path the section readers
-    /// use ([`decode_int_array`]), reusing [`int_coded_max_len`] as the
-    /// decompression-bomb budget. The compressed region runs from
-    /// `region_offset` to the end of the value region (the `tocOffset`);
-    /// the inner LZ4 block is self-terminating, so the trailing
-    /// value-region bytes after the block are never touched.
+    /// A compressed integral value array is, per §16.3.7.2.3, the
+    /// stream `[u64 compressedSize][§3a chunked-LZ4 block]` whose
+    /// decompressed body is the §3b int-coded array — the size prefix
+    /// sits **inside** the value region right after the array's `u64`
+    /// element count (pinned against the Elephant fixture's compressed
+    /// `int[]` reps, whose regions open with a small LE size word).
+    /// A compressed *float* / *double* / *half* array is a different
+    /// §16.3.9.3.2 coding (a leading `i`/`t` encoding character —
+    /// decoded by `usdc_values`), so this method is **only** valid
+    /// when the rep's [`ValueRep::value_type`] is `int` or `uint`
+    /// (use [`decode_int_array64`] semantics for the 64-bit classes).
+    /// Passing a non-integral compressed array yields a decode error —
+    /// never a panic or out-of-bounds read.
     ///
     /// Errors with [`Error::InvalidData`](crate::Error) if `region` is
     /// not a [`ValueRegion::CompressedArray`], if its declared `count`
-    /// does not fit in `usize`, or if the §3a/§3b decode of the region
-    /// fails (truncated block, control/payload disagreement, …).
+    /// or size prefix does not fit the value region, or if the
+    /// §3a/§3b decode fails (truncated block, control/payload
+    /// disagreement, …).
     pub fn decode_compressed_int_array(
         &self,
         region: ValueRegion<'_>,
@@ -4275,19 +4270,27 @@ impl UsdcFile {
         if count == 0 {
             return Ok(Vec::new());
         }
-        // The compressed buffer begins at `region_offset` and runs to
-        // the end of the value region (the tail TOC). The §3a leading
-        // chunk-count byte + the self-terminating LZ4 block bound the
-        // actual consumption; the slice merely needs to *contain* the
-        // block, so bounding at the TOC offset is safe.
         let toc = usize::try_from(self.bootstrap.toc_offset).unwrap_or(usize::MAX);
         let region_end = toc.min(file_bytes.len());
-        if region_offset >= region_end {
+        // §16.3.7.2.3: the stream opens with its u64 compressedSize.
+        if region_offset + 8 > region_end {
             return Err(invalid(format!(
-                "USDC §4.3 compressed int array: region offset {region_offset:#x} is at or past the value-region end {region_end:#x}",
+                "USDC §4.3 compressed int array: u64 compressedSize prefix at {region_offset:#x} runs past the value-region end {region_end:#x}",
             )));
         }
-        let buffer_bytes = &file_bytes[region_offset..region_end];
+        let csize = read_u64_le(&file_bytes[region_offset..region_offset + 8]);
+        let csize = usize::try_from(csize).map_err(|_| {
+            invalid(format!(
+                "USDC §4.3 compressed int array: compressedSize {csize} does not fit in usize"
+            ))
+        })?;
+        let body_start = region_offset + 8;
+        let body_end = body_start.checked_add(csize).filter(|&e| e <= region_end).ok_or_else(|| {
+            invalid(format!(
+                "USDC §4.3 compressed int array: compressedSize {csize} at {region_offset:#x} runs past the value-region end {region_end:#x}",
+            ))
+        })?;
+        let buffer_bytes = &file_bytes[body_start..body_end];
         let decoded =
             CompressedBuffer::parse(buffer_bytes)?.decompress(int_coded_max_len(count))?;
         decode_int_array(&decoded, count)
@@ -6022,7 +6025,10 @@ mod tests {
         let mut f = vec![0u8; BOOTSTRAP_SIZE];
         let carr_off = f.len();
         f.extend_from_slice(&(elements.len() as u64).to_le_bytes()); // count
-        f.extend_from_slice(&compressed); // §3a/§3b compressed region
+                                                                     // §16.3.7.2.3: the compressed stream opens with its u64
+                                                                     // compressedSize, then the §3a block.
+        f.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
+        f.extend_from_slice(&compressed);
         let toc_off = f.len() as u64;
         f.extend_from_slice(&0u64.to_le_bytes()); // TOC: sectionCount = 0
 
@@ -6191,24 +6197,14 @@ mod tests {
     }
 
     #[test]
-    fn real_fixture_compressed_arrays_are_not_3b_integer_form() {
-        // Grounded observation pinned against real bytes: the Elephant
-        // fixture's compressed-array reps are **not** the §3b
-        // integer-coded form. The trace doc §3b documents §3a/§3b only
-        // for the index tables (TOKENS / FIELDS-names / FIELDSETS /
-        // PATHS / SPECS); the value-region compressed *array* element
-        // coding for float/double/half is a separate encoding the trace
-        // does not pin (it is part of the deferred Round-B type work).
-        //
-        // This test confirms that `decode_compressed_int_array` —
-        // applied (as a caller wrongly might) to these non-integer
-        // compressed reps — **fails cleanly** rather than panicking or
-        // fabricating integers. Each rep's region offset is still inside
-        // the value region (`value_region`'s structural framing holds);
-        // it is only the §3b *element coding* assumption that does not
-        // apply, and the decoder rejects it. This is the empirical
-        // backing for `decode_compressed_int_array`'s documented
-        // caller-obligation: establish integrality before calling.
+    fn real_fixture_compressed_int_arrays_decode_and_float_arrays_refuse() {
+        // §16.3.9.3.1 pinned against real bytes: the Elephant fixture's
+        // compressed `int[]` reps decode through
+        // `decode_compressed_int_array` — the region opens with the
+        // §16.3.7.2.3 `u64 compressedSize` prefix, then the §3a/§3b
+        // stream — while the compressed `float[]` reps (a different
+        // §16.3.9.3.2 coding that opens with an `i`/`t` encoding
+        // character) fail cleanly rather than fabricating integers.
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../docs/3d/usd/fixtures/SoC-ElephantWithMonochord.usdc");
         if !fixture.exists() {
@@ -6224,7 +6220,8 @@ mod tests {
         let reps = sec.decode_value_reps().expect("value-reps decode");
 
         let toc = file.bootstrap.toc_offset as usize;
-        let mut checked = 0usize;
+        let mut ints = 0usize;
+        let mut floats = 0usize;
         for r in &reps {
             if !(r.is_array() && r.is_compressed()) {
                 continue;
@@ -6237,18 +6234,30 @@ mod tests {
                 off >= BOOTSTRAP_SIZE && off < toc,
                 "compressed region offset {off:#x} inside value region",
             );
-            assert!(region.array_count().is_some(), "array count present");
-            // The §3b integer decoder must reject these non-integer
-            // compressed arrays cleanly — never panic, never truncate.
-            assert!(
-                file.decode_compressed_int_array(region, &bytes).is_err(),
-                "non-integer compressed array at {off:#x} must fail decode_compressed_int_array",
-            );
-            checked += 1;
+            let count = region.array_count().expect("array count present") as usize;
+            match r.value_type() {
+                Some(ValueType::Int) => {
+                    let decoded = file
+                        .decode_compressed_int_array(region, &bytes)
+                        .expect("compressed int[] decodes");
+                    assert_eq!(decoded.len(), count, "count recovered exactly");
+                    // Mesh index-style data: all values non-negative.
+                    assert!(decoded.iter().all(|&v| v >= 0), "index-like values");
+                    ints += 1;
+                }
+                Some(ValueType::Float) => {
+                    assert!(
+                        file.decode_compressed_int_array(region, &bytes).is_err(),
+                        "compressed float[] at {off:#x} must refuse the integral decoder",
+                    );
+                    floats += 1;
+                }
+                other => panic!("unexpected compressed array type {other:?}"),
+            }
         }
-        assert!(checked > 0, "fixture has compressed-array reps to check");
+        assert!(ints > 0, "fixture has compressed int[] reps");
+        assert!(floats > 0, "fixture has compressed float[] reps");
     }
-
     #[test]
     fn real_fixture_fields_decode_value_reps_splits_first_words() {
         // Trace doc §4.3 / §5: decode the real Elephant FIELDS reps

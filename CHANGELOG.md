@@ -27,6 +27,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/SoC_ElephantWithMonochord.xformOp:transform`), pairwise
   distinct, parent-closed, and each ending in its spec's leaf token.
 
+- **usdc: §16.3.9/§16.3.10 typed value decoding
+  (`usdc_values::ValueDecoder`) — every Crate field value now decodes
+  to a concrete `usda::Value`.** The decoder implements the spec's
+  value-representation rules end to end: the §16.3.9.1 inlining rules
+  (4-byte payload limit; zero payload = default; direct casts for the
+  one-dimension types; `Vec2h` component packing; the int8 component
+  fallback for wider vectors and the int8 matrix diagonal — pinned by
+  the fixture's `0x01010101` identity matrix4d; `double`-as-`float`,
+  `(u)int64`-as-`(u)int32`, token/string/asset by pool index), offset
+  scalars (double/TimeCode, all dimensioned vec/quat/matrix widths,
+  row-major matrices per §16.3.10.24, imaginary-first quaternion
+  storage re-ordered to the text form's real-first per §16.3.10.22),
+  uncompressed arrays for every Supports-Array type, §16.3.9.3.1
+  compressed integral arrays (`u64 compressedSize` + §3a/§3b stream;
+  32- and 64-bit widths), §16.3.9.3.2 compressed floating-point
+  arrays (both the `i` all-integral coding and the `t` lookup-table
+  coding: `u32 lutCount` + values + int-coded indices), the
+  §16.3.10.26 index vectors (Token/String/Path/Double/LayerOffset),
+  §16.3.10.19 dictionaries (relative-offset members, recursion
+  bounded), §16.3.10.25 list operations (bitmask header + the six
+  ordered sublists mapped onto `usda::ListOp`; only-Make-Explicit =
+  explicit empty list), §16.3.10.30 variant-selection maps,
+  §16.3.10.31 time samples (the double-indirect timecodes DoubleVector
+  + per-sample rep table, offset bases pinned on the fixture's two
+  shared-timeline tracks), §16.3.10.21 references/payloads,
+  §16.3.10.17 indirect values with a recursion guard, §16.3.10.18
+  unregistered values (inner-type restriction enforced), ValueBlock →
+  `Value::None`, and the §16.3.10.27–.29 specifier / permission /
+  variability enums (out-of-range codes refused). Relocates (0.11.0)
+  and Splines (0.12.0) refuse with a precise `Unsupported`. A
+  spec-conventions IEEE-754 half decoder (`half_to_f32`) covers
+  normals, denormals, infinities and NaN. **Fixture proof:** all 157
+  Elephant field reps decode; pinned values include
+  `defaultPrim`/`upAxis` tokens, the inline-60.0 / offset-0.01 layer
+  doubles, `primChildren` TokenVectors, `xformOpOrder` token arrays,
+  inline + offset matrix4d, unit-norm real-first quatf[] rest
+  rotations, prepend-authored `apiSchemas`, absolute-path
+  connection/target list ops, both `i`- and `t`-coded compressed
+  float arrays (values within [0,1]), and the 2540/3023-sample
+  animation tracks. `usda::Value` and `usda::ListOp` now derive
+  `PartialEq` to support value-level assertions.
+
+- **usdc: `decode_compressed_int_array` reads the §16.3.7.2.3
+  `u64 compressedSize` prefix.** The value-region compressed-array
+  stream opens with its size word (right after the element count);
+  the old code treated the size byte as the §3a chunk-count byte,
+  which is why the fixture's compressed `int[]` reps "failed
+  cleanly" — they now decode (element counts recovered exactly), and
+  the fixture test asserts both that and that compressed `float[]`
+  reps still refuse the integral decoder.
+
 - **usdc: the §16.3.10.1 value-type table (`usdc::ValueType`).** The
   AOUSD *USD Core Specification* 1.0.1 (staged in `docs/3d/usd/`)
   publishes the Crate value-type enumeration — IDs 1–59 with their

@@ -262,7 +262,7 @@ pub struct Attr {
 }
 
 /// USDA value variants relevant to the round-1 schema mappings.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     /// Token / identifier without quotes (`"none"` ↔ raw `none`).
     Token(String),
@@ -402,7 +402,7 @@ impl ListEditOp {
 /// operators on the same field (`delete references = @a@` followed by
 /// `prepend references = @b@`) merge losslessly. Entries are stored in
 /// authoring order within each sublist.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ListOp {
     /// `prepend`-authored value (the strongest additive sublist).
     pub prepended: Option<Value>,
