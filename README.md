@@ -26,9 +26,13 @@ let out   = UsdzEncoder::new().encode(&scene)?;
 
 ## Container
 
-- **PKZIP central-directory walk** — STORED-only entries (the USDZ spec
-  rejects any compression method); every payload offset is verified
-  against the 64-byte alignment requirement. **ZIP64 is rejected at the
+- **PKZIP central-directory walk** — STORED-only entries (spec
+  §16.4.1.1 rejects any compression method and any encryption); the
+  §16.4.1.3 64-byte rule is enforced under both its readings (an
+  entry passes when its file *header* or its *payload* sits on the
+  boundary), and the §16.4.1.4 End-of-Central-Directory restrictions
+  are checked — zero disk numbers, a single central directory
+  (agreeing entry counts). **ZIP64 is rejected at the
   boundary** — the EOCD sentinels (`0xFFFF` entry count, `0xFFFFFFFF`
   central-directory size/offset) surface a precise *"USDZ forbids
   ZIP64"* error instead of dereferencing a sentinel as a literal offset,
@@ -149,118 +153,66 @@ order (*prepended* → *explicit* → *appended*) and then removes any
 removal rather than being treated as an add. The writer re-emits each
 authored operator on its own line.
 
-## USDC (binary crate file) — partial reader + structural writer
+## USDC (binary crate file) — full reader + structural writer
 
-A clean-room USDC reader is in progress, with a matching **structural
-writer** (`usdc_writer::CrateImage`). Implemented so far:
+A clean-room Crate reader implemented from the AOUSD *USD Core
+Specification* 1.0.1 §16.3 (staged in `docs/3d/usd/`), cross-checked
+against a committed real-production fixture. **A `.usdz` whose default
+layer is a `.usdc` now decodes end-to-end to a `Scene3D`**, and a
+generic `.usd` layer dispatches on its header byte run (§16.1:
+`PXR-USDC` magic = Crate, `#usda` banner = text).
 
-- The §1 version-compatibility dispatch gate (`usdc::Version` with a
-  reader-max ceiling; files newer than the ceiling are refused up front).
-- The TOC and the outer framing of all six standard sections — TOKENS,
-  STRINGS, FIELDS, FIELDSETS, PATHS, SPECS — with typed section accessors
-  and canonical-order predicates.
-- The §3a compressed-buffer framing with the public LZ4 block decode,
-  and the §3b compressed-integer decoder including the 4-byte
-  common-delta preamble. The int-coded decoder enforces the §3b
-  "zero leftover bytes" invariant: a buffer whose control stream and
-  payload disagree on the array's byte length (trailing unconsumed
-  payload after the last element) is rejected rather than silently
-  truncated.
-- End-to-end section-content decode chaining §3a → LZ4 → §3b: the TOKENS
-  atom pool, the FIELDS `(nameIndex, valueRep)` pairs, the FIELDSETS flat
-  index array, and the three PATHS buffers — each decoding exactly on the
-  committed Elephant fixture (192 tokens, 157 fields, 576 field-set
-  indices, 248 paths). Each FIELDS value-rep word is split into a typed
-  `ValueRep` — the high-16-bit type-code + flags word and the low-48-bit
-  inline-or-offset payload (lossless: `ValueRep::raw()` rebuilds the
-  original `u64`). The flag bits are **observer-grounded from the fixture
-  bytes**: `is_array` (bit 63), `is_inline` (bit 62) and `is_compressed`
-  (bit 61) — across all 157 Elephant reps the flag byte only ever takes
-  `0x00/0x40/0x80/0xa0`, array and inline are mutually exclusive, and
-  compressed only rides on array. `UsdcFile::value_region` then resolves
-  a rep to its on-disk value: an inline payload (bit-cast via
-  `as_f32`/`as_i32`/`as_u32`/`as_bool`), a `[u64 count][elements]`
-  uncompressed array (`array_elements_exact(width)` trims to
-  `count × width`), a compressed-array `(count, offset)`, or a scalar
-  offset — all bounds-checked against the value region `[0x58,
-  toc_offset)`. The fixture's inline `0x4009` rep decodes to the `float`
-  `60.0` and its `0x0f` `double[]` array reads back with `1.0` as element
-  0. For the **integer** compressed-array class,
-  `UsdcFile::decode_compressed_int_array` runs the documented §3a → LZ4 →
-  §3b path on the compressed region (bounded by `int_coded_max_len`) and
-  returns the `count` recovered `i32`s; `ValueRegion::array_count` /
-  `compressed_region_offset` expose the array shape uniformly. The
-  compressed float/double/half element coding is a *separate* (deferred)
-  encoding — a real-fixture test pins that the Elephant's compressed
-  arrays are not the §3b integer form, and `decode_compressed_int_array`
-  fails cleanly on them rather than fabricating integers (the caller must
-  establish integrality first). Only the *naming* of the raw
-  `type_code()` byte (which code is `float`, which is `int[]`) stays
-  deferred — that enumeration is GAP-TRACKER Round B.
-- The STRINGS → TOKENS and field-name TOKENS pool resolution and the
-  full §5 SPECS → FIELDSETS → FIELDS join (`decode_specs` /
-  `decode_named_specs`), which materialises all 248 Elephant spec rows
-  with their field names resolved to strings. Each spec row's `pathIndex`
-  is bounds-checked against the §4.5 PATHS `numPaths`, so a corrupt
-  path-index column referencing a non-existent namespace path is rejected
-  rather than producing a dangling `SdfPath` reference.
-- The §4.5 PATHS structural join (`decode_path_elements`) — the three
-  parallel buffers are joined into one typed `PathElement` per tree-walk
-  slot. Parsing the fixture bytes pins the per-element buffer roles
-  tighter than the trace doc's column header: buffer 1 is the
-  **target-slot permutation** (an exact permutation of `0..numPaths`),
-  buffer 2 is the **element-token word** whose `abs(word) >> 1` is an
-  in-range §4.1 TOKENS index for all 248 elements (resolving to `Xform` /
-  `Material` / `xformOp:transform` / … via `element_token`), and buffer 3
-  is the **jump** offset. The element-token sign + low bit and the
-  jump-walk are preserved verbatim and left to the deferred tree
-  reconstruction below.
-- The §4.5↔§4.6 PATHS↔SPECS join naming each spec's leaf component.
-  `decode_path_elements_by_slot` puts the path elements into
-  `target_index` order (the index space a SPECS `path_index` addresses,
-  validated as a permutation), and `decode_spec_leaf_names` joins the
-  SPECS table to it so each spec row gets its own path-component token
-  (the pseudo-root spec carries the stage metadata, prim specs get their
-  type/name token — `Xform` / `Materials` / …). This names *what each
-  spec is*; the full ancestor `SdfPath` still needs the deferred
-  jump-walk.
-- **Structural writer** — `usdc_writer::CrateImage` is the inverse of
-  the reader at the documented structural layer. `from_bytes` /
-  `from_file` decode a `.usdc` into a content image (the six sections'
-  decoded arrays); `to_bytes` re-emits the bootstrap, the six section
-  payloads in canonical order, and the tail TOC, using the §3a
-  single-chunk LZ4 framing and §3b integer coding. The committed
-  Elephant fixture round-trips structurally (all 192 tokens / 157
-  fields / 576 field-set indices / 248 paths / 248 specs reproduced),
-  and supports **read-modify-write**: load, intern tokens / `add_field`
-  authored properties, and re-emit a valid file. The §4.3 value-rep
-  words ride through opaque (the type-code enumeration is not staged),
-  so authored values are preserved losslessly rather than interpreted.
-  The public §3a/§3b encoders (`encode_compressed_buffer`,
-  `encode_int_coded`) are the byte-exact inverses of the read path.
+- **Preamble + sections** — bootstrap, version gate (reader ceiling
+  Crate 0.10.0 per the §16.3.8.2 version table; 0.11 Relocates /
+  0.12 Splines refuse up front), the tail TOC, and all six standard
+  sections (TOKENS, STRINGS, FIELDS, FIELDSETS, PATHS, SPECS) with
+  the §16.3.7 compression stack: chunked LZ4 buffers and the
+  compressed-integer coding (2-bit control stream + common-delta
+  preamble, 32- and 64-bit widths, difference model per the spec's
+  worked example — which is carried verbatim as a test).
+- **Paths** — the §16.3.8.4.5.4 path-construction algorithm rebuilds
+  every `SdfPath` from the three parallel PATHS arrays (jump codes
+  `-2` leaf / `-1` child / `0` sibling / positive child+sibling; the
+  element-token sign selects the prim `/` vs property `.` delimiter),
+  with corruption guards for cycles, out-of-table jumps, and
+  duplicate/unfilled slots.
+- **Typed values** — `usdc::ValueType` carries the §16.3.10.1 type
+  table (IDs 1–59, per-type Supports-Array), and
+  `usdc_values::ValueDecoder` resolves any value representation to a
+  concrete `usda::Value`: the §16.3.9.1 inlining rules (4-byte
+  payload limit, int8 vector/matrix-diagonal packing,
+  `double`-as-`float`, pool-index token/string/asset), offset
+  scalars for every dimensioned width (row-major matrices,
+  imaginary-first quaternions re-ordered to the text form's
+  real-first), uncompressed arrays, compressed integral arrays, the
+  §16.3.9.3.2 compressed floating-point codings (`i` all-integral
+  and `t` lookup-table), index vectors, dictionaries, the
+  six-sublist list operations, variant-selection maps, time samples,
+  references/payloads, recursion-guarded indirect values, and the
+  specifier / permission / variability enums. On the committed
+  fixture **all 157 field values decode**, pinned down to exact
+  layer metadata, mesh arrays, and 3023-sample animation tracks.
+- **Scene bridge** — `usdc_layer::layer_from_usdc` materialises the
+  §16.3.8.4.6 spec table (path + form + field set) into the same
+  `usda::Layer` prim-tree model the text parser produces: prim specs
+  with specifier / typeName / `primChildren` ordering, attribute
+  specs with their `custom` / `uniform` spelling plus
+  `.timeSamples` / `.connect` companion statements, relationship
+  specs as `rel` statements. The existing `usd_to_scene` pipeline
+  then builds the typed scene — the fixture yields its full
+  UsdPreviewSurface networks, skinned meshes, 27-joint skeleton,
+  sampled animation, and spatial audio, `Scene3D::validate()`-clean.
+- **Structural writer** — `usdc_writer::CrateImage` re-emits a
+  parsed `.usdc` (bootstrap, six section payloads in canonical
+  order, tail TOC) byte-exactly on the committed fixture, and
+  supports read-modify-write (token interning + field authoring).
+  Value reps ride through the writer losslessly as raw words — a
+  typed value *writer* is not implemented yet.
 
-Not yet implemented (so USDC files do not fully decode to a scene yet):
-
-- **FIELDS value-rep type-code naming** — the value-rep word's flag
-  bits (array / inline / compressed) and its on-disk value region (inline
-  payload, uncompressed/compressed array, scalar offset) are now decoded,
-  so a caller that knows an element is a 4-byte `float` can read it. What
-  remains is the **mapping from the raw `type_code()` byte to a named USD
-  value type** (`0x09` → `float`, `0x0f` → `double`, `0x29` → `int[]`,
-  …). That enumeration lives only in the off-limits reference-implementation source and is
-  not yet staged in `docs/3d/usd/` — GAP-TRACKER Round B. Without it the
-  reader cannot auto-select element widths or build a typed scene from a
-  `.usdc` value section.
-- **PATHS namespace-tree reconstruction** — the three parallel buffers
-  now decode to a typed `PathElement` join (target-slot permutation,
-  element-token index + name, raw element-token word, jump), but the
-  **jump-walk** that turns those triples into full `SdfPath` strings is
-  not yet documented: how the absolute root is seeded, what the `jump`
-  sign cases (`-1` / `-2` / `0` / positive) mean for has-child /
-  has-sibling descent, and what the element-token sign + low bit
-  distinguish are not pinned by the staged trace (GAP-TRACKER §1 /
-  Round B). The decode stops at the verified parallel-array join so no
-  un-grounded path string is fabricated.
+Not yet implemented on the Crate path: variant / variant-set spec
+forms (10/11) refuse precisely rather than bridging into the text
+model's `variantSet` blocks; `Relocates` (0.11) / `Splines` (0.12) /
+`UnregisteredValueListOp` payloads refuse with precise messages.
 
 ## Not yet supported
 
