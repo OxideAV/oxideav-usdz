@@ -1973,10 +1973,10 @@ impl ValueRep {
 
     /// The raw **type-code byte** (low 8 bits of `type_and_flags`).
     ///
-    /// Surfaced as an opaque code: the mapping from this byte to a
-    /// named USD value type (`float`, `int`, `token[]`, …) is the
-    /// deferred fact-table extraction (GAP-TRACKER Round B). Two reps
-    /// with the same `type_code` but different flag bits are the
+    /// The mapping from this byte to a named USD value type is the
+    /// AOUSD Core Specification §16.3.10.1 type table — resolve it
+    /// with [`ValueRep::value_type`] / [`ValueType::from_id`]. Two
+    /// reps with the same `type_code` but different flag bits are the
     /// scalar/array (or inline/offset) forms of the *same* underlying
     /// type.
     #[inline]
@@ -2014,6 +2014,348 @@ impl ValueRep {
     #[inline]
     pub fn is_compressed(self) -> bool {
         self.type_and_flags & Self::FLAG_COMPRESSED != 0
+    }
+
+    /// Resolve the rep's raw [`type_code`](Self::type_code) byte to
+    /// its named USD value type per the AOUSD Core Specification
+    /// §16.3.10.1 type table. `None` when the byte is not one of the
+    /// 59 published IDs (an unknown / future type — per the spec's
+    /// forward-compatibility posture the caller should treat the
+    /// value as opaque rather than failing the whole file).
+    #[inline]
+    pub fn value_type(self) -> Option<ValueType> {
+        ValueType::from_id(self.type_code())
+    }
+}
+
+/// The named USD value types of the Crate format, per the AOUSD
+/// *USD Core Specification* 1.0.1 §16.3.10.1 type table (IDs 1–59).
+///
+/// The discriminant of each variant **is** its on-disk type-code
+/// byte — the penultimate byte of a §16.3.9 value-representation
+/// word ([`ValueRep::type_code`]). This table closes what the gap
+/// tracker used to call the "Round B" blocker: the enumeration is
+/// published spec text, so no observer extraction is needed.
+///
+/// Cross-checked against the committed Elephant fixture: every one
+/// of its 157 field reps carries a type code in this table, and the
+/// decoded values are shape-consistent with the named type (e.g.
+/// the `0x0f` = `matrix4d` reps resolve to 16-double regions whose
+/// first element is the identity diagonal's `1.0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum ValueType {
+    /// 8-bit boolean; non-zero is `true` (§16.3.10.2).
+    Bool = 1,
+    /// Unsigned 8-bit character (§16.3.10.3).
+    Uchar = 2,
+    /// Signed 32-bit integer (§16.3.10.4).
+    Int = 3,
+    /// Unsigned 32-bit integer (§16.3.10.5).
+    Uint = 4,
+    /// Signed 64-bit integer; inlined as `int` (§16.3.10.6).
+    Int64 = 5,
+    /// Unsigned 64-bit integer; inlined as `uint` (§16.3.10.7).
+    Uint64 = 6,
+    /// IEEE-754 half-precision float (§16.3.10.8).
+    Half = 7,
+    /// IEEE-754 single-precision float (§16.3.10.9).
+    Float = 8,
+    /// IEEE-754 double-precision float; inlined as `float`
+    /// (§16.3.10.10).
+    Double = 9,
+    /// String, stored as an Index into the STRINGS section
+    /// (§16.3.10.11).
+    String = 10,
+    /// Token, stored as an Index into the TOKENS section
+    /// (§16.3.10.12).
+    Token = 11,
+    /// Asset path — an Index into STRINGS, or (inlined) into TOKENS
+    /// (§16.3.10.13).
+    Asset = 12,
+    /// 2×2 double matrix, row-major (§16.3.10.24).
+    Matrix2d = 13,
+    /// 3×3 double matrix, row-major (§16.3.10.24).
+    Matrix3d = 14,
+    /// 4×4 double matrix, row-major (§16.3.10.24).
+    Matrix4d = 15,
+    /// Double quaternion — imaginary ×3 then real (§16.3.10.22).
+    Quatd = 16,
+    /// Float quaternion — imaginary ×3 then real (§16.3.10.22).
+    Quatf = 17,
+    /// Half quaternion — imaginary ×3 then real (§16.3.10.22).
+    Quath = 18,
+    /// Two contiguous doubles (§16.3.10.23).
+    Double2 = 19,
+    /// Two contiguous floats (§16.3.10.23).
+    Float2 = 20,
+    /// Two contiguous halves (§16.3.10.23).
+    Half2 = 21,
+    /// Two contiguous ints (§16.3.10.23).
+    Int2 = 22,
+    /// Three contiguous doubles (§16.3.10.23).
+    Double3 = 23,
+    /// Three contiguous floats (§16.3.10.23).
+    Float3 = 24,
+    /// Three contiguous halves (§16.3.10.23).
+    Half3 = 25,
+    /// Three contiguous ints (§16.3.10.23).
+    Int3 = 26,
+    /// Four contiguous doubles (§16.3.10.23).
+    Double4 = 27,
+    /// Four contiguous floats (§16.3.10.23).
+    Float4 = 28,
+    /// Four contiguous halves (§16.3.10.23).
+    Half4 = 29,
+    /// Four contiguous ints (§16.3.10.23).
+    Int4 = 30,
+    /// Token-keyed dictionary (§16.3.10.19).
+    Dictionary = 31,
+    /// List operation over Token Indices (§16.3.10.25).
+    TokenListOp = 32,
+    /// List operation over String Indices (§16.3.10.25).
+    StringListOp = 33,
+    /// List operation over Path Indices (§16.3.10.25).
+    PathListOp = 34,
+    /// List operation over References (§16.3.10.25).
+    ReferenceListOp = 35,
+    /// List operation over ints (§16.3.10.25).
+    IntListOp = 36,
+    /// List operation over int64s (§16.3.10.25).
+    Int64ListOp = 37,
+    /// List operation over uints (§16.3.10.25).
+    UIntListOp = 38,
+    /// List operation over uint64s (§16.3.10.25).
+    UInt64ListOp = 39,
+    /// Variable-length vector of Path Indices (§16.3.10.26).
+    PathVector = 40,
+    /// Variable-length vector of Token Indices (§16.3.10.26).
+    TokenVector = 41,
+    /// Prim specifier — def / over / class (§16.3.10.27).
+    Specifier = 42,
+    /// Deprecated permission enum (§16.3.10.28).
+    Permission = 43,
+    /// Attribute variability — varying / uniform (§16.3.10.29).
+    Variability = 44,
+    /// Variant-set → variant selection map (§16.3.10.30).
+    VariantSelectionMap = 45,
+    /// Time-sampled value series (§16.3.10.31).
+    TimeSamples = 46,
+    /// Payload composition-arc value (§16.3.10.21).
+    Payload = 47,
+    /// Variable-length vector of doubles (§16.3.10.26).
+    DoubleVector = 48,
+    /// Variable-length vector of Layer Offsets (§16.3.10.26).
+    LayerOffsetVector = 49,
+    /// Variable-length vector of String Indices (§16.3.10.26).
+    StringVector = 50,
+    /// Authored-but-blocked value sentinel; no data bytes
+    /// (§16.3.10.16).
+    ValueBlock = 51,
+    /// Indirect pointer to another value representation
+    /// (§16.3.10.17).
+    Value = 52,
+    /// Unregistered metadata value (§16.3.10.18).
+    UnregisteredValue = 53,
+    /// List operation over unregistered values (§16.3.10.25).
+    UnregisteredValueOp = 54,
+    /// List operation over Payloads (§16.3.10.25).
+    PayloadListOp = 55,
+    /// TimeCode — same representation as Double; Crate ≥ 0.9.0
+    /// (§16.3.10.32).
+    TimeCode = 56,
+    /// Path expression — same representation as an asset path;
+    /// Crate ≥ 0.10.0 (§16.3.10.14).
+    PathExpression = 57,
+    /// Relocates map — path-index pairs; Crate ≥ 0.11.0
+    /// (§16.3.10.15).
+    Relocates = 58,
+    /// Spline curve data; Crate ≥ 0.12.0 (§16.3.10.33).
+    Splines = 59,
+}
+
+impl ValueType {
+    /// Map an on-disk type-code byte to its named type. `None` for
+    /// `0` and for any ID above 59 (unknown / future types).
+    pub fn from_id(id: u8) -> Option<Self> {
+        use ValueType::*;
+        Some(match id {
+            1 => Bool,
+            2 => Uchar,
+            3 => Int,
+            4 => Uint,
+            5 => Int64,
+            6 => Uint64,
+            7 => Half,
+            8 => Float,
+            9 => Double,
+            10 => String,
+            11 => Token,
+            12 => Asset,
+            13 => Matrix2d,
+            14 => Matrix3d,
+            15 => Matrix4d,
+            16 => Quatd,
+            17 => Quatf,
+            18 => Quath,
+            19 => Double2,
+            20 => Float2,
+            21 => Half2,
+            22 => Int2,
+            23 => Double3,
+            24 => Float3,
+            25 => Half3,
+            26 => Int3,
+            27 => Double4,
+            28 => Float4,
+            29 => Half4,
+            30 => Int4,
+            31 => Dictionary,
+            32 => TokenListOp,
+            33 => StringListOp,
+            34 => PathListOp,
+            35 => ReferenceListOp,
+            36 => IntListOp,
+            37 => Int64ListOp,
+            38 => UIntListOp,
+            39 => UInt64ListOp,
+            40 => PathVector,
+            41 => TokenVector,
+            42 => Specifier,
+            43 => Permission,
+            44 => Variability,
+            45 => VariantSelectionMap,
+            46 => TimeSamples,
+            47 => Payload,
+            48 => DoubleVector,
+            49 => LayerOffsetVector,
+            50 => StringVector,
+            51 => ValueBlock,
+            52 => Value,
+            53 => UnregisteredValue,
+            54 => UnregisteredValueOp,
+            55 => PayloadListOp,
+            56 => TimeCode,
+            57 => PathExpression,
+            58 => Relocates,
+            59 => Splines,
+            _ => return None,
+        })
+    }
+
+    /// The on-disk type-code byte for this type (the table's ID
+    /// column). Exact inverse of [`ValueType::from_id`].
+    #[inline]
+    pub fn id(self) -> u8 {
+        self as u8
+    }
+
+    /// Whether the §16.3.10.1 table's *Supports Array* column is
+    /// "Yes" for this type — i.e. whether a conforming rep may carry
+    /// the array flag with this type code.
+    pub fn supports_array(self) -> bool {
+        use ValueType::*;
+        matches!(
+            self,
+            Bool | Uchar
+                | Int
+                | Uint
+                | Int64
+                | Uint64
+                | Half
+                | Float
+                | Double
+                | String
+                | Token
+                | Asset
+                | Matrix2d
+                | Matrix3d
+                | Matrix4d
+                | Quatd
+                | Quatf
+                | Quath
+                | Double2
+                | Float2
+                | Half2
+                | Int2
+                | Double3
+                | Float3
+                | Half3
+                | Int3
+                | Double4
+                | Float4
+                | Half4
+                | Int4
+                | TimeCode
+                | PathExpression
+        )
+    }
+
+    /// The spec name of the type as spelled in the §16.3.10.1 table
+    /// (also the USDA type-token spelling for the plain value types).
+    pub fn name(self) -> &'static str {
+        use ValueType::*;
+        match self {
+            Bool => "bool",
+            Uchar => "uchar",
+            Int => "int",
+            Uint => "uint",
+            Int64 => "int64",
+            Uint64 => "uint64",
+            Half => "half",
+            Float => "float",
+            Double => "double",
+            String => "string",
+            Token => "token",
+            Asset => "asset",
+            Matrix2d => "matrix2d",
+            Matrix3d => "matrix3d",
+            Matrix4d => "matrix4d",
+            Quatd => "quatd",
+            Quatf => "quatf",
+            Quath => "quath",
+            Double2 => "double2",
+            Float2 => "float2",
+            Half2 => "half2",
+            Int2 => "int2",
+            Double3 => "double3",
+            Float3 => "float3",
+            Half3 => "half3",
+            Int3 => "int3",
+            Double4 => "double4",
+            Float4 => "float4",
+            Half4 => "half4",
+            Int4 => "int4",
+            Dictionary => "dictionary",
+            TokenListOp => "TokenListOp",
+            StringListOp => "StringListOp",
+            PathListOp => "PathListOp",
+            ReferenceListOp => "ReferenceListOp",
+            IntListOp => "IntListOp",
+            Int64ListOp => "Int64ListOp",
+            UIntListOp => "UIntListOp",
+            UInt64ListOp => "UInt64ListOp",
+            PathVector => "PathVector",
+            TokenVector => "TokenVector",
+            Specifier => "Specifier",
+            Permission => "Permission",
+            Variability => "Variability",
+            VariantSelectionMap => "VariantSelectionMap",
+            TimeSamples => "TimeSamples",
+            Payload => "Payload",
+            DoubleVector => "DoubleVector",
+            LayerOffsetVector => "LayerOffsetVector",
+            StringVector => "StringVector",
+            ValueBlock => "ValueBlock",
+            Value => "Value",
+            UnregisteredValue => "UnregisteredValue",
+            UnregisteredValueOp => "UnregisteredValueOp",
+            PayloadListOp => "PayloadListOp",
+            TimeCode => "TimeCode",
+            PathExpression => "PathExpression",
+            Relocates => "Relocates",
+            Splines => "Splines",
+        }
     }
 }
 
@@ -5466,24 +5808,29 @@ mod tests {
         let region = file.value_region(reps[2], &bytes).expect("resolve");
         assert_eq!(region.as_f32(), Some(60.0), "rep[2] inline float");
 
-        // At least one uncompressed array decodes as 8-byte doubles
-        // (tc=0x0f) whose first element is 1.0 (0x3ff0000000000000).
-        let mut saw_double_one = false;
+        // At least one uncompressed array decodes as matrix4d elements
+        // (tc=0x0f per the §16.3.10.1 table, 16 doubles = 128 bytes
+        // each) whose leading double is 1.0 — the row-major identity
+        // matrix's top-left element (§16.3.10.24).
+        let mut saw_identity_lead = false;
         for r in &reps {
-            if r.type_code() == 0x0f && r.is_array() && !r.is_compressed() {
+            if r.value_type() == Some(ValueType::Matrix4d) && r.is_array() && !r.is_compressed() {
                 let region = file.value_region(*r, &bytes).expect("resolve");
                 if let ValueRegion::Array { count, .. } = region {
-                    if let Some(elems) = region.array_elements_exact(8) {
-                        assert_eq!(elems.len() as u64, count * 8);
+                    if let Some(elems) = region.array_elements_exact(128) {
+                        assert_eq!(elems.len() as u64, count * 128);
                         let first = f64::from_le_bytes(elems[0..8].try_into().unwrap());
                         if first == 1.0 {
-                            saw_double_one = true;
+                            saw_identity_lead = true;
                         }
                     }
                 }
             }
         }
-        assert!(saw_double_one, "a 0x0f double[] array starts with 1.0");
+        assert!(
+            saw_identity_lead,
+            "a matrix4d[] array should lead with the identity 1.0"
+        );
     }
 
     #[test]
@@ -7551,6 +7898,126 @@ mod tests {
         assert!(
             resolved.is_empty(),
             "trace doc §4.2 records Elephant STRINGS count = 0"
+        );
+    }
+
+    // ---- §16.3.10.1 value-type table ------------------------------
+
+    #[test]
+    fn value_type_table_round_trips_all_ids() {
+        // Every ID 1..=59 resolves, and `id()` is the exact inverse.
+        for id in 1u8..=59 {
+            let vt = ValueType::from_id(id)
+                .unwrap_or_else(|| panic!("ID {id} must be in the §16.3.10.1 table"));
+            assert_eq!(vt.id(), id, "id() must invert from_id()");
+            assert!(!vt.name().is_empty());
+        }
+        // 0 and IDs above the table are unknown.
+        assert_eq!(ValueType::from_id(0), None);
+        assert_eq!(ValueType::from_id(60), None);
+        assert_eq!(ValueType::from_id(255), None);
+    }
+
+    #[test]
+    fn value_type_supports_array_matches_table() {
+        // §16.3.10.1: IDs 1..=30 all support arrays; of the rest only
+        // TimeCode (56) and PathExpression (57) do.
+        for id in 1u8..=59 {
+            let vt = ValueType::from_id(id).unwrap();
+            let expect = (1..=30).contains(&id) || id == 56 || id == 57;
+            assert_eq!(
+                vt.supports_array(),
+                expect,
+                "supports-array mismatch for ID {id} ({})",
+                vt.name()
+            );
+        }
+    }
+
+    #[test]
+    fn value_rep_value_type_resolves_spec_examples() {
+        // §16.3.9 worked shapes: type byte 0x09 = double, 0x0f = matrix4d,
+        // 0x0b = token, 0x2a = Specifier, 0x2c = Variability.
+        // The Elephant's framesPerSecond rep: flags 0x40 (inline),
+        // type 0x09 (double), payload the f32 bits of 60.0.
+        let rep = ValueRep::from_raw(0x4009_0000_4270_0000);
+        assert_eq!(rep.value_type(), Some(ValueType::Double));
+        assert_eq!(rep.payload, 0x4270_0000);
+        assert_eq!(
+            ValueRep::from_raw(0x800f_0000_0000_1000).value_type(),
+            Some(ValueType::Matrix4d)
+        );
+        assert_eq!(
+            ValueRep::from_raw(0x402a_0000_0000_0000).value_type(),
+            Some(ValueType::Specifier)
+        );
+        assert_eq!(
+            ValueRep::from_raw(0x402c_0000_0000_0000).value_type(),
+            Some(ValueType::Variability)
+        );
+        // An out-of-table byte resolves to None, not an error.
+        assert_eq!(ValueRep::from_raw(0x40ff_0000_0000_0000).value_type(), None);
+    }
+
+    #[test]
+    fn real_fixture_all_reps_have_table_types() {
+        // Every one of the Elephant fixture's 157 field reps must carry
+        // a §16.3.10.1 type code, each array-flagged rep must use a
+        // type whose Supports-Array column is Yes, and the set of
+        // types present must match the empirically pinned roster.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/3d/usd/fixtures/SoC-ElephantWithMonochord.usdc");
+        if !fixture.exists() {
+            eprintln!("skip: fixture {fixture:?} not present");
+            return;
+        }
+        let bytes = std::fs::read(&fixture).expect("read fixture");
+        let file = UsdcFile::parse(&bytes).expect("parse Elephant USDC");
+        let section = file
+            .section_bytes(SectionName::Fields, &bytes)
+            .expect("FIELDS section");
+        let fields = FieldsSection::parse(section).expect("parse FIELDS");
+        let reps = fields.decode_value_reps().expect("decode reps");
+        assert_eq!(reps.len(), 157);
+        let mut seen = std::collections::BTreeSet::new();
+        for rep in &reps {
+            let vt = rep.value_type().unwrap_or_else(|| {
+                panic!("type code {:#04x} not in §16.3.10.1 table", rep.type_code())
+            });
+            if rep.is_array() {
+                assert!(
+                    vt.supports_array(),
+                    "array rep with non-array type {}",
+                    vt.name()
+                );
+            }
+            seen.insert(vt);
+        }
+        use ValueType::*;
+        let expected = [
+            Bool,
+            Int,
+            Float,
+            Double,
+            Token,
+            Asset,
+            Matrix4d,
+            Quatf,
+            Float2,
+            Float3,
+            Half3,
+            Float4,
+            TokenListOp,
+            PathListOp,
+            TokenVector,
+            Specifier,
+            Variability,
+            TimeSamples,
+        ];
+        assert_eq!(
+            seen,
+            expected.iter().copied().collect(),
+            "the fixture's empirical type roster changed"
         );
     }
 }

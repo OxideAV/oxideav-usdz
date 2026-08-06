@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **usdc: the §16.3.10.1 value-type table (`usdc::ValueType`).** The
+  AOUSD *USD Core Specification* 1.0.1 (staged in `docs/3d/usd/`)
+  publishes the Crate value-type enumeration — IDs 1–59 with their
+  per-type *Supports Array* column — closing what the gap tracker
+  called the "Round B" blocker. `ValueType` carries the table verbatim
+  (discriminant = on-disk type-code byte), with `from_id` / `id` /
+  `name` / `supports_array`, and `ValueRep::value_type()` resolves a
+  rep's raw `type_code()` byte to the named type (unknown / future IDs
+  resolve to `None` rather than failing the file). Cross-checked
+  against the committed Elephant fixture: all 157 field reps resolve,
+  every array-flagged rep uses a Supports-Array type, and the
+  fixture's empirical type roster (bool / int / float / double /
+  token / asset / matrix4d / quatf / float2 / float3 / half3 /
+  float4 / TokenListOp / PathListOp / TokenVector / Specifier /
+  Variability / TimeSamples) is pinned by test. The previously
+  observer-guessed "`0x0f` = `double[]`" reading is corrected: `0x0f`
+  is **matrix4d** (its first element still reads `1.0` — the identity
+  diagonal).
+
 ### Changed
 
 - **`UsdPreviewSurface` extras shims migrated onto the typed
