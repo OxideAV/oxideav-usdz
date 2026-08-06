@@ -849,8 +849,12 @@ fn read_attr_name(t: &mut Tokenizer<'_>) -> Result<String> {
     Ok(s)
 }
 
-/// Read a `"..."`-quoted string with backslash escapes. Triple
-/// `"""..."""` strings are also handled (USD permits them).
+/// Read a quoted string with backslash escapes — the §16.2.5 String
+/// production: single- or double-quoted, in the single-line
+/// (`'...'` / `"..."`) or multi-line triple-quoted
+/// (`\'\'\'...\'\'\'` / `"""..."""`) forms, with the `Escaped`
+/// rule (`\a \b \f \n \r \t \v \' \" \xHH \ooo`) applied
+/// in both forms.
 fn read_quoted_string(t: &mut Tokenizer<'_>) -> Result<String> {
     let quote = t
         .peek_char()
@@ -876,6 +880,14 @@ fn read_quoted_string(t: &mut Tokenizer<'_>) -> Result<String> {
                 t.advance();
                 return Ok(s);
             }
+            // §16.2.5 MultilineContents: the `Escaped` rule applies
+            // inside triple-quoted strings exactly as in single-line
+            // ones (only the quote-termination rule differs).
+            if t.peek_char() == Some('\\') {
+                t.advance();
+                read_string_escape(t, &mut s)?;
+                continue;
+            }
             s.push(t.advance().unwrap());
         }
     }
@@ -887,22 +899,79 @@ fn read_quoted_string(t: &mut Tokenizer<'_>) -> Result<String> {
         }
         if c == '\\' {
             t.advance();
-            match t.advance() {
-                Some('n') => s.push('\n'),
-                Some('t') => s.push('\t'),
-                Some('r') => s.push('\r'),
-                Some('"') => s.push('"'),
-                Some('\'') => s.push('\''),
-                Some('\\') => s.push('\\'),
-                Some(c2) => s.push(c2),
-                None => return Err(invalid("EOF after `\\` escape in string")),
-            }
+            read_string_escape(t, &mut s)?;
             continue;
         }
         s.push(c);
         t.advance();
     }
     Err(invalid("EOF inside quoted string"))
+}
+
+/// Consume one §16.2.5 `Escaped` production (the backslash has
+/// already been consumed) and push the decoded character onto `s`.
+///
+/// Handles the full escape set — `\a \b \f \n \r \t \v`, the
+/// quote characters, `\xH` / `\xHH` hex escapes, and 1–3-digit
+/// octal escapes — plus `\\` and a lenient fallback that keeps an
+/// unrecognised escaped character verbatim (reading out-of-spec
+/// content is permitted; the writer only emits the defined set).
+fn read_string_escape(t: &mut Tokenizer<'_>, s: &mut String) -> Result<()> {
+    let Some(c) = t.advance() else {
+        return Err(invalid("EOF after `\\` escape in string"));
+    };
+    match c {
+        'a' => s.push('\x07'),
+        'b' => s.push('\x08'),
+        'f' => s.push('\x0C'),
+        'n' => s.push('\n'),
+        'r' => s.push('\r'),
+        't' => s.push('\t'),
+        'v' => s.push('\x0B'),
+        '"' => s.push('"'),
+        '\'' => s.push('\''),
+        '\\' => s.push('\\'),
+        'x' => {
+            // EscapeHex <- 'x' HexDigit (HexDigit)?
+            let mut value: u32 = 0;
+            let mut digits = 0;
+            while digits < 2 {
+                match t.peek_char().and_then(|h| h.to_digit(16)) {
+                    Some(d) => {
+                        value = value * 16 + d;
+                        t.advance();
+                        digits += 1;
+                    }
+                    None => break,
+                }
+            }
+            if digits == 0 {
+                return Err(invalid(format!(
+                    "`\\x` escape without a hex digit at {}",
+                    t.pos_display()
+                )));
+            }
+            s.push(char::from_u32(value).expect("<= 0xFF is a valid code point"));
+        }
+        d if d.is_digit(8) => {
+            // EscapeOct <- OctDigit (OctDigit (OctDigit)?)?
+            let mut value: u32 = d.to_digit(8).unwrap();
+            let mut digits = 1;
+            while digits < 3 {
+                match t.peek_char().and_then(|o| o.to_digit(8)) {
+                    Some(od) => {
+                        value = value * 8 + od;
+                        t.advance();
+                        digits += 1;
+                    }
+                    None => break,
+                }
+            }
+            s.push(char::from_u32(value).expect("<= 0o777 is a valid code point"));
+        }
+        other => s.push(other),
+    }
+    Ok(())
 }
 
 /// Read an `@asset_path@` or `@@@asset_path@@@` reference.
@@ -1018,6 +1087,24 @@ fn read_number(t: &mut Tokenizer<'_>) -> Result<Value> {
     if matches!(t.peek_char(), Some('+' | '-')) {
         s.push(t.advance().unwrap());
     }
+    // §16.2.5 Number: `inf` (optionally signed) and `nan` are number
+    // spellings, not identifiers.
+    if t.rest().starts_with("inf") {
+        for _ in 0..3 {
+            t.advance();
+        }
+        return Ok(Value::Float(if s.starts_with('-') {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        }));
+    }
+    if t.rest().starts_with("nan") && s.is_empty() {
+        for _ in 0..3 {
+            t.advance();
+        }
+        return Ok(Value::Float(f64::NAN));
+    }
     let mut saw_digit = false;
     while let Some(c) = t.peek_char() {
         if c.is_ascii_digit() {
@@ -1118,6 +1205,10 @@ fn parse_value(t: &mut Tokenizer<'_>) -> Result<Value> {
                 "true" => Ok(Value::Bool(true)),
                 "false" => Ok(Value::Bool(false)),
                 "None" | "none" => Ok(Value::None),
+                // §16.2.5: `inf` / `nan` in a value position are the
+                // non-finite number spellings.
+                "inf" => Ok(Value::Float(f64::INFINITY)),
+                "nan" => Ok(Value::Float(f64::NAN)),
                 _ => Ok(Value::Token(id)),
             }
         }

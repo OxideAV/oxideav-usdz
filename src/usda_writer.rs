@@ -933,6 +933,11 @@ fn escape_quoted(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            '\x07' => out.push_str("\\a"),
+            '\x08' => out.push_str("\\b"),
+            '\x0C' => out.push_str("\\f"),
+            '\x0B' => out.push_str("\\v"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\x{:02x}", c as u32)),
             _ => out.push(c),
         }
     }
@@ -3165,9 +3170,11 @@ fn guess_usda_type(v: &Value) -> &'static str {
     }
 }
 
-/// Escape a quoted string for emission inside `"..."` USDA syntax.
-/// Backslash + double-quote are the only mandatory escapes; we keep
-/// the rest of the bytes verbatim so non-ASCII names round-trip.
+/// Escape a quoted string for emission inside `"..."` USDA syntax,
+/// per the §16.2.5 `Escaped` production: the named single-character
+/// escapes for the C0 controls that have one, `\xHH` for the rest,
+/// and backslash + double-quote; other bytes stay verbatim so
+/// non-ASCII names round-trip.
 fn escape_usda_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -3175,6 +3182,13 @@ fn escape_usda_string(s: &str) -> String {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
             '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x07' => out.push_str("\\a"),
+            '\x08' => out.push_str("\\b"),
+            '\x0C' => out.push_str("\\f"),
+            '\x0B' => out.push_str("\\v"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\x{:02x}", c as u32)),
             _ => out.push(c),
         }
     }
@@ -3218,6 +3232,14 @@ fn format_metadata_lines(key: &str, value: &Value) -> Vec<String> {
 }
 
 fn format_float(f: f64) -> String {
+    // §16.2.5 Number: the non-finite spellings are `inf`, `-inf`,
+    // and `nan` (Rust's default `NaN` is not valid USDA).
+    if f.is_nan() {
+        return "nan".to_owned();
+    }
+    if f.is_infinite() {
+        return if f < 0.0 { "-inf" } else { "inf" }.to_owned();
+    }
     // USD canonical: keep at most 6 fractional digits, strip
     // trailing zeros so `1.0` round-trips as `1` (USD parses both
     // identically via our own `read_number`).
@@ -3232,6 +3254,34 @@ fn format_float(f: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escape_functions_emit_spec_escape_set() {
+        // §16.2.5 Escaped: named single-character escapes for the C0
+        // controls that have one, \xHH for the rest.
+        let raw = "bell\x07 back\x08 page\x0C vert\x0B tab\t nl\n esc\x1b q\"b\\";
+        let escaped = escape_quoted(raw);
+        assert_eq!(
+            escaped,
+            "bell\\a back\\b page\\f vert\\v tab\\t nl\\n esc\\x1b q\\\"b\\\\"
+        );
+        assert_eq!(escape_usda_string(raw), escaped);
+        // And the parser decodes the emission back to the raw bytes.
+        let src = format!("#usda 1.0\ndef Scope \"S\" {{\n    string a = \"{escaped}\"\n}}\n");
+        let layer = crate::usda::parse(src.as_bytes()).expect("parse escaped emission");
+        let crate::usda::Value::String(back) = &layer.prims[0].attrs["a"].value else {
+            panic!("string value");
+        };
+        assert_eq!(back, raw, "writer escapes and parser escapes are inverses");
+    }
+
+    #[test]
+    fn format_float_spells_non_finite_values_per_spec() {
+        assert_eq!(format_float(f64::INFINITY), "inf");
+        assert_eq!(format_float(f64::NEG_INFINITY), "-inf");
+        assert_eq!(format_float(f64::NAN), "nan");
+        assert_eq!(format_float(1.0), "1");
+    }
 
     #[test]
     fn writes_minimal_layer() {

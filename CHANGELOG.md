@@ -27,6 +27,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/SoC_ElephantWithMonochord.xformOp:transform`), pairwise
   distinct, parent-closed, and each ending in its spec's leaf token.
 
+- **usda: §16.2.5 character / numeric literal conformance.** The
+  string tokenizer now implements the full `Escaped` production —
+  `\a` / `\b` / `\f` / `\v` join the named set, `\xH`/`\xHH`
+  hex and 1–3-digit octal escapes decode to their code points, and
+  escapes now apply inside triple-quoted (multi-line) strings too
+  (previously they passed through raw). The `Number` production's
+  non-finite spellings parse (`inf`, `-inf`, `nan` — standalone and
+  inside tuples/arrays), and the writer emits them back in exactly
+  those spellings (Rust's default `NaN` is not valid USDA) while its
+  string escaping now covers the named C0 escapes plus `\xHH` for
+  the remaining control characters — writer emission and parser
+  decode are verified inverses.
+
 - **zip: §16.4 normative container restrictions.** The container
   walker now enforces the End-of-Central-Directory rules the spec
   states normatively (§16.4.1.4): non-zero disk-number fields are a
