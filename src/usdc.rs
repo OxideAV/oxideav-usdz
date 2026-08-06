@@ -1051,8 +1051,9 @@ pub fn encode_compressed_buffer(raw: &[u8]) -> Vec<u8> {
 /// of elements take the zero-payload code `0`), then chooses the
 /// narrowest width that represents each remaining element: an `int8`
 /// or `int16` *delta* from the previous value, or — when neither
-/// fits — an absolute `int32` (code `3`, which the trace doc records
-/// as an absolute value, not a delta).
+/// fits — a full-width `int32` **delta** (code `3`; the spec's
+/// §16.3.7.2.2 worked example pins that the full-width codepoint
+/// also stores the difference, not the absolute value).
 ///
 /// Round-trips with [`decode_int_array`]: `decode_int_array(&encode_int_coded(v), v.len())`
 /// returns `v` for any `&[i32]`. An empty slice encodes to the empty
@@ -1091,7 +1092,10 @@ pub fn encode_int_coded(values: &[i32]) -> Vec<u8> {
             payload.extend_from_slice(&d.to_le_bytes());
             2
         } else {
-            payload.extend_from_slice(&v.to_le_bytes());
+            // §16.3.7.2.2: the full-width codepoint also stores the
+            // **difference**, not the absolute value (pinned by the
+            // spec's worked example).
+            payload.extend_from_slice(&delta.to_le_bytes());
             3
         };
         control[i / 4] |= code << ((i % 4) * 2);
@@ -1349,8 +1353,10 @@ pub fn split_tokens_blob(blob: &[u8], header: &TokensHeader) -> Result<Vec<Strin
 ///    * `0` → previous value **+ the common delta**, 0 payload bytes
 ///    * `1` → `int8` signed delta from previous, 1 payload byte
 ///    * `2` → `int16` signed delta from previous, 2 payload bytes
-///    * `3` → `int32` **value** (absolute, not a delta, per the
-///      trace doc), 4 payload bytes
+///    * `3` → `int32` signed **delta** from previous (§16.3.7.2.2:
+///      every codepoint stores the difference — the spec's worked
+///      example encodes `int32(100000)` for the element whose
+///      absolute value is `100125`), 4 payload bytes
 /// 3. The variable-width **payload bytes**, in array order.
 ///
 /// The "previous" value starts at zero for the first element (a
@@ -1384,8 +1390,9 @@ pub fn split_tokens_blob(blob: &[u8], header: &TokensHeader) -> Result<Vec<Strin
 /// control) produces out-of-range/negative indices on the same
 /// buffers, so the preamble form is the on-disk reality; the
 /// trace doc's documented form is its `commonDelta = 0` special
-/// case. Code `3` is not exercised by any fixture buffer, so its
-/// absolute-value semantics rest on the trace doc alone.
+/// case. Code `3` is not exercised by any fixture buffer; its
+/// difference semantics come from the spec's §16.3.7.2.2 worked
+/// example.
 ///
 /// Returns the reconstructed sequence as `i32`s (the on-disk
 /// representation: token indices, jump offsets, and field indices
@@ -1456,13 +1463,19 @@ pub fn decode_int_array(buf: &[u8], count: usize) -> Result<Vec<i32>> {
             3 => {
                 if payload.len() < 4 {
                     return Err(invalid(format!(
-                        "USDC int-coded array element {i}: control says int32 value but only {} payload byte(s) left",
+                        "USDC int-coded array element {i}: control says int32 delta but only {} payload byte(s) left",
                         payload.len()
                     )));
                 }
-                let v = i32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                // §16.3.7.2.2: every codepoint (the full-width one
+                // included) encodes the element's **difference** from
+                // the previous value — the spec's worked example stores
+                // int32(100000) for the element whose absolute value is
+                // 100125. Adding to `prev` here (rather than taking the
+                // word as the absolute value) is what the example pins.
+                let delta = i32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
                 payload = &payload[4..];
-                v
+                prev.wrapping_add(delta)
             }
             _ => unreachable!("2-bit code masked with 0b11"),
         };
@@ -1494,6 +1507,125 @@ pub fn decode_int_array(buf: &[u8], count: usize) -> Result<Vec<i32>> {
 /// [`decode_int_array`].
 pub fn encode_int_array_for_tests(values: &[i32]) -> Vec<u8> {
     encode_int_coded(values)
+}
+
+/// Decode a §16.3.7.2 int-coded buffer of **64-bit** integers.
+///
+/// The compressed-integer algorithm "can represent either 32-bit or
+/// 64-bit integers as required by their point of use" (§16.3.7.2);
+/// the 64-bit form widens every field one step per the §16.3.7.2.2
+/// table: the leading common-delta preamble is an `int64` (8 bytes),
+/// codepoint `01` (quarter width) reads an `int16` delta, `10` (half
+/// width) an `int32` delta, and `11` (full width) an `int64` delta.
+/// All other rules — the LSB-first 2-bit control stream, the
+/// difference model, the zero-leftover-payload invariant — match
+/// [`decode_int_array`].
+///
+/// Used by the §16.3.9.3.1 compressed `int64[]` / `uint64[]` value
+/// arrays; the section machinery itself is 32-bit indexed.
+pub fn decode_int_array64(buf: &[u8], count: usize) -> Result<Vec<i64>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if buf.len() < 8 {
+        return Err(invalid(format!(
+            "USDC int64-coded array: 8-byte common-delta preamble truncated (buffer is only {} bytes)",
+            buf.len()
+        )));
+    }
+    let common_delta = i64::from_le_bytes(buf[0..8].try_into().unwrap());
+    let body = &buf[8..];
+    let control_bytes = count.div_ceil(4);
+    if body.len() < control_bytes {
+        return Err(invalid(format!(
+            "USDC int64-coded array: control stream needs {control_bytes} bytes ({count} elements at 2 bits each), only {} remain after the common-delta preamble",
+            body.len()
+        )));
+    }
+    let (control, mut payload) = body.split_at(control_bytes);
+    let mut out: Vec<i64> = Vec::with_capacity(count);
+    let mut prev: i64 = 0;
+    for i in 0..count {
+        let code = (control[i / 4] >> ((i % 4) * 2)) & 0b11;
+        let width = match code {
+            0 => 0usize,
+            1 => 2,
+            2 => 4,
+            3 => 8,
+            _ => unreachable!("2-bit code masked with 0b11"),
+        };
+        if payload.len() < width {
+            return Err(invalid(format!(
+                "USDC int64-coded array element {i}: control says a {width}-byte delta but only {} payload byte(s) left",
+                payload.len()
+            )));
+        }
+        let delta = match code {
+            0 => common_delta,
+            1 => i16::from_le_bytes(payload[0..2].try_into().unwrap()) as i64,
+            2 => i32::from_le_bytes(payload[0..4].try_into().unwrap()) as i64,
+            3 => i64::from_le_bytes(payload[0..8].try_into().unwrap()),
+            _ => unreachable!(),
+        };
+        payload = &payload[width..];
+        let value = prev.wrapping_add(delta);
+        out.push(value);
+        prev = value;
+    }
+    if !payload.is_empty() {
+        return Err(invalid(format!(
+            "USDC int64-coded array: {} payload byte(s) left unconsumed after decoding all {count} element(s) — the control stream and payload disagree",
+            payload.len()
+        )));
+    }
+    Ok(out)
+}
+
+/// Encode a 64-bit int-coded buffer — the exact inverse of
+/// [`decode_int_array64`], mirroring [`encode_int_coded`] with the
+/// §16.3.7.2.2 64-bit field widths (int64 preamble; int16 / int32 /
+/// int64 deltas for codepoints 1 / 2 / 3).
+pub fn encode_int_coded64(values: &[i64]) -> Vec<u8> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+    let mut prev: i64 = 0;
+    let mut histogram: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+    for &v in values {
+        *histogram.entry(v.wrapping_sub(prev)).or_insert(0) += 1;
+        prev = v;
+    }
+    let common_delta = histogram
+        .iter()
+        .max_by_key(|(delta, n)| (**n, **delta))
+        .map(|(delta, _)| *delta)
+        .unwrap_or(0);
+
+    let control_bytes = values.len().div_ceil(4);
+    let mut control = vec![0u8; control_bytes];
+    let mut payload: Vec<u8> = Vec::new();
+    let mut prev: i64 = 0;
+    for (i, &v) in values.iter().enumerate() {
+        let delta = v.wrapping_sub(prev);
+        let code: u8 = if delta == common_delta {
+            0
+        } else if let Ok(d) = i16::try_from(delta) {
+            payload.extend_from_slice(&d.to_le_bytes());
+            1
+        } else if let Ok(d) = i32::try_from(delta) {
+            payload.extend_from_slice(&d.to_le_bytes());
+            2
+        } else {
+            payload.extend_from_slice(&delta.to_le_bytes());
+            3
+        };
+        control[i / 4] |= code << ((i % 4) * 2);
+        prev = v;
+    }
+    let mut out = common_delta.to_le_bytes().to_vec();
+    out.extend(control);
+    out.extend(payload);
+    out
 }
 
 /// The 8-byte header at the start of the §4.2 STRINGS section.
@@ -4636,23 +4768,73 @@ mod tests {
     }
 
     #[test]
-    fn int_array_int32_absolute() {
+    fn int_array_int32_full_width_delta_from_zero() {
         // Code 3 for one element: control = 0b00_00_00_11 = 0x03.
-        // Payload: i32 LE = 0x12345678 → [0x78, 0x56, 0x34, 0x12].
+        // Payload: i32 LE delta = 0x12345678; prev starts at 0, so the
+        // decoded value equals the delta.
         let buf = with_common_delta(0, &[0x03, 0x78, 0x56, 0x34, 0x12]);
         let out = decode_int_array(&buf, 1).unwrap();
         assert_eq!(out, vec![0x12345678]);
     }
 
     #[test]
-    fn int_array_int32_resets_prev_to_absolute_value() {
-        // Two elements: code 3 (absolute 1000), then code 1 (delta +5).
-        // control = 0b00_00_01_11 = 0x07.
-        // Payload: i32 1000 LE = [0xE8, 0x03, 0x00, 0x00], then i8 +5 = 0x05.
-        // Decoded: 1000, then 1005.
-        let buf = with_common_delta(0, &[0x07, 0xE8, 0x03, 0x00, 0x00, 0x05]);
+    fn int_array_int32_full_width_is_a_delta() {
+        // §16.3.7.2.2: the full-width codepoint stores the DIFFERENCE.
+        // Two elements: code 1 (delta +100 → value 100), then code 3
+        // (int32 delta +100000 → value 100100, NOT 100000).
+        // control = 0b00_00_11_01 = 0x0D.
+        let buf = with_common_delta(0, &[0x0D, 100, 0xA0, 0x86, 0x01, 0x00]);
         let out = decode_int_array(&buf, 2).unwrap();
-        assert_eq!(out, vec![1000, 1005]);
+        assert_eq!(out, vec![100, 100_100]);
+    }
+
+    #[test]
+    fn int_array_spec_worked_example() {
+        // The §16.3.7.2 worked example, end to end:
+        //   input  = [123, 124, 125, 100125, 100125, 100126, 100126]
+        //   diffs  = [123, 1, 1, 100000, 0, 1, 0]
+        //   common = 1
+        //   codes  = [01, 00, 00, 11, 01, 00, 01]
+        //   payload= [int8(123), int32(100000), int8(0), int8(0)]
+        let input: Vec<i32> = vec![123, 124, 125, 100_125, 100_125, 100_126, 100_126];
+        // Hand-build the spec's stated output bytes. Control stream is
+        // LSB-first 2-bit codes: byte0 = 11_00_00_01, byte1 = xx_01_00_01.
+        let mut body = Vec::new();
+        body.push(0b1100_0001u8);
+        body.push(0b0001_0001u8);
+        body.push(123u8);
+        body.extend_from_slice(&100_000i32.to_le_bytes());
+        body.push(0u8);
+        body.push(0u8);
+        let buf = with_common_delta(1, &body);
+        assert_eq!(decode_int_array(&buf, input.len()).unwrap(), input);
+        // And the encoder reproduces those exact bytes.
+        assert_eq!(encode_int_coded(&input), buf);
+    }
+
+    #[test]
+    fn int_array64_round_trips_all_widths() {
+        // 64-bit form (§16.3.7.2): int16 quarter, int32 half, int64
+        // full deltas + the int64 common-delta preamble.
+        let values: Vec<i64> = vec![
+            0,
+            1,
+            2,
+            40_000,             // int16-out-of-range → int32 delta
+            40_000 + (1 << 40), // int32-out-of-range → int64 delta
+            40_001 + (1 << 40), // int16 delta
+            0,                  // large negative int64 delta
+        ];
+        let encoded = encode_int_coded64(&values);
+        assert_eq!(decode_int_array64(&encoded, values.len()).unwrap(), values);
+        // Empty round trip.
+        assert_eq!(encode_int_coded64(&[]), Vec::<u8>::new());
+        assert_eq!(decode_int_array64(&[], 0).unwrap(), Vec::<i64>::new());
+        // Leftover payload is rejected.
+        let mut bad = encoded.clone();
+        bad.push(0xAB);
+        let err = decode_int_array64(&bad, values.len()).expect_err("slack");
+        assert!(format!("{err:?}").contains("unconsumed"), "{err:?}");
     }
 
     #[test]
@@ -4755,9 +4937,9 @@ mod tests {
             500,     // int16 delta from -1
             -500,    // negative int16 delta
             0,       // int8 delta
-            70_000,  // int16-out-of-range delta → code 3 absolute
-            70_001,  // int8 delta from absolute
-            -70_001, // int32 absolute again
+            70_000,  // int16-out-of-range delta → code 3 int32 delta
+            70_001,  // int8 delta after the wide one
+            -70_001, // int32-wide negative delta
             0,
         ];
         let encoded = encode_int_array_for_tests(&values);

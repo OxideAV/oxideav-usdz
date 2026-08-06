@@ -48,6 +48,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **usdc: §16.3.7.2.2 full-width codepoint is a *difference*, not an
+  absolute value.** The int-coded decoder treated control code `3`
+  (full-width int32) as the element's absolute value — a trace-doc-era
+  guess that no fixture buffer exercises (the encoder mirrored it, so
+  round trips masked it). The spec's worked example pins the
+  difference model for every codepoint (`int32(100000)` encodes the
+  element whose absolute value is `100125`), so decode is now
+  `prev + delta` for code `3` too, and `encode_int_coded` emits the
+  delta. New tests carry the spec's worked example end-to-end
+  (decode of the published bytes + byte-exact re-encode) and a
+  discriminating prev≠0 case. A 64-bit variant
+  (`decode_int_array64` / `encode_int_coded64`) lands alongside for
+  the §16.3.9.3.1 compressed `int64[]` / `uint64[]` value arrays
+  (int64 preamble; int16 / int32 / int64 delta widths).
+
 - **usdc: PATHS element-token mapping corrected to the normative
   §16.3.8.4.5.2 rule.** The observer-era decode read the element
   token index as `abs(word) >> 1` (guessing the low bit was a flag);
