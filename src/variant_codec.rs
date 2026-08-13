@@ -133,7 +133,7 @@ fn decode_variant(value: &JValue) -> Variant {
     }
 }
 
-fn encode_prim(p: &Prim) -> JValue {
+pub(crate) fn encode_prim(p: &Prim) -> JValue {
     let mut o = JMap::new();
     o.insert("spec".into(), JValue::String(p.spec.clone()));
     o.insert("type_name".into(), JValue::String(p.type_name.clone()));
@@ -156,7 +156,7 @@ fn encode_prim(p: &Prim) -> JValue {
     JValue::Object(o)
 }
 
-fn decode_prim(value: &JValue) -> Prim {
+pub(crate) fn decode_prim(value: &JValue) -> Prim {
     let JValue::Object(obj) = value else {
         return Prim {
             spec: String::new(),

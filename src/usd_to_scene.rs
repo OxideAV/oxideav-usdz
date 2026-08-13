@@ -2106,15 +2106,307 @@ fn strip_skel_binding_api(v: &Value) -> Option<Value> {
 ///   `Primitive::extras["usd:mesh_transform"]` as a Matrix-shaped
 ///   JSON object.
 fn build_mesh(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Mesh> {
-    let prim_out = match prim.type_name.as_str() {
-        "BasisCurves" => build_basis_curves_primitive(ctx, path, prim)?,
-        "Points" => build_points_primitive(ctx, path, prim)?,
+    let primitives = match prim.type_name.as_str() {
+        "BasisCurves" => vec![build_basis_curves_primitive(ctx, path, prim)?],
+        "Points" => vec![build_points_primitive(ctx, path, prim)?],
         // "Mesh" or anything else routes through the triangle path.
-        _ => build_triangle_primitive(ctx, path, prim)?,
+        // A Mesh prim carrying `def GeomSubset` children may split
+        // into one Primitive per material-bound face subset.
+        _ => {
+            let base = build_triangle_primitive(ctx, path, prim)?;
+            apply_geom_subsets(ctx, path, prim, base)?
+        }
     };
 
-    let mesh = Mesh::new(Some(prim.name.clone())).with_primitive(prim_out);
+    let mut mesh = Mesh::new(Some(prim.name.clone()));
+    mesh.primitives = primitives;
     Ok(mesh)
+}
+
+/// One material-bound face subset gathered by [`apply_geom_subsets`].
+struct MaterialFaceSubset {
+    name: String,
+    family_name: String,
+    faces: Vec<u32>,
+    material: oxideav_mesh3d::MaterialId,
+    /// Unconsumed attrs / metadata / children of the subset prim,
+    /// preserved losslessly for the writer replay. `None` when the
+    /// subset carried nothing beyond the schema quartet.
+    rest: Option<serde_json::Value>,
+}
+
+/// `UsdGeomSubset` (staged schema `usdgeom-usdshade-schema.md`
+/// Part 1): split a Mesh prim's per-face **material** subsets into
+/// one typed [`Primitive`] per bound material.
+///
+/// Placement rule §1.1: a `GeomSubset` is a direct namespace child
+/// of the geometric prim it subsets, so discovery is a single scan
+/// of `prim.children`. A subset participates in the split when
+///
+/// * `elementType` is `face` (the schema fallback — §1.2), and
+/// * it carries a `material:binding` that resolves to an indexed
+///   `Material` (§1.1: materials bind to a subset through the
+///   ordinary MaterialBindingAPI).
+///
+/// Every other subset (point/edge/segment/tetrahedron element
+/// types, families with no material binding, bindings whose target
+/// is not present in the layer) is preserved losslessly on the base
+/// primitive's `extras["usd:geomSubsets"]` and re-emitted verbatim
+/// by the writer.
+///
+/// **Face → triangle mapping.** `indices` index the parent's
+/// authored faces (§1.2); the typed model is triangle-list, so face
+/// `f` (arity `n`) maps to the `n - 2` fan triangles
+/// [`fan_triangulate`] emitted for it. Each subset primitive shares
+/// the parent's vertex arrays (points / normals / UVs / colours /
+/// joint influences / morph targets are all point-indexed) and
+/// carries only its own faces' triangles. Faces claimed by **no**
+/// material subset stay on the base primitive with the parent
+/// prim's own binding — the §1.3 "unassigned elements" set, which
+/// falls back to the parent's binding during material resolution.
+/// The base primitive is always kept (even when a partition family
+/// claims every face) so mesh-level state — parent binding,
+/// doubleSided, skinning, blend shapes — has a stable carrier.
+///
+/// **Families (§1.3).** `partition` / `nonOverlapping` /
+/// `unrestricted` constraints are declarative assertions by the
+/// author, not enforced invariants — per the schema doc a reader
+/// must "validate ... or tolerate its violation — not assume". We
+/// tolerate: overlapping face claims keep every claiming subset's
+/// authored membership (each subset primitive carries all its
+/// faces). The family *type* token lives on the **parent** prim
+/// under a property whose spelling the published documentation does
+/// not state (§1.4); per the documented consequence we discover it
+/// by enumeration — any token-valued parent property whose value is
+/// one of the three familyType tokens and whose name carries an
+/// authored `familyName` as a `:`-separated segment — and preserve
+/// the exact authored spelling on
+/// `extras["usd:subsetFamilies"]` for verbatim re-emission.
+///
+/// An `indices` value that is malformed or out of the parent's
+/// face range is a precise `InvalidData` refusal (a corrupt
+/// subset, not a tolerable family-constraint violation).
+fn apply_geom_subsets(
+    ctx: &mut Ctx,
+    path: &str,
+    prim: &Prim,
+    mut base: Primitive,
+) -> Result<Vec<Primitive>> {
+    let subset_prims: Vec<&Prim> = prim
+        .children
+        .iter()
+        .filter(|c| c.spec == "def" && c.type_name == "GeomSubset")
+        .collect();
+    if subset_prims.is_empty() {
+        return Ok(vec![base]);
+    }
+
+    // Rebuild the authored face → triangle-run map. Face `f` of
+    // arity `n` yields `n.saturating_sub(2)` triangles, in authored
+    // order — exactly `fan_triangulate`'s emission rule (degenerate
+    // faces with arity < 3 yield none).
+    let counts = prim
+        .attrs
+        .get("faceVertexCounts")
+        .and_then(|a| read_int_array(&a.value))
+        .ok_or_else(|| invalid(format!("Mesh `{path}` has malformed `faceVertexCounts`")))?;
+    let n_faces = counts.len();
+    let mut tri_start: Vec<u32> = Vec::with_capacity(n_faces);
+    let mut acc = 0u32;
+    for &n in &counts {
+        tri_start.push(acc);
+        acc += n.saturating_sub(2);
+    }
+
+    // Flatten the base primitive's triangulated index buffer.
+    let base_indices: Vec<u32> = match &base.indices {
+        Some(Indices::U16(v)) => v.iter().map(|&i| i as u32).collect(),
+        Some(Indices::U32(v)) => v.clone(),
+        None => (0..base.positions.len() as u32).collect(),
+    };
+
+    let mut material_subsets: Vec<MaterialFaceSubset> = Vec::new();
+    let mut verbatim: Vec<serde_json::Value> = Vec::new();
+    for sp in &subset_prims {
+        let spath = join_path(path, &sp.name);
+        let element_type = sp
+            .attrs
+            .get("elementType")
+            .and_then(|a| a.value.as_text())
+            // §1.2 fallback.
+            .unwrap_or("face");
+        let family_name = sp
+            .attrs
+            .get("familyName")
+            .and_then(|a| a.value.as_text())
+            .unwrap_or("");
+        let material = sp
+            .attrs
+            .get("material:binding")
+            .and_then(|a| a.value.as_text())
+            .and_then(|rel| ctx.materials_by_path.get(rel).copied());
+        if element_type != "face" || material.is_none() {
+            // Not a material face subset — preserve the whole prim
+            // losslessly for the writer replay.
+            verbatim.push(crate::variant_codec::encode_prim(sp));
+            continue;
+        }
+        // §1.2: `indices` fallback is the empty list.
+        let faces = match sp.attrs.get("indices") {
+            Some(a) => read_int_array(&a.value)
+                .ok_or_else(|| invalid(format!("GeomSubset `{spath}` has malformed `indices`")))?,
+            None => Vec::new(),
+        };
+        if let Some(&bad) = faces.iter().find(|&&f| f as usize >= n_faces) {
+            return Err(invalid(format!(
+                "GeomSubset `{spath}` face index {bad} is out of range \
+                 (parent mesh has {n_faces} faces)"
+            )));
+        }
+        // Unconsumed opinions on the subset prim ride along.
+        let mut stripped = (*sp).clone();
+        for k in ["elementType", "familyName", "indices", "material:binding"] {
+            stripped.attrs.remove(k);
+        }
+        let rest = if stripped.attrs.is_empty()
+            && stripped.metadata.is_empty()
+            && stripped.children.is_empty()
+            && stripped.variant_sets.is_empty()
+        {
+            None
+        } else {
+            Some(crate::variant_codec::encode_prim(&stripped))
+        };
+        material_subsets.push(MaterialFaceSubset {
+            name: sp.name.clone(),
+            family_name: family_name.to_string(),
+            faces,
+            material: material.expect("checked above"),
+            rest,
+        });
+    }
+
+    // §1.4 familyType discovery-by-enumeration on the parent prim.
+    let family_names: std::collections::BTreeSet<&str> = material_subsets
+        .iter()
+        .map(|m| m.family_name.as_str())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut family_props: Vec<serde_json::Value> = Vec::new();
+    for (name, attr) in &prim.attrs {
+        if !attr.type_token.contains("token") {
+            continue;
+        }
+        let Some(val) = attr.value.as_text() else {
+            continue;
+        };
+        if !matches!(val, "partition" | "nonOverlapping" | "unrestricted") {
+            continue;
+        }
+        if name.split(':').any(|seg| family_names.contains(seg)) {
+            family_props.push(serde_json::json!({
+                "name": name,
+                "typeToken": attr.type_token,
+                "value": val,
+            }));
+        }
+    }
+
+    if !verbatim.is_empty() {
+        base.extras
+            .insert("usd:geomSubsets".into(), serde_json::Value::Array(verbatim));
+    }
+    if material_subsets.is_empty() {
+        return Ok(vec![base]);
+    }
+    if !family_props.is_empty() {
+        base.extras.insert(
+            "usd:subsetFamilies".into(),
+            serde_json::Value::Array(family_props),
+        );
+    }
+
+    // §2.5 doubleSided is a gprim-wide flag: a subset-bound material
+    // inherits it just like the parent-bound one does.
+    let double_sided = base
+        .extras
+        .get("usd:doubleSided")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Split: each material subset takes its authored faces'
+    // triangles (authored face order preserved); the base keeps the
+    // unclaimed remainder.
+    let n_tris = (base_indices.len() / 3) as u32;
+    let mut claimed = vec![false; n_tris as usize];
+    let tris_of_face = |f: u32| -> std::ops::Range<u32> {
+        let start = tri_start[f as usize];
+        start..start + counts[f as usize].saturating_sub(2)
+    };
+    let pack_indices = |flat: Vec<u32>, n_points: usize| -> Indices {
+        if n_points <= u16::MAX as usize {
+            Indices::U16(flat.iter().map(|&i| i as u16).collect())
+        } else {
+            Indices::U32(flat)
+        }
+    };
+    let mut out: Vec<Primitive> = Vec::new();
+    let mut subset_primitives: Vec<Primitive> = Vec::new();
+    for ms in &material_subsets {
+        let mut flat: Vec<u32> = Vec::new();
+        for &f in &ms.faces {
+            for t in tris_of_face(f) {
+                claimed[t as usize] = true;
+                let b = (t as usize) * 3;
+                flat.extend_from_slice(&base_indices[b..b + 3]);
+            }
+        }
+        let mut sp = Primitive::new(Topology::Triangles);
+        sp.positions = base.positions.clone();
+        sp.normals = base.normals.clone();
+        sp.tangents = base.tangents.clone();
+        sp.uvs = base.uvs.clone();
+        sp.colors = base.colors.clone();
+        sp.joints = base.joints.clone();
+        sp.weights = base.weights.clone();
+        // Morph targets are per-point deltas — every primitive of
+        // the mesh must carry the same target roster for the typed
+        // model's per-mesh weight vector to stay meaningful.
+        sp.targets = base.targets.clone();
+        sp.indices = Some(pack_indices(flat, base.positions.len()));
+        sp.material = Some(ms.material);
+        let mut marker = serde_json::Map::new();
+        marker.insert("name".into(), serde_json::Value::String(ms.name.clone()));
+        if !ms.family_name.is_empty() {
+            marker.insert(
+                "familyName".into(),
+                serde_json::Value::String(ms.family_name.clone()),
+            );
+        }
+        if let Some(rest) = &ms.rest {
+            marker.insert("rest".into(), rest.clone());
+        }
+        sp.extras
+            .insert("usd:subset".into(), serde_json::Value::Object(marker));
+        if double_sided {
+            if let Some(mat) = ctx.scene.materials.get_mut(ms.material.0 as usize) {
+                mat.double_sided = true;
+            }
+        }
+        subset_primitives.push(sp);
+    }
+    // Remainder faces stay on the base primitive.
+    let mut remainder: Vec<u32> = Vec::new();
+    for t in 0..n_tris {
+        if !claimed[t as usize] {
+            let b = (t as usize) * 3;
+            remainder.extend_from_slice(&base_indices[b..b + 3]);
+        }
+    }
+    base.indices = Some(pack_indices(remainder, base.positions.len()));
+    out.push(base);
+    out.extend(subset_primitives);
+    Ok(out)
 }
 
 /// Build a `Topology::Triangles` primitive from a USD `Mesh` prim.

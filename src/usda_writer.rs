@@ -19,7 +19,8 @@ use std::fmt::Write;
 
 use oxideav_mesh3d::{
     AlphaMode, AudioData, AudioEmitter, AudioSource, AuralMode, Axis, ImageData, Indices, Material,
-    Mesh, MeshId, NodeId, Primitive, Scene3D, Texture, TextureRef, Topology, Transform, Unit,
+    MaterialId, Mesh, MeshId, NodeId, Primitive, Scene3D, Texture, TextureRef, Topology, Transform,
+    Unit,
 };
 
 use crate::usda::Value;
@@ -1102,6 +1103,23 @@ fn write_mesh(
     // * `Points` → `def Points` (UsdGeomPoints) carrying just the
     //   `points` array (no per-point widths in r5; downstream tools
     //   default to a sensible point size when none is authored).
+    // UsdGeomSubset re-emission (staged schema Part 1): primitives
+    // the decoder split out of one authored Mesh prim (marked with
+    // `extras["usd:subset"]`) fold back into a *single* `def Mesh`
+    // whose triangles are the concatenation [base | subset₁ |
+    // subset₂ | ...], with one `def GeomSubset` child per subset
+    // primitive claiming its contiguous face run. The base primitive
+    // (the one without the marker) carries the mesh-level state —
+    // parent binding, doubleSided, skinning, blend shapes, plus the
+    // `usd:subsetFamilies` / `usd:geomSubsets` replay stashes.
+    if mesh
+        .primitives
+        .iter()
+        .any(|p| p.topology == Topology::Triangles && p.extras.contains_key("usd:subset"))
+    {
+        write_subset_mesh(w, scene, mesh, &mesh_name, parent_path, skel);
+        return;
+    }
     for (i, prim) in mesh.primitives.iter().enumerate() {
         let prim_name = if i == 0 {
             mesh_name.clone()
@@ -1111,7 +1129,7 @@ fn write_mesh(
         match prim.topology {
             Topology::Triangles => {
                 let prim_path = format!("{parent_path}/{prim_name}");
-                write_one_mesh_prim(w, scene, prim, &prim_name, &prim_path, None, skel)
+                write_one_mesh_prim(w, scene, prim, &prim_name, &prim_path, None, skel, &[])
             }
             Topology::TriangleStrip => {
                 let expanded = expand_strip_to_triangle_list(prim);
@@ -1124,6 +1142,7 @@ fn write_mesh(
                     &prim_path,
                     Some("triangleStrip"),
                     skel,
+                    &[],
                 );
             }
             Topology::TriangleFan => {
@@ -1137,6 +1156,7 @@ fn write_mesh(
                     &prim_path,
                     Some("triangleFan"),
                     skel,
+                    &[],
                 );
             }
             Topology::Lines | Topology::LineStrip | Topology::LineLoop => {
@@ -1156,6 +1176,15 @@ fn write_mesh(
 /// with a `(usd:original_topology = "<token>")` metadata block so
 /// the source topology survives the conversion. Set by the
 /// strip/fan tessellation paths in [`write_mesh`].
+///
+/// `subsets` carries the `def GeomSubset` children to author inside
+/// the prim body — non-empty only on the [`write_subset_mesh`]
+/// path. Independently of it, the prim's own extras stashes
+/// (`usd:subsetFamilies` familyType properties and
+/// `usd:geomSubsets` verbatim non-material subsets) replay here, so
+/// a mesh whose only subsets were preserved verbatim re-emits them
+/// through the ordinary single-primitive path too.
+#[allow(clippy::too_many_arguments)]
 fn write_one_mesh_prim(
     w: &mut Out,
     scene: &Scene3D,
@@ -1164,6 +1193,7 @@ fn write_one_mesh_prim(
     prim_path: &str,
     original_topology_hint: Option<&str>,
     skel: Option<&SkelBindingPaths>,
+    subsets: &[SubsetChild],
 ) {
     let mut metadata_lines: Vec<String> = Vec::new();
     if let Some(token) = original_topology_hint {
@@ -1288,9 +1318,274 @@ fn write_one_mesh_prim(
         }
     }
     write_blend_shapes(w, prim, prim_path);
+    // UsdGeomSubset (staged schema Part 1): §1.4 familyType
+    // properties replay on the geometric prim with their exact
+    // authored spelling (the property name is discovered by
+    // enumeration on decode — never constructed).
+    if let Some(families) = prim
+        .extras
+        .get("usd:subsetFamilies")
+        .and_then(|v| v.as_array())
+    {
+        for fam in families {
+            let (Some(name), Some(tok), Some(val)) = (
+                fam.get("name").and_then(|v| v.as_str()),
+                fam.get("typeToken").and_then(|v| v.as_str()),
+                fam.get("value").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            w.write_indent();
+            writeln!(w.s, "{tok} {name} = \"{val}\"").unwrap();
+        }
+    }
+    // Material face subsets split into typed primitives on decode.
+    for sub in subsets {
+        write_geom_subset_child(w, scene, sub);
+    }
+    // Non-material subsets preserved verbatim on decode.
+    if let Some(stash) = prim
+        .extras
+        .get("usd:geomSubsets")
+        .and_then(|v| v.as_array())
+    {
+        for entry in stash {
+            let subset_prim = crate::variant_codec::decode_prim(entry);
+            write_prim(w, &subset_prim);
+        }
+    }
     w.indent -= 1;
     w.write_indent();
     writeln!(w.s, "}}").unwrap();
+}
+
+/// One `def GeomSubset` child re-authored by [`write_subset_mesh`]:
+/// the face run `[face_start, face_start + face_count)` of the
+/// enclosing mesh's (all-triangle) topology, bound to `material`.
+struct SubsetChild {
+    name: String,
+    family_name: Option<String>,
+    face_start: u32,
+    face_count: u32,
+    material: Option<MaterialId>,
+    /// Extra authored opinions preserved from the source subset
+    /// prim (decoded from the `usd:subset` marker's `rest` slot).
+    rest: Option<crate::usda::Prim>,
+}
+
+/// Emit one `def GeomSubset` child (staged schema §1.1/§1.2):
+/// `elementType = "face"` (this crate only splits face subsets),
+/// the authored `familyName`, the contiguous `indices` run the
+/// subset's triangles occupy in the emitted parent topology, its
+/// `material:binding`, plus any preserved extra opinions.
+fn write_geom_subset_child(w: &mut Out, scene: &Scene3D, sub: &SubsetChild) {
+    let name = sanitize_prim_name(&sub.name);
+    w.write_indent();
+    let metadata_lines = sub
+        .rest
+        .as_ref()
+        .filter(|r| !r.metadata.is_empty())
+        .map(|r| metadata_lines_from_value_map(&r.metadata))
+        .unwrap_or_default();
+    if metadata_lines.is_empty() {
+        writeln!(w.s, "def GeomSubset \"{name}\" {{").unwrap();
+    } else {
+        writeln!(w.s, "def GeomSubset \"{name}\" (").unwrap();
+        w.indent += 1;
+        for line in metadata_lines {
+            w.write_indent();
+            writeln!(w.s, "{line}").unwrap();
+        }
+        w.indent -= 1;
+        w.write_indent();
+        writeln!(w.s, ") {{").unwrap();
+    }
+    w.indent += 1;
+    w.write_indent();
+    writeln!(w.s, "uniform token elementType = \"face\"").unwrap();
+    if let Some(fam) = &sub.family_name {
+        w.write_indent();
+        writeln!(w.s, "uniform token familyName = \"{fam}\"").unwrap();
+    }
+    w.write_indent();
+    write!(w.s, "int[] indices = [").unwrap();
+    for i in 0..sub.face_count {
+        if i > 0 {
+            w.s.push_str(", ");
+        }
+        write!(w.s, "{}", sub.face_start + i).unwrap();
+    }
+    writeln!(w.s, "]").unwrap();
+    if let Some(mat_id) = sub.material {
+        if let Some(mat) = scene.materials.get(mat_id.0 as usize) {
+            let mat_name = material_prim_name(mat, mat_id.0 as usize);
+            w.write_indent();
+            writeln!(w.s, "rel material:binding = </Materials/{mat_name}>").unwrap();
+        }
+    }
+    if let Some(rest) = &sub.rest {
+        write_attr_map(w, &rest.attrs);
+        if !rest.variant_sets.is_empty() {
+            write_variant_sets(w, &rest.variant_sets);
+        }
+        for child in &rest.children {
+            write_prim(w, child);
+        }
+    }
+    w.indent -= 1;
+    w.write_indent();
+    writeln!(w.s, "}}").unwrap();
+}
+
+/// Re-author a decoder-split subset mesh as a **single**
+/// `def Mesh` + `def GeomSubset` children (staged schema Part 1).
+///
+/// The emitted topology is the concatenation
+/// `[base triangles | subset₁ triangles | subset₂ triangles | ...]`
+/// (base = the primitive without the `usd:subset` marker), so each
+/// subset claims a contiguous face run and the base's triangles are
+/// exactly the §1.3 unassigned set falling back to the parent
+/// binding. Vertex arrays come from the base primitive — the
+/// decoder's split shares them across every subset primitive.
+/// Non-triangle primitives and any additional unmarked primitives
+/// beyond the first re-emit as sibling prims under the ordinary
+/// per-primitive rules.
+///
+/// The first decode of an authored layer normalises subset
+/// membership into this concatenated form (arbitrary interleaved /
+/// overlapping face claims become contiguous runs, duplicating any
+/// face claimed twice); from then on encode → decode → encode is a
+/// fixed point.
+fn write_subset_mesh(
+    w: &mut Out,
+    scene: &Scene3D,
+    mesh: &Mesh,
+    mesh_name: &str,
+    parent_path: &str,
+    skel: Option<&SkelBindingPaths>,
+) {
+    let is_subset =
+        |p: &Primitive| p.topology == Topology::Triangles && p.extras.contains_key("usd:subset");
+    let flat_indices = |p: &Primitive| -> Vec<u32> {
+        match &p.indices {
+            Some(Indices::U16(v)) => v.iter().map(|&i| i as u32).collect(),
+            Some(Indices::U32(v)) => v.clone(),
+            None => (0..p.positions.len() as u32).collect(),
+        }
+    };
+
+    // The base primitive carries mesh-level state; a typed-model
+    // scene authored without one borrows the first subset
+    // primitive's vertex arrays and starts with zero faces.
+    let base = mesh
+        .primitives
+        .iter()
+        .find(|p| p.topology == Topology::Triangles && !p.extras.contains_key("usd:subset"));
+    let mut combined = match base {
+        Some(b) => b.clone(),
+        None => {
+            let first = mesh
+                .primitives
+                .iter()
+                .find(|p| is_subset(p))
+                .expect("write_subset_mesh called with no subset primitive");
+            let mut shell = first.clone();
+            shell.extras.remove("usd:subset");
+            shell.material = None;
+            shell.indices = Some(Indices::U32(Vec::new()));
+            shell
+        }
+    };
+
+    let mut flat = flat_indices(&combined);
+    let mut children: Vec<SubsetChild> = Vec::new();
+    for prim in mesh.primitives.iter().filter(|p| is_subset(p)) {
+        let marker = prim
+            .extras
+            .get("usd:subset")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let sub_flat = flat_indices(prim);
+        let face_start = (flat.len() / 3) as u32;
+        let face_count = (sub_flat.len() / 3) as u32;
+        flat.extend_from_slice(&sub_flat);
+        children.push(SubsetChild {
+            name: marker
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("subset")
+                .to_string(),
+            family_name: marker
+                .get("familyName")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            face_start,
+            face_count,
+            material: prim.material,
+            rest: marker.get("rest").map(crate::variant_codec::decode_prim),
+        });
+    }
+    combined.indices = Some(if combined.positions.len() <= u16::MAX as usize {
+        Indices::U16(flat.iter().map(|&i| i as u16).collect())
+    } else {
+        Indices::U32(flat)
+    });
+
+    let prim_path = format!("{parent_path}/{mesh_name}");
+    write_one_mesh_prim(
+        w, scene, &combined, mesh_name, &prim_path, None, skel, &children,
+    );
+
+    // Any additional unmarked primitives beyond the base re-emit as
+    // sibling prims under the ordinary per-primitive rules (they
+    // never arise from this crate's own decoder, which produces
+    // exactly one base).
+    let base_ptr = base.map(|b| b as *const Primitive);
+    for (i, prim) in mesh.primitives.iter().enumerate() {
+        if is_subset(prim) || base_ptr == Some(prim as *const Primitive) {
+            continue;
+        }
+        let prim_name = format!("{mesh_name}_{i}");
+        match prim.topology {
+            Topology::Triangles => {
+                let p_path = format!("{parent_path}/{prim_name}");
+                write_one_mesh_prim(w, scene, prim, &prim_name, &p_path, None, skel, &[]);
+            }
+            Topology::TriangleStrip => {
+                let expanded = expand_strip_to_triangle_list(prim);
+                let p_path = format!("{parent_path}/{prim_name}");
+                write_one_mesh_prim(
+                    w,
+                    scene,
+                    &expanded,
+                    &prim_name,
+                    &p_path,
+                    Some("triangleStrip"),
+                    skel,
+                    &[],
+                );
+            }
+            Topology::TriangleFan => {
+                let expanded = expand_fan_to_triangle_list(prim);
+                let p_path = format!("{parent_path}/{prim_name}");
+                write_one_mesh_prim(
+                    w,
+                    scene,
+                    &expanded,
+                    &prim_name,
+                    &p_path,
+                    Some("triangleFan"),
+                    skel,
+                    &[],
+                );
+            }
+            Topology::Lines | Topology::LineStrip | Topology::LineLoop => {
+                write_basis_curves_prim(w, scene, prim, &prim_name);
+            }
+            Topology::Points => write_points_prim(w, scene, prim, &prim_name),
+        }
+    }
 }
 
 /// UsdSkel blend shapes (§1.4 / §1.5): emit the geometry's

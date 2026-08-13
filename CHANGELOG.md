@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`UsdGeomSubset` per-face material subsets (staged schema
+  `usdgeom-usdshade-schema.md` Part 1) — the top "Not yet supported"
+  item is closed.** A Mesh prim's `def GeomSubset` children
+  (discovered by the §1.1 direct-namespace-child scan) whose
+  `elementType` is `face` (the §1.2 fallback) and whose
+  `material:binding` resolves now split the mesh into one typed
+  `Primitive` per bound material: each subset primitive shares the
+  parent's point-indexed vertex arrays (positions / normals / UVs /
+  colours / joint influences / morph targets) and carries exactly its
+  authored faces' fan triangles; faces claimed by no material subset
+  — the §1.3 *unassigned elements* set — stay on the base primitive
+  under the parent prim's own binding. Family constraints are treated
+  as the declarative assertions §1.3 says they are (overlapping
+  claims keep every claiming subset's authored membership); a face
+  index past the parent's face count is a precise `InvalidData`
+  refusal. The §1.4 `familyType` encoding on the parent — whose
+  property spelling the published documentation does not state — is
+  discovered by enumeration (any token-valued parent property whose
+  value is one of `partition` / `nonOverlapping` / `unrestricted`
+  and whose name carries an authored `familyName` segment) and
+  preserved verbatim. Non-face and unbound subsets are preserved
+  losslessly and re-emitted as authored. The writer folds the split
+  back into a **single** `def Mesh` + `def GeomSubset` children
+  (concatenated `[base | subset…]` triangle topology, contiguous
+  face runs, per-subset bindings, familyType properties replayed
+  with their exact authored spelling), so encode → decode → encode
+  is a one-cycle fixed point — previously a subset-carrying mesh
+  silently dropped the subsets and their material assignments.
+  gprim-wide `doubleSided` now reaches subset-bound materials too.
+  10 new integration tests in `tests/geom_subsets.rs`.
+
 - **usdc: §16.3.8.4.5.4 path construction — full `SdfPath`
   reconstruction (`usdc::construct_paths` /
   `UsdcFile::decode_paths`).** The AOUSD spec publishes the PATHS
