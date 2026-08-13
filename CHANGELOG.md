@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`material:binding` purpose forms, `bindMaterialAs` strength, and
+  namespace inheritance (staged schema Part 3 §3.1–§3.4).** Direct
+  bindings now resolve per the schema's ordered rules instead of
+  reading only a gprim-local bare `material:binding`:
+  - **Rule 1 / §3.3** — bindings on enclosing containers (Xform /
+    Scope / SkelRoot) inherit down namespace to unbound gprims; the
+    binding closest to the leaf wins unless an ancestor
+    relationship carries
+    `(bindMaterialAs = "strongerThanDescendants")`, in which case
+    the outermost such ancestor wins (the unauthored default is
+    `weakerThanDescendants`).
+  - **Rule 3 / §3.1** — the typed model's single material slot
+    resolves with requested purpose **`preview`** (this crate's
+    material model is `UsdPreviewSurface`, the preview shading
+    schema): `material:binding:preview` is preferred over the
+    all-purpose spelling at the same prim; a `material:binding:full`
+    opinion binds only when no preview or all-purpose binding exists
+    anywhere on the chain (so full-only assets don't decode
+    unbound); arbitrary purpose tokens (§3.1 is not a closed
+    enumeration) never bind the typed slot.
+  - `GeomSubset` splits accept any purpose-restricted direct
+    binding authored on the subset under the same preference.
+  - **Round-trip** — authored relationship sets that differ from
+    the single synthetic `rel material:binding` (purpose spellings,
+    strength metadata, collection forms, container-level bindings)
+    are preserved verbatim via a tagged stash
+    (`usd:materialBindings` on nodes and primitives, the `bindings`
+    slot of the `usd:subset` marker) and replayed byte-for-byte; a
+    binding resolved purely from an ancestor no longer gains a
+    synthetic gprim-level relationship on re-encode. §3.2
+    collection forms are preserved (evaluation lands with the §15
+    CollectionAPI work). The generic attr replay now also re-emits
+    each attribute's authored `( ... )` metadata block (previously
+    dropped for every stash replay — e.g. a variant-authored
+    `interpolation` block). 10 new integration tests in
+    `tests/material_binding_resolution.rs`.
+
 - **`UsdGeomSubset` per-face material subsets (staged schema
   `usdgeom-usdshade-schema.md` Part 1) — the top "Not yet supported"
   item is closed.** A Mesh prim's `def GeomSubset` children

@@ -79,6 +79,7 @@ pub fn translate(layer: &Layer, archive: Arc<Vec<u8>>, entries: &[ZipEntry]) -> 
         time_codes_per_second: 24.0,
         blendshapes_by_path: HashMap::new(),
         pending_blend_weights: Vec::new(),
+        binding_levels: Vec::new(),
     };
 
     apply_layer_metadata(&mut ctx.scene, &layer.metadata);
@@ -1014,6 +1015,188 @@ struct Ctx {
     /// channels once every mesh (and its morph-target roster) is
     /// built.
     pending_blend_weights: Vec<PendingBlendWeights>,
+    /// Direct `material:binding*` opinions of the container prims
+    /// enclosing the prim currently being built, outermost first —
+    /// pushed/popped around the `build_node` child recursion so a
+    /// gprim can resolve §3.4 rule 1 (bindings inherit down
+    /// namespace; `strongerThanDescendants` ancestors win).
+    binding_levels: Vec<PrimBindingLevel>,
+}
+
+/// One direct material binding (staged schema §3.2 two/three-token
+/// forms): the target `Material` path plus the §3.3
+/// `bindMaterialAs` strength flag.
+#[derive(Clone, Debug)]
+struct DirectBinding {
+    path: String,
+    /// `bindMaterialAs = "strongerThanDescendants"` (§3.3; the
+    /// unauthored default is `weakerThanDescendants`).
+    stronger: bool,
+}
+
+/// The direct `material:binding*` opinions authored on one prim,
+/// split by binding purpose (§3.1): the all-purpose fallback, the
+/// `preview` restriction, and the `full` restriction. Other
+/// (arbitrary) purpose tokens never bind the typed model's single
+/// material slot; they are preserved verbatim for round-trip.
+#[derive(Clone, Debug, Default)]
+struct PrimBindingLevel {
+    all: Option<DirectBinding>,
+    preview: Option<DirectBinding>,
+    full: Option<DirectBinding>,
+}
+
+/// Read one prim's direct `material:binding*` relationships into a
+/// [`PrimBindingLevel`]. §3.2: a direct binding has exactly one
+/// target — a multi-target value is not a direct binding and is
+/// left for the verbatim stash (a reader "should reject, not guess
+/// at" malformed spellings; here the typed slot simply doesn't
+/// bind, while the authored bytes survive).
+fn read_binding_level(prim: &Prim) -> PrimBindingLevel {
+    let mut level = PrimBindingLevel::default();
+    for (name, attr) in &prim.attrs {
+        let Some(rest) = name.strip_prefix("material:binding") else {
+            continue;
+        };
+        // §3.1/§3.2 token count: "" = all-purpose direct,
+        // ":<purpose>" = purpose-restricted direct; the
+        // ":collection:..." forms are evaluated separately.
+        let purpose = match rest {
+            "" => None,
+            _ => match rest.strip_prefix(':') {
+                Some(p) if !p.is_empty() && !p.contains(':') && p != "collection" => Some(p),
+                _ => continue,
+            },
+        };
+        let Some(path) = (match &attr.value {
+            Value::Path(p) => Some(p.clone()),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let stronger = attr
+            .metadata
+            .get("bindMaterialAs")
+            .and_then(|v| v.as_text())
+            .map(|s| s == "strongerThanDescendants")
+            .unwrap_or(false);
+        let binding = DirectBinding { path, stronger };
+        match purpose {
+            None => level.all = Some(binding),
+            Some("preview") => level.preview = Some(binding),
+            Some("full") => level.full = Some(binding),
+            // Arbitrary purpose tokens (§3.1: the purpose position
+            // is not a closed enumeration) — preserved verbatim
+            // only.
+            Some(_) => {}
+        }
+    }
+    level
+}
+
+/// Resolve the direct-binding chain `levels` (outermost ancestor
+/// first, the gprim's own level last) into the winning `Material`
+/// path per the staged schema §3.4 ordered rules, for the typed
+/// model's single material slot:
+///
+/// * **Requested purpose.** The typed model carries one material
+///   per primitive and this crate's material model is
+///   `UsdPreviewSurface` — the *preview* shading schema — so
+///   resolution requests `preview`: a `material:binding:preview`
+///   opinion is preferred over the all-purpose `material:binding`
+///   at the same prim (rule 3). When *no* preview or all-purpose
+///   binding is authored anywhere on the chain, the `full`
+///   restriction resolves as a last resort so an asset authored
+///   only with full-purpose bindings doesn't decode unbound; the
+///   authored spelling always survives verbatim for round-trip.
+/// * **Namespace strength (rule 1).** The binding closest to the
+///   leaf wins — unless an ancestor binding is marked
+///   `strongerThanDescendants` (§3.3), in which case the
+///   *outermost* such ancestor wins.
+fn resolve_direct_binding(levels: &[PrimBindingLevel]) -> Option<String> {
+    let pick = |get: &dyn Fn(&PrimBindingLevel) -> [Option<&DirectBinding>; 2]| -> Option<String> {
+        // Outermost level carrying a strongerThanDescendants
+        // matching binding wins over everything deeper.
+        for level in levels {
+            let [restricted, all] = get(level);
+            if let Some(b) = restricted.filter(|b| b.stronger) {
+                return Some(b.path.clone());
+            }
+            if let Some(b) = all.filter(|b| b.stronger) {
+                return Some(b.path.clone());
+            }
+        }
+        // Otherwise the binding nearest the leaf; restricted
+        // preferred over all-purpose at the same prim (rule 3).
+        for level in levels.iter().rev() {
+            let [restricted, all] = get(level);
+            if let Some(b) = restricted {
+                return Some(b.path.clone());
+            }
+            if let Some(b) = all {
+                return Some(b.path.clone());
+            }
+        }
+        None
+    };
+    pick(&|l: &PrimBindingLevel| [l.preview.as_ref(), l.all.as_ref()])
+        .or_else(|| pick(&|l: &PrimBindingLevel| [l.full.as_ref(), None]))
+}
+
+/// Collect every authored `material:binding*` attribute on a prim —
+/// the direct forms *and* the collection forms — for the verbatim
+/// round-trip stash.
+fn collect_binding_attrs(prim: &Prim) -> BTreeMap<String, Attr> {
+    prim.attrs
+        .iter()
+        .filter(|(name, _)| {
+            name.as_str() == "material:binding" || name.starts_with("material:binding:")
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// `true` when the authored binding set is exactly the shape the
+/// writer synthesises from `Primitive::material` — a single
+/// all-purpose `material:binding` targeting `resolved`, with no
+/// relationship metadata — so no verbatim stash is needed.
+fn bindings_are_synthetic(authored: &BTreeMap<String, Attr>, resolved: Option<&str>) -> bool {
+    if authored.is_empty() {
+        return resolved.is_none();
+    }
+    if authored.len() != 1 {
+        return false;
+    }
+    let Some(attr) = authored.get("material:binding") else {
+        return false;
+    };
+    if !attr.metadata.is_empty() {
+        return false;
+    }
+    match (&attr.value, resolved) {
+        (Value::Path(p), Some(r)) => p == r,
+        _ => false,
+    }
+}
+
+/// Stash the authored `material:binding*` attributes as a shell
+/// prim (the lossless tagged encoding from
+/// [`crate::variant_codec`]) under `usd:materialBindings`, for the
+/// writer to replay verbatim *instead of* synthesising a binding
+/// from the typed material slot. An **empty** stash is meaningful:
+/// it marks "this prim authored no binding — the typed slot was
+/// resolved from an ancestor — emit nothing".
+fn binding_stash_json(authored: &BTreeMap<String, Attr>) -> serde_json::Value {
+    let shell = Prim {
+        spec: String::new(),
+        type_name: String::new(),
+        name: String::new(),
+        metadata: BTreeMap::new(),
+        attrs: authored.clone(),
+        children: Vec::new(),
+        variant_sets: BTreeMap::new(),
+    };
+    crate::variant_codec::encode_prim(&shell)
 }
 
 /// One parsed `def BlendShape` (§1.4).
@@ -1543,6 +1726,20 @@ fn build_node(ctx: &mut Ctx, parent: &str, prim: &Prim) -> Result<Option<oxideav
                     serde_json::Value::String("SkelRoot".into()),
                 );
             }
+            // §3.4 rule 1: direct material bindings inherit down
+            // namespace — push this container's binding opinions
+            // for descendant gprims to resolve against, and stash
+            // the authored relationships verbatim so the writer
+            // replays them on the re-emitted container prim.
+            let binding_level = read_binding_level(prim);
+            let authored_bindings = collect_binding_attrs(prim);
+            if !authored_bindings.is_empty() {
+                node.extras.insert(
+                    "usd:materialBindings".into(),
+                    binding_stash_json(&authored_bindings),
+                );
+            }
+            ctx.binding_levels.push(binding_level);
             // Recurse children — collect the scene-graph children
             // first, push attribute extras after. Mesh children
             // sharing a common stem fold into a single Mesh per
@@ -1600,6 +1797,9 @@ fn build_node(ctx: &mut Ctx, parent: &str, prim: &Prim) -> Result<Option<oxideav
                     i += 1;
                 }
             }
+            // (An early `?` return above discards `ctx` wholesale,
+            // so no unwind bookkeeping is needed on the error path.)
+            ctx.binding_levels.pop();
             node.children = child_ids;
             stash_extras(&mut node.extras, prim);
             // A USD `Scope` is a pure namespace container — it is
@@ -2129,6 +2329,12 @@ struct MaterialFaceSubset {
     family_name: String,
     faces: Vec<u32>,
     material: oxideav_mesh3d::MaterialId,
+    /// The authored `material:binding*` relationship set, stashed
+    /// verbatim (see [`binding_stash_json`]) when it differs from
+    /// the single synthetic `rel material:binding` the writer would
+    /// emit — purpose-restricted spellings, `bindMaterialAs`
+    /// metadata, collection forms.
+    bindings: Option<serde_json::Value>,
     /// Unconsumed attrs / metadata / children of the subset prim,
     /// preserved losslessly for the writer replay. `None` when the
     /// subset carried nothing beyond the schema quartet.
@@ -2240,10 +2446,16 @@ fn apply_geom_subsets(
             .get("familyName")
             .and_then(|a| a.value.as_text())
             .unwrap_or("");
-        let material = sp
-            .attrs
-            .get("material:binding")
-            .and_then(|a| a.value.as_text())
+        // §1.1: a subset is a binding target like any other prim —
+        // its *own authored* direct binding (any §3.1 purpose form,
+        // resolved under the same preview-first preference) selects
+        // the split material. A subset authoring no binding keeps
+        // its faces on the base primitive, which is exactly the
+        // §3.4 fallback through the parent's own resolution.
+        let own_level = read_binding_level(sp);
+        let resolved = resolve_direct_binding(std::slice::from_ref(&own_level));
+        let material = resolved
+            .as_ref()
             .and_then(|rel| ctx.materials_by_path.get(rel).copied());
         if element_type != "face" || material.is_none() {
             // Not a material face subset — preserve the whole prim
@@ -2265,9 +2477,18 @@ fn apply_geom_subsets(
         }
         // Unconsumed opinions on the subset prim ride along.
         let mut stripped = (*sp).clone();
-        for k in ["elementType", "familyName", "indices", "material:binding"] {
+        for k in ["elementType", "familyName", "indices"] {
             stripped.attrs.remove(k);
         }
+        stripped
+            .attrs
+            .retain(|k, _| k != "material:binding" && !k.starts_with("material:binding:"));
+        let authored_bindings = collect_binding_attrs(sp);
+        let bindings_stash = if bindings_are_synthetic(&authored_bindings, resolved.as_deref()) {
+            None
+        } else {
+            Some(binding_stash_json(&authored_bindings))
+        };
         let rest = if stripped.attrs.is_empty()
             && stripped.metadata.is_empty()
             && stripped.children.is_empty()
@@ -2282,6 +2503,7 @@ fn apply_geom_subsets(
             family_name: family_name.to_string(),
             faces,
             material: material.expect("checked above"),
+            bindings: bindings_stash,
             rest,
         });
     }
@@ -2382,6 +2604,9 @@ fn apply_geom_subsets(
                 "familyName".into(),
                 serde_json::Value::String(ms.family_name.clone()),
             );
+        }
+        if let Some(bindings) = &ms.bindings {
+            marker.insert("bindings".into(), bindings.clone());
         }
         if let Some(rest) = &ms.rest {
             marker.insert("rest".into(), rest.clone());
@@ -2564,20 +2789,7 @@ fn build_triangle_primitive(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Pr
         }
     }
 
-    if let Some(rel) = prim
-        .attrs
-        .get("material:binding")
-        .and_then(|a| a.value.as_text())
-    {
-        if let Some(&mid) = ctx.materials_by_path.get(rel) {
-            prim_out.material = Some(mid);
-            if double_sided {
-                if let Some(mat) = ctx.scene.materials.get_mut(mid.0 as usize) {
-                    mat.double_sided = true;
-                }
-            }
-        }
-    }
+    apply_material_binding(ctx, prim, &mut prim_out, double_sided);
 
     apply_skel_binding(ctx, path, prim, &mut prim_out)?;
     apply_blend_shapes(ctx, path, prim, &mut prim_out)?;
@@ -3312,15 +3524,7 @@ fn build_basis_curves_primitive(ctx: &mut Ctx, path: &str, prim: &Prim) -> Resul
         Indices::U32((0..n as u32).collect())
     });
 
-    if let Some(rel) = prim
-        .attrs
-        .get("material:binding")
-        .and_then(|a| a.value.as_text())
-    {
-        if let Some(&mid) = ctx.materials_by_path.get(rel) {
-            prim_out.material = Some(mid);
-        }
-    }
+    apply_material_binding(ctx, prim, &mut prim_out, false);
 
     apply_mesh_metadata_to_primitive(prim, &mut prim_out);
     Ok(prim_out)
@@ -3345,18 +3549,47 @@ fn build_points_primitive(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Prim
         Indices::U32((0..n as u32).collect())
     });
 
-    if let Some(rel) = prim
-        .attrs
-        .get("material:binding")
-        .and_then(|a| a.value.as_text())
-    {
-        if let Some(&mid) = ctx.materials_by_path.get(rel) {
-            prim_out.material = Some(mid);
-        }
-    }
+    apply_material_binding(ctx, prim, &mut prim_out, false);
 
     apply_mesh_metadata_to_primitive(prim, &mut prim_out);
     Ok(prim_out)
+}
+
+/// Resolve a gprim's effective direct material binding (staged
+/// schema §3.1–§3.4: purpose forms, `bindMaterialAs` strength,
+/// rule-1 namespace inheritance from the enclosing containers) into
+/// the typed material slot, and preserve the authored relationship
+/// set for the writer.
+///
+/// The verbatim `usd:materialBindings` stash is written whenever
+/// the authored opinions differ from the single synthetic
+/// `rel material:binding = </resolved>` the writer would emit from
+/// `Primitive::material` — including the **empty** stash, which
+/// marks "this gprim authored nothing; the binding came from an
+/// ancestor; emit no gprim-level relationship".
+fn apply_material_binding(ctx: &mut Ctx, prim: &Prim, out: &mut Primitive, double_sided: bool) {
+    let own_level = read_binding_level(prim);
+    let mut levels: Vec<PrimBindingLevel> = ctx.binding_levels.clone();
+    levels.push(own_level);
+    let resolved = resolve_direct_binding(&levels);
+    if let Some(path) = &resolved {
+        if let Some(&mid) = ctx.materials_by_path.get(path) {
+            out.material = Some(mid);
+            if double_sided {
+                if let Some(mat) = ctx.scene.materials.get_mut(mid.0 as usize) {
+                    mat.double_sided = true;
+                }
+            }
+        }
+    }
+    let authored = collect_binding_attrs(prim);
+    // `bindings_are_synthetic` also covers the ancestor-resolved
+    // case (authored empty + resolved Some ⇒ stash an empty set so
+    // no synthetic gprim-level relationship appears on re-encode).
+    if !bindings_are_synthetic(&authored, resolved.as_deref()) {
+        out.extras
+            .insert("usd:materialBindings".into(), binding_stash_json(&authored));
+    }
 }
 
 /// Surface the round-5 prim-metadata hints

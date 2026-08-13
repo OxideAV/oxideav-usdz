@@ -572,6 +572,14 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
     // UsdGeomXformable contract.
     write_node_transform(w, &node.transform);
 
+    // §3.4 rule 1: a container prim's authored `material:binding*`
+    // relationships (inherited by descendant gprims during decode)
+    // replay verbatim from the decoder's stash.
+    if let Some(stash) = node.extras.get("usd:materialBindings") {
+        let shell = crate::variant_codec::decode_prim(stash);
+        write_attr_map(w, &shell.attrs);
+    }
+
     // Mesh attachment — emit an inner `def Mesh` so its prim path is
     // `<parent>/<node_name>/<mesh_name>`. A skinned node passes its
     // bound skeleton's emitted prim path down so the geometry prim
@@ -774,7 +782,9 @@ fn metadata_lines_from_value_map(
     out
 }
 
-/// Emit `BTreeMap<String, Attr>` as `<type> <name> = <value>` lines.
+/// Emit `BTreeMap<String, Attr>` as `<type> <name> = <value>` lines,
+/// with each attribute's authored `( ... )` metadata block replayed
+/// inline (e.g. `bindMaterialAs`, `interpolation`, `elementSize`).
 fn write_attr_map(w: &mut Out, attrs: &std::collections::BTreeMap<String, crate::usda::Attr>) {
     for (name, attr) in attrs {
         w.write_indent();
@@ -783,9 +793,17 @@ fn write_attr_map(w: &mut Out, attrs: &std::collections::BTreeMap<String, crate:
         } else {
             format!("{} ", attr.type_token)
         };
+        let meta = if attr.metadata.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " ({})",
+                metadata_lines_from_value_map(&attr.metadata).join(", ")
+            )
+        };
         match render_value(&attr.value) {
-            Some(rendered) => writeln!(w.s, "{type_token}{name} = {rendered}").unwrap(),
-            None => writeln!(w.s, "{type_token}{name}").unwrap(),
+            Some(rendered) => writeln!(w.s, "{type_token}{name} = {rendered}{meta}").unwrap(),
+            None => writeln!(w.s, "{type_token}{name}{meta}").unwrap(),
         }
     }
 }
@@ -1245,13 +1263,12 @@ fn write_one_mesh_prim(
         w.write_indent();
         writeln!(w.s, "uniform bool doubleSided = 1").unwrap();
     }
-    if let Some(mat_id) = prim.material {
-        if let Some(mat) = scene.materials.get(mat_id.0 as usize) {
-            let mat_name = material_prim_name(mat, mat_id.0 as usize);
-            w.write_indent();
-            writeln!(w.s, "rel material:binding = </Materials/{mat_name}>").unwrap();
-        }
-    }
+    write_material_binding(
+        w,
+        scene,
+        prim.material,
+        prim.extras.get("usd:materialBindings"),
+    );
     // UsdSkel BindingAPI (§1.5 / §1.6): the skeleton relationship
     // plus the per-vertex joint influences in the canonical layout
     // (`vertex` interpolation, `elementSize = 4` matching the typed
@@ -1368,6 +1385,10 @@ struct SubsetChild {
     face_start: u32,
     face_count: u32,
     material: Option<MaterialId>,
+    /// Authored `material:binding*` relationship set to replay
+    /// verbatim instead of synthesising from `material` (decoded
+    /// from the `usd:subset` marker's `bindings` slot).
+    bindings: Option<crate::usda::Prim>,
     /// Extra authored opinions preserved from the source subset
     /// prim (decoded from the `usd:subset` marker's `rest` slot).
     rest: Option<crate::usda::Prim>,
@@ -1416,11 +1437,18 @@ fn write_geom_subset_child(w: &mut Out, scene: &Scene3D, sub: &SubsetChild) {
         write!(w.s, "{}", sub.face_start + i).unwrap();
     }
     writeln!(w.s, "]").unwrap();
-    if let Some(mat_id) = sub.material {
-        if let Some(mat) = scene.materials.get(mat_id.0 as usize) {
-            let mat_name = material_prim_name(mat, mat_id.0 as usize);
-            w.write_indent();
-            writeln!(w.s, "rel material:binding = </Materials/{mat_name}>").unwrap();
+    match &sub.bindings {
+        // Authored relationship set preserved verbatim (purpose
+        // forms, bindMaterialAs metadata, collection forms).
+        Some(bindings) => write_attr_map(w, &bindings.attrs),
+        None => {
+            if let Some(mat_id) = sub.material {
+                if let Some(mat) = scene.materials.get(mat_id.0 as usize) {
+                    let mat_name = material_prim_name(mat, mat_id.0 as usize);
+                    w.write_indent();
+                    writeln!(w.s, "rel material:binding = </Materials/{mat_name}>").unwrap();
+                }
+            }
         }
     }
     if let Some(rest) = &sub.rest {
@@ -1435,6 +1463,32 @@ fn write_geom_subset_child(w: &mut Out, scene: &Scene3D, sub: &SubsetChild) {
     w.indent -= 1;
     w.write_indent();
     writeln!(w.s, "}}").unwrap();
+}
+
+/// Emit a gprim's `material:binding*` relationships: replay the
+/// decoder's verbatim `usd:materialBindings` stash when present
+/// (staged schema §3.1–§3.3 spellings survive byte-for-byte, and an
+/// **empty** stash means the binding was inherited from an ancestor
+/// — emit nothing), otherwise synthesise the single all-purpose
+/// `rel material:binding` from the typed material slot.
+fn write_material_binding(
+    w: &mut Out,
+    scene: &Scene3D,
+    material: Option<MaterialId>,
+    stash: Option<&serde_json::Value>,
+) {
+    if let Some(stash) = stash {
+        let shell = crate::variant_codec::decode_prim(stash);
+        write_attr_map(w, &shell.attrs);
+        return;
+    }
+    if let Some(mat_id) = material {
+        if let Some(mat) = scene.materials.get(mat_id.0 as usize) {
+            let mat_name = material_prim_name(mat, mat_id.0 as usize);
+            w.write_indent();
+            writeln!(w.s, "rel material:binding = </Materials/{mat_name}>").unwrap();
+        }
+    }
 }
 
 /// Re-author a decoder-split subset mesh as a **single**
@@ -1523,6 +1577,9 @@ fn write_subset_mesh(
             face_start,
             face_count,
             material: prim.material,
+            bindings: marker
+                .get("bindings")
+                .map(crate::variant_codec::decode_prim),
             rest: marker.get("rest").map(crate::variant_codec::decode_prim),
         });
     }
@@ -2442,13 +2499,12 @@ fn write_basis_curves_prim(w: &mut Out, scene: &Scene3D, prim: &Primitive, prim_
     };
     writeln!(w.s, "uniform token wrap = \"{wrap}\"").unwrap();
 
-    if let Some(mat_id) = prim.material {
-        if let Some(mat) = scene.materials.get(mat_id.0 as usize) {
-            let mat_name = material_prim_name(mat, mat_id.0 as usize);
-            w.write_indent();
-            writeln!(w.s, "rel material:binding = </Materials/{mat_name}>").unwrap();
-        }
-    }
+    write_material_binding(
+        w,
+        scene,
+        prim.material,
+        prim.extras.get("usd:materialBindings"),
+    );
     w.indent -= 1;
     w.write_indent();
     writeln!(w.s, "}}").unwrap();
@@ -2505,13 +2561,12 @@ fn write_points_prim(w: &mut Out, scene: &Scene3D, prim: &Primitive, prim_name: 
     }
     writeln!(w.s, "]").unwrap();
 
-    if let Some(mat_id) = prim.material {
-        if let Some(mat) = scene.materials.get(mat_id.0 as usize) {
-            let mat_name = material_prim_name(mat, mat_id.0 as usize);
-            w.write_indent();
-            writeln!(w.s, "rel material:binding = </Materials/{mat_name}>").unwrap();
-        }
-    }
+    write_material_binding(
+        w,
+        scene,
+        prim.material,
+        prim.extras.get("usd:materialBindings"),
+    );
     w.indent -= 1;
     w.write_indent();
     writeln!(w.s, "}}").unwrap();
