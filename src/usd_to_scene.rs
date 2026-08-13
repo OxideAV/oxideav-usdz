@@ -80,6 +80,7 @@ pub fn translate(layer: &Layer, archive: Arc<Vec<u8>>, entries: &[ZipEntry]) -> 
         blendshapes_by_path: HashMap::new(),
         pending_blend_weights: Vec::new(),
         binding_levels: Vec::new(),
+        collections: HashMap::new(),
     };
 
     apply_layer_metadata(&mut ctx.scene, &layer.metadata);
@@ -240,6 +241,16 @@ pub fn translate(layer: &Layer, archive: Arc<Vec<u8>>, entries: &[ZipEntry]) -> 
     // read them locally.
     for prim in &mut resolved {
         propagate_skel_bindings(prim);
+    }
+
+    // CollectionAPI pre-pass (Core Specification §15): index every
+    // `collection:<inst>:*` opinion by its property path so
+    // `material:binding:collection:*` targets resolve during the
+    // node walk regardless of declaration order.
+    {
+        let mut collections = HashMap::new();
+        index_collections(&mut collections, "", &resolved);
+        ctx.collections = collections;
     }
 
     // UsdSkel pre-pass: register every `def Skeleton` (joint nodes +
@@ -1021,6 +1032,202 @@ struct Ctx {
     /// gprim can resolve §3.4 rule 1 (bindings inherit down
     /// namespace; `strongerThanDescendants` ancestors win).
     binding_levels: Vec<PrimBindingLevel>,
+    /// Every CollectionAPI instance in the composed layer, keyed by
+    /// its property path (`</prim/path.collection:instName>`) —
+    /// built by a pre-pass so `material:binding:collection:*`
+    /// targets resolve regardless of declaration order (AOUSD Core
+    /// Specification §15).
+    collections: HashMap<String, CollectionDef>,
+}
+
+/// §15.1.1.1 `expansionRule` allowed values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExpansionRule {
+    ExplicitOnly,
+    ExpandPrims,
+    ExpandPrimsAndProperties,
+}
+
+/// One CollectionAPI instance (§15.1): the includes / excludes
+/// relationship targets plus the expansion knobs.
+#[derive(Clone, Debug)]
+struct CollectionDef {
+    includes: Vec<String>,
+    excludes: Vec<String>,
+    expansion: ExpansionRule,
+    include_root: bool,
+}
+
+impl Default for CollectionDef {
+    fn default() -> Self {
+        CollectionDef {
+            includes: Vec::new(),
+            excludes: Vec::new(),
+            // §15.1.1.1 fallback.
+            expansion: ExpansionRule::ExpandPrims,
+            include_root: false,
+        }
+    }
+}
+
+/// Flatten a relationship value's target list (single path, array
+/// of paths, or a list-edited opinion) into absolute path strings.
+fn rel_target_paths(v: &Value) -> Vec<String> {
+    match listedited_items(Some(v)) {
+        Some(items) => items
+            .iter()
+            .filter_map(|item| match item {
+                Value::Path(p) => Some(p.clone()),
+                _ => None,
+            })
+            .collect(),
+        None => match v {
+            Value::Path(p) => vec![p.clone()],
+            Value::Array(items) => items
+                .iter()
+                .filter_map(|item| match item {
+                    Value::Path(p) => Some(p.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        },
+    }
+}
+
+/// Walk the composed prim tree once and index every CollectionAPI
+/// instance (§15.1): `collection:<inst>:includes` / `:excludes`
+/// relationships plus the `:expansionRule` / `:includeRoot`
+/// attributes, keyed by `<prim path>.collection:<inst>`.
+fn index_collections(map: &mut HashMap<String, CollectionDef>, parent: &str, prims: &[Prim]) {
+    for prim in prims {
+        let path = join_path(parent, &prim.name);
+        let mut instances: BTreeMap<String, CollectionDef> = BTreeMap::new();
+        for (name, attr) in &prim.attrs {
+            let Some(rest) = name.strip_prefix("collection:") else {
+                continue;
+            };
+            let Some((inst, field)) = rest.rsplit_once(':') else {
+                continue;
+            };
+            if inst.is_empty() {
+                continue;
+            }
+            let def = instances.entry(inst.to_string()).or_default();
+            match field {
+                "includes" => def.includes = rel_target_paths(&attr.value),
+                "excludes" => def.excludes = rel_target_paths(&attr.value),
+                "expansionRule" => {
+                    def.expansion = match attr.value.as_text() {
+                        Some("explicitOnly") => ExpansionRule::ExplicitOnly,
+                        Some("expandPrimsAndProperties") => ExpansionRule::ExpandPrimsAndProperties,
+                        // Fallback (and any unknown token): expandPrims.
+                        _ => ExpansionRule::ExpandPrims,
+                    }
+                }
+                "includeRoot" => {
+                    def.include_root = matches!(&attr.value, Value::Bool(true))
+                        || attr.value.as_f32().is_some_and(|f| f != 0.0)
+                        || attr.value.as_text().is_some_and(|s| s == "true");
+                }
+                _ => {}
+            }
+        }
+        for (inst, def) in instances {
+            map.insert(format!("{path}.collection:{inst}"), def);
+        }
+        index_collections(map, &path, &prim.children);
+    }
+}
+
+/// `true` when prim path `p` is `root` or a namespace descendant of
+/// it. The absolute root `/` contains every prim.
+fn at_or_under(p: &str, root: &str) -> bool {
+    if root == "/" {
+        return true;
+    }
+    p == root || (p.len() > root.len() && p.starts_with(root) && p.as_bytes()[root.len()] == b'/')
+}
+
+/// §15.2 membership test: does the collection at property path
+/// `coll` contain the prim at `p`?
+///
+/// * `expandPrims` / `expandPrimsAndProperties`: an included prim
+///   path contributes itself and all its descendants (for prim
+///   membership the two rules agree — properties are not prims).
+/// * `explicitOnly`: only the exact listed paths.
+/// * `includeRoot` (§15.1.1.2): the absolute root — every prim.
+/// * An include targeting another collection's property path
+///   contributes that collection's members recursively (cycle
+///   guarded).
+/// * Excludes subtract at-or-under the excluded prim path; an
+///   *orphaned* exclude — one that is not itself in the pre-exclude
+///   included set — is inert per §15.2. Property-path excludes
+///   cannot affect prim membership.
+fn collection_contains(map: &HashMap<String, CollectionDef>, coll: &str, p: &str) -> bool {
+    fn pre_member(
+        map: &HashMap<String, CollectionDef>,
+        def: &CollectionDef,
+        p: &str,
+        stack: &mut std::collections::HashSet<String>,
+    ) -> bool {
+        if def.include_root {
+            return true;
+        }
+        for inc in &def.includes {
+            if let Some(dot) = inc.find('.') {
+                // Property-path include: only a `collection:` target
+                // contributes prim members (recursively).
+                if inc[dot + 1..].starts_with("collection:") && contains_inner(map, inc, p, stack) {
+                    return true;
+                }
+                continue;
+            }
+            let hit = match def.expansion {
+                ExpansionRule::ExplicitOnly => p == inc,
+                _ => at_or_under(p, inc),
+            };
+            if hit {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn contains_inner(
+        map: &HashMap<String, CollectionDef>,
+        coll: &str,
+        p: &str,
+        stack: &mut std::collections::HashSet<String>,
+    ) -> bool {
+        if !stack.insert(coll.to_string()) {
+            // Include cycle — already being evaluated above us.
+            return false;
+        }
+        let result = match map.get(coll) {
+            Some(def) if pre_member(map, def, p, stack) => {
+                !def.excludes.iter().any(|e| {
+                    if e.contains('.') {
+                        // §15.1.1.4: property excludes (which may
+                        // not target collections) don't remove
+                        // prim members.
+                        return false;
+                    }
+                    let applies = match def.expansion {
+                        ExpansionRule::ExplicitOnly => p == e,
+                        _ => at_or_under(p, e),
+                    };
+                    // Orphaned excludes are inert.
+                    applies && pre_member(map, def, e, stack)
+                })
+            }
+            _ => false,
+        };
+        stack.remove(coll);
+        result
+    }
+
+    contains_inner(map, coll, p, &mut std::collections::HashSet::new())
 }
 
 /// One direct material binding (staged schema §3.2 two/three-token
@@ -1034,16 +1241,39 @@ struct DirectBinding {
     stronger: bool,
 }
 
-/// The direct `material:binding*` opinions authored on one prim,
-/// split by binding purpose (§3.1): the all-purpose fallback, the
-/// `preview` restriction, and the `full` restriction. Other
-/// (arbitrary) purpose tokens never bind the typed model's single
-/// material slot; they are preserved verbatim for round-trip.
+/// One collection binding (§3.2 four/five-token forms): the
+/// collection property path + material path pair, with purpose and
+/// §3.3 strength.
+#[derive(Clone, Debug)]
+struct CollectionBinding {
+    /// Full relationship name (`material:binding:collection:...`) —
+    /// the §3.4 rule-5 ordering key.
+    rel_name: String,
+    /// `None` = all-purpose; `Some` for `preview` / `full` (other
+    /// purpose tokens never bind the typed slot and aren't stored).
+    purpose: Option<&'static str>,
+    collection: String,
+    material: String,
+    stronger: bool,
+}
+
+/// The `material:binding*` opinions authored on one prim, split by
+/// binding purpose (§3.1): the all-purpose fallback, the `preview`
+/// restriction, and the `full` restriction, plus the collection
+/// bindings in §3.4 rule-5 property order. Other (arbitrary)
+/// purpose tokens never bind the typed model's single material
+/// slot; they are preserved verbatim for round-trip.
 #[derive(Clone, Debug, Default)]
 struct PrimBindingLevel {
     all: Option<DirectBinding>,
     preview: Option<DirectBinding>,
     full: Option<DirectBinding>,
+    /// Collection bindings in the normative property order — name-
+    /// sorted (Core Specification §11.3.2 path-element ordering)
+    /// with the prim's strongest authored `propertyOrder`
+    /// (§7.6.2.4.6) applied: listed names first in listed order,
+    /// absent ones after.
+    collections: Vec<CollectionBinding>,
 }
 
 /// Read one prim's direct `material:binding*` relationships into a
@@ -1058,13 +1288,58 @@ fn read_binding_level(prim: &Prim) -> PrimBindingLevel {
         let Some(rest) = name.strip_prefix("material:binding") else {
             continue;
         };
-        // §3.1/§3.2 token count: "" = all-purpose direct,
-        // ":<purpose>" = purpose-restricted direct; the
-        // ":collection:..." forms are evaluated separately.
+        let stronger = attr
+            .metadata
+            .get("bindMaterialAs")
+            .and_then(|v| v.as_text())
+            .map(|s| s == "strongerThanDescendants")
+            .unwrap_or(false);
+        // §3.2 four/five-token collection forms.
+        if let Some(tail) = rest.strip_prefix(":collection:") {
+            let purpose = match tail.split(':').collect::<Vec<_>>()[..] {
+                [n] if !n.is_empty() => None,
+                [p, n] if !p.is_empty() && !n.is_empty() => match p {
+                    "preview" => Some("preview"),
+                    "full" => Some("full"),
+                    // Arbitrary purpose tokens never bind the
+                    // typed slot; preserved verbatim only.
+                    _ => continue,
+                },
+                // ≥ 6 tokens — not a §3.2 spelling.
+                _ => continue,
+            };
+            // §3.2: exactly two targets — one collection property
+            // path and one Material prim path. The pairing is
+            // classified structurally (the collection target is the
+            // one carrying `.collection:`), and anything else is
+            // rejected for the typed slot (never guessed at) while
+            // surviving verbatim in the stash.
+            let targets = rel_target_paths(&attr.value);
+            let [a, b] = &targets[..] else {
+                continue;
+            };
+            let (collection, material) = if a.contains(".collection:") && !b.contains('.') {
+                (a.clone(), b.clone())
+            } else if b.contains(".collection:") && !a.contains('.') {
+                (b.clone(), a.clone())
+            } else {
+                continue;
+            };
+            level.collections.push(CollectionBinding {
+                rel_name: name.clone(),
+                purpose,
+                collection,
+                material,
+                stronger,
+            });
+            continue;
+        }
+        // §3.1/§3.2 direct forms: "" = all-purpose,
+        // ":<purpose>" = purpose-restricted.
         let purpose = match rest {
             "" => None,
             _ => match rest.strip_prefix(':') {
-                Some(p) if !p.is_empty() && !p.contains(':') && p != "collection" => Some(p),
+                Some(p) if !p.is_empty() && !p.contains(':') => Some(p),
                 _ => continue,
             },
         };
@@ -1074,12 +1349,6 @@ fn read_binding_level(prim: &Prim) -> PrimBindingLevel {
         }) else {
             continue;
         };
-        let stronger = attr
-            .metadata
-            .get("bindMaterialAs")
-            .and_then(|v| v.as_text())
-            .map(|s| s == "strongerThanDescendants")
-            .unwrap_or(false);
         let binding = DirectBinding { path, stronger };
         match purpose {
             None => level.all = Some(binding),
@@ -1091,56 +1360,117 @@ fn read_binding_level(prim: &Prim) -> PrimBindingLevel {
             Some(_) => {}
         }
     }
+    // §3.4 rule 5: among collection bindings on one prim, native
+    // property order decides — §11.3.2 pins that as name-sorted
+    // (the BTreeMap walk above) reordered by the strongest authored
+    // `propertyOrder` (§7.6.2.4.6: listed names first, in listed
+    // order; absent names after).
+    if let Some(order) = prim
+        .metadata
+        .get("propertyOrder")
+        .and_then(|v| v.as_seq())
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|v| v.as_text())
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        })
+    {
+        level.collections.sort_by_key(|cb| {
+            order
+                .iter()
+                .position(|n| *n == cb.rel_name)
+                .unwrap_or(usize::MAX)
+        });
+    }
     level
 }
 
-/// Resolve the direct-binding chain `levels` (outermost ancestor
-/// first, the gprim's own level last) into the winning `Material`
-/// path per the staged schema §3.4 ordered rules, for the typed
-/// model's single material slot:
+/// Resolve the binding chain `levels` (outermost ancestor first,
+/// the gprim's own level last) for the gprim at absolute path `g`
+/// into the winning `Material` path per the staged schema §3.4
+/// ordered rules, for the typed model's single material slot:
 ///
 /// * **Requested purpose.** The typed model carries one material
 ///   per primitive and this crate's material model is
 ///   `UsdPreviewSurface` — the *preview* shading schema — so
-///   resolution requests `preview`: a `material:binding:preview`
-///   opinion is preferred over the all-purpose `material:binding`
+///   resolution requests `preview`: a `preview`-restricted opinion
+///   is preferred over the all-purpose one within the same class
 ///   at the same prim (rule 3). When *no* preview or all-purpose
-///   binding is authored anywhere on the chain, the `full`
-///   restriction resolves as a last resort so an asset authored
-///   only with full-purpose bindings doesn't decode unbound; the
-///   authored spelling always survives verbatim for round-trip.
+///   binding matches anywhere on the chain, the `full` restriction
+///   resolves as a last resort so an asset authored only with
+///   full-purpose bindings doesn't decode unbound; the authored
+///   spelling always survives verbatim for round-trip.
+/// * **Collections (rules 2, 4, 5, 6).** A collection binding
+///   matches when its collection contains `g` (§15 membership;
+///   rule 2's at-or-beneath-the-owner restriction is satisfied by
+///   construction — every level *is* an ancestor of `g`). At one
+///   prim, collection bindings beat direct bindings (rule 4);
+///   among collection bindings, the §11.3.2 property order decides
+///   (rule 5); membership is boolean, so namespace specificity
+///   within a collection never enters (rule 6).
 /// * **Namespace strength (rule 1).** The binding closest to the
 ///   leaf wins — unless an ancestor binding is marked
 ///   `strongerThanDescendants` (§3.3), in which case the
 ///   *outermost* such ancestor wins.
-fn resolve_direct_binding(levels: &[PrimBindingLevel]) -> Option<String> {
-    let pick = |get: &dyn Fn(&PrimBindingLevel) -> [Option<&DirectBinding>; 2]| -> Option<String> {
-        // Outermost level carrying a strongerThanDescendants
-        // matching binding wins over everything deeper.
-        for level in levels {
-            let [restricted, all] = get(level);
-            if let Some(b) = restricted.filter(|b| b.stronger) {
-                return Some(b.path.clone());
+fn resolve_binding(
+    levels: &[PrimBindingLevel],
+    collections: &HashMap<String, CollectionDef>,
+    g: &str,
+) -> Option<String> {
+    // One prim's ordered candidates for a requested restricted
+    // purpose: collection-restricted, collection-all-purpose,
+    // direct-restricted, direct-all-purpose (rule 4 ranks the
+    // classes; rule 3 ranks purposes within each class).
+    let match_at = |level: &PrimBindingLevel,
+                    restricted: &str,
+                    with_all: bool,
+                    stronger_only: bool|
+     -> Option<String> {
+        for want in [Some(restricted), None] {
+            if want.is_none() && !with_all {
+                continue;
             }
-            if let Some(b) = all.filter(|b| b.stronger) {
-                return Some(b.path.clone());
+            for cb in &level.collections {
+                if cb.purpose == want
+                    && (!stronger_only || cb.stronger)
+                    && collection_contains(collections, &cb.collection, g)
+                {
+                    return Some(cb.material.clone());
+                }
             }
         }
-        // Otherwise the binding nearest the leaf; restricted
-        // preferred over all-purpose at the same prim (rule 3).
-        for level in levels.iter().rev() {
-            let [restricted, all] = get(level);
-            if let Some(b) = restricted {
-                return Some(b.path.clone());
-            }
-            if let Some(b) = all {
+        let direct = if restricted == "preview" {
+            &level.preview
+        } else {
+            &level.full
+        };
+        if let Some(b) = direct.as_ref().filter(|b| !stronger_only || b.stronger) {
+            return Some(b.path.clone());
+        }
+        if with_all {
+            if let Some(b) = level.all.as_ref().filter(|b| !stronger_only || b.stronger) {
                 return Some(b.path.clone());
             }
         }
         None
     };
-    pick(&|l: &PrimBindingLevel| [l.preview.as_ref(), l.all.as_ref()])
-        .or_else(|| pick(&|l: &PrimBindingLevel| [l.full.as_ref(), None]))
+    for (restricted, with_all) in [("preview", true), ("full", false)] {
+        // Outermost level carrying a strongerThanDescendants
+        // matching binding wins over everything deeper.
+        for level in levels {
+            if let Some(m) = match_at(level, restricted, with_all, true) {
+                return Some(m);
+            }
+        }
+        // Otherwise the matching binding nearest the leaf.
+        for level in levels.iter().rev() {
+            if let Some(m) = match_at(level, restricted, with_all, false) {
+                return Some(m);
+            }
+        }
+    }
+    None
 }
 
 /// Collect every authored `material:binding*` attribute on a prim —
@@ -1152,6 +1482,17 @@ fn collect_binding_attrs(prim: &Prim) -> BTreeMap<String, Attr> {
         .filter(|(name, _)| {
             name.as_str() == "material:binding" || name.starts_with("material:binding:")
         })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// Collect every authored CollectionAPI property (§15.1 —
+/// `collection:<inst>:*`) on a prim for the verbatim round-trip
+/// stash.
+fn collect_collection_attrs(prim: &Prim) -> BTreeMap<String, Attr> {
+    prim.attrs
+        .iter()
+        .filter(|(name, _)| name.starts_with("collection:"))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
 }
@@ -1737,6 +2078,14 @@ fn build_node(ctx: &mut Ctx, parent: &str, prim: &Prim) -> Result<Option<oxideav
                 node.extras.insert(
                     "usd:materialBindings".into(),
                     binding_stash_json(&authored_bindings),
+                );
+            }
+            // §15.1 CollectionAPI properties round-trip verbatim.
+            let authored_collections = collect_collection_attrs(prim);
+            if !authored_collections.is_empty() {
+                node.extras.insert(
+                    "usd:collections".into(),
+                    binding_stash_json(&authored_collections),
                 );
             }
             ctx.binding_levels.push(binding_level);
@@ -2447,13 +2796,14 @@ fn apply_geom_subsets(
             .and_then(|a| a.value.as_text())
             .unwrap_or("");
         // §1.1: a subset is a binding target like any other prim —
-        // its *own authored* direct binding (any §3.1 purpose form,
-        // resolved under the same preview-first preference) selects
-        // the split material. A subset authoring no binding keeps
-        // its faces on the base primitive, which is exactly the
-        // §3.4 fallback through the parent's own resolution.
+        // its *own authored* binding (any §3.1 purpose form, direct
+        // or collection, resolved under the same preview-first
+        // preference) selects the split material. A subset
+        // authoring no binding keeps its faces on the base
+        // primitive, which is exactly the §3.4 fallback through the
+        // parent's own resolution.
         let own_level = read_binding_level(sp);
-        let resolved = resolve_direct_binding(std::slice::from_ref(&own_level));
+        let resolved = resolve_binding(std::slice::from_ref(&own_level), &ctx.collections, &spath);
         let material = resolved
             .as_ref()
             .and_then(|rel| ctx.materials_by_path.get(rel).copied());
@@ -2789,7 +3139,7 @@ fn build_triangle_primitive(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Pr
         }
     }
 
-    apply_material_binding(ctx, prim, &mut prim_out, double_sided);
+    apply_material_binding(ctx, path, prim, &mut prim_out, double_sided);
 
     apply_skel_binding(ctx, path, prim, &mut prim_out)?;
     apply_blend_shapes(ctx, path, prim, &mut prim_out)?;
@@ -3524,7 +3874,7 @@ fn build_basis_curves_primitive(ctx: &mut Ctx, path: &str, prim: &Prim) -> Resul
         Indices::U32((0..n as u32).collect())
     });
 
-    apply_material_binding(ctx, prim, &mut prim_out, false);
+    apply_material_binding(ctx, path, prim, &mut prim_out, false);
 
     apply_mesh_metadata_to_primitive(prim, &mut prim_out);
     Ok(prim_out)
@@ -3549,17 +3899,17 @@ fn build_points_primitive(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Prim
         Indices::U32((0..n as u32).collect())
     });
 
-    apply_material_binding(ctx, prim, &mut prim_out, false);
+    apply_material_binding(ctx, path, prim, &mut prim_out, false);
 
     apply_mesh_metadata_to_primitive(prim, &mut prim_out);
     Ok(prim_out)
 }
 
-/// Resolve a gprim's effective direct material binding (staged
-/// schema §3.1–§3.4: purpose forms, `bindMaterialAs` strength,
-/// rule-1 namespace inheritance from the enclosing containers) into
-/// the typed material slot, and preserve the authored relationship
-/// set for the writer.
+/// Resolve a gprim's effective material binding (staged schema
+/// §3.1–§3.4: purpose forms, `bindMaterialAs` strength, rule-1
+/// namespace inheritance from the enclosing containers, and §15
+/// collection bindings) into the typed material slot, and preserve
+/// the authored relationship set for the writer.
 ///
 /// The verbatim `usd:materialBindings` stash is written whenever
 /// the authored opinions differ from the single synthetic
@@ -3567,11 +3917,17 @@ fn build_points_primitive(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Prim
 /// `Primitive::material` — including the **empty** stash, which
 /// marks "this gprim authored nothing; the binding came from an
 /// ancestor; emit no gprim-level relationship".
-fn apply_material_binding(ctx: &mut Ctx, prim: &Prim, out: &mut Primitive, double_sided: bool) {
+fn apply_material_binding(
+    ctx: &mut Ctx,
+    path: &str,
+    prim: &Prim,
+    out: &mut Primitive,
+    double_sided: bool,
+) {
     let own_level = read_binding_level(prim);
     let mut levels: Vec<PrimBindingLevel> = ctx.binding_levels.clone();
     levels.push(own_level);
-    let resolved = resolve_direct_binding(&levels);
+    let resolved = resolve_binding(&levels, &ctx.collections, path);
     if let Some(path) = &resolved {
         if let Some(&mid) = ctx.materials_by_path.get(path) {
             out.material = Some(mid);
@@ -3589,6 +3945,15 @@ fn apply_material_binding(ctx: &mut Ctx, prim: &Prim, out: &mut Primitive, doubl
     if !bindings_are_synthetic(&authored, resolved.as_deref()) {
         out.extras
             .insert("usd:materialBindings".into(), binding_stash_json(&authored));
+    }
+    // §15.1 CollectionAPI properties authored on the gprim itself
+    // round-trip verbatim.
+    let authored_collections = collect_collection_attrs(prim);
+    if !authored_collections.is_empty() {
+        out.extras.insert(
+            "usd:collections".into(),
+            binding_stash_json(&authored_collections),
+        );
     }
 }
 

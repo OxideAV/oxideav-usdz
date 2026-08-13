@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Collection material bindings — AOUSD Core Specification §15
+  CollectionAPI evaluated through the staged schema's §3.2/§3.4
+  collection forms.** The four/five-token
+  `material:binding:collection:[<purpose>:]<name>` relationships now
+  resolve into the typed material slot instead of being
+  preserve-only:
+  - **§15 membership** — a pre-pass indexes every
+    `collection:<inst>:{includes,excludes,expansionRule,includeRoot}`
+    opinion by property path; membership implements `expandPrims`
+    (included prim + descendants) / `explicitOnly` (exact paths) /
+    `expandPrimsAndProperties`, `includeRoot`, excludes as subtree
+    subtraction with **orphaned excludes inert** per §15.2,
+    property-path excludes never removing prim members, and includes
+    targeting *other collections* contributing their members
+    recursively (cycle-guarded).
+  - **§3.4 rules 2/4/5/6** — a collection binding applies to
+    members below the owning prim (rule 2, by construction of the
+    ancestor chain); at one prim collection bindings beat direct
+    bindings (rule 4); among collection bindings the **normative
+    property order** decides (rule 5) — name-sorted per Core
+    Specification §11.3.2 with the strongest authored
+    `propertyOrder` (§7.6.2.4.6) applied, so the schema doc's
+    Chair/Rivet example resolves to the earlier collection even
+    though the later one names the prim more specifically (rule 6);
+    §3.3 `bindMaterialAs` strength and the preview-first purpose
+    preference apply across classes. The §3.2 two-target rule is
+    enforced structurally (the collection target is the one carrying
+    `.collection:`; anything else never binds and is never guessed
+    at).
+  - **Round-trip** — CollectionAPI properties on containers and
+    gprims are preserved verbatim (`usd:collections` tagged stash)
+    and replayed; a subset prim's collection properties ride its
+    `rest` slot. 10 new integration tests in
+    `tests/collection_bindings.rs`, including the §15.2 worked
+    examples (office/bookshelf excludes, referenced collections)
+    and both rule-5/rule-6 orderings.
+
 - **`material:binding` purpose forms, `bindMaterialAs` strength, and
   namespace inheritance (staged schema Part 3 §3.1–§3.4).** Direct
   bindings now resolve per the schema's ordered rules instead of
