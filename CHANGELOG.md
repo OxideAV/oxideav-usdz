@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **UsdSkel inbetween shapes (staged schema §1.4.1, added
+  2026-08-10) — the "inbetweens are not yet modelled" limitation is
+  closed.** An `inbetweens:<name>` attribute on a `BlendShape` (its
+  target weight in the attribute's `weight` **metadata** field, per
+  the staged encoding) now decodes: a channel with k valid
+  inbetweens expands into k + 1 consecutive morph targets
+  (ascending-weight inbetweens, then the primary shape), and the
+  channel's scalar weight animation bakes into per-target weights
+  through the documented piecewise-linear resolution — implicit
+  0/1 endpoints, bracketing-pair interpolation, **unbounded**
+  extrapolation (the doc's `w = −0.25` ⇒ shape-at-0.25 × −1 worked
+  example is a test). Keyframes are inserted wherever a scalar ramp
+  crosses an inbetween weight, so the typed model's linear
+  interpolation reproduces the USD evaluation *exactly*; the writer
+  inverts the bake in closed form (`w = Σ vⱼ·knotⱼ`) and re-emits
+  the original scalar `blendShapeWeights` samples, making
+  encode → decode → encode a one-cycle fixed point. The prim-level
+  `pointIndices` governs every inbetween's arrays (§1.4.1);
+  authoring errors — weight 0/1, duplicate weights, missing weight
+  metadata — are ignored for evaluation per the documented
+  error-but-continue behaviour but preserved and replayed verbatim;
+  per-inbetween normal offsets are **discovered by enumeration** of
+  deeper `inbetweens:<name>:*` attributes (the spelling is
+  unpublished — §1.4.2) and replay under their exact authored name.
+  6 new integration tests in `tests/usdskel_inbetweens.rs`.
+
 - **Collection material bindings — AOUSD Core Specification §15
   CollectionAPI evaluated through the staged schema's §3.2/§3.4
   collection forms.** The four/five-token

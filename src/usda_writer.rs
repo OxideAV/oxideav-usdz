@@ -1664,90 +1664,184 @@ fn write_blend_shapes(w: &mut Out, prim: &Primitive, prim_path: &str) {
     if prim.targets.is_empty() {
         return;
     }
-    let names: Vec<String> = {
-        let stashed: Vec<String> = prim
-            .extras
-            .get("usd:skel:blendShapes")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(sanitize_prim_name))
-                    .collect()
-            })
-            .unwrap_or_default();
-        (0..prim.targets.len())
-            .map(|i| {
-                stashed
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(|| format!("shape_{i}"))
-            })
-            .collect()
-    };
+    // §1.4.1 group layout: channel i owns (inbetweens + 1)
+    // consecutive targets. A plain roster (no `usd:skel:inbetweens`
+    // stash) degenerates to one target per channel; targets beyond
+    // the roster emit as `shape_<i>` single-target channels.
+    let mut groups = blend_channel_groups(prim);
+    {
+        let covered: usize = groups.iter().map(|g| g.inbetweens.len() + 1).sum();
+        for i in covered..prim.targets.len() {
+            groups.push(BlendChannelGroup {
+                name: format!("shape_{i}"),
+                inbetweens: Vec::new(),
+                malformed: None,
+            });
+        }
+    }
 
     w.write_indent();
     write!(w.s, "uniform token[] skel:blendShapes = [").unwrap();
-    for (i, name) in names.iter().enumerate() {
+    for (i, g) in groups.iter().enumerate() {
         if i > 0 {
             w.s.push_str(", ");
         }
-        write!(w.s, "\"{name}\"").unwrap();
+        write!(w.s, "\"{}\"", g.name).unwrap();
     }
     writeln!(w.s, "]").unwrap();
     w.write_indent();
     write!(w.s, "rel skel:blendShapeTargets = [").unwrap();
-    for (i, name) in names.iter().enumerate() {
+    for (i, g) in groups.iter().enumerate() {
         if i > 0 {
             w.s.push_str(", ");
         }
-        write!(w.s, "<{prim_path}/{name}>").unwrap();
+        write!(w.s, "<{prim_path}/{}>", g.name).unwrap();
     }
     writeln!(w.s, "]").unwrap();
 
-    for (target, name) in prim.targets.iter().zip(&names) {
+    let write_deltas = |w: &mut Out, lead: &str, arr: &[[f32; 3]], trail: &str| {
         w.write_indent();
-        writeln!(w.s, "def BlendShape \"{name}\" {{").unwrap();
-        w.indent += 1;
-        if let Some(offsets) = &target.position {
-            w.write_indent();
-            write!(w.s, "uniform vector3f[] offsets = [").unwrap();
-            for (i, o) in offsets.iter().enumerate() {
-                if i > 0 {
-                    w.s.push_str(", ");
-                }
-                write!(
-                    w.s,
-                    "({}, {}, {})",
-                    format_float(o[0] as f64),
-                    format_float(o[1] as f64),
-                    format_float(o[2] as f64)
-                )
-                .unwrap();
+        w.s.push_str(lead);
+        for (i, o) in arr.iter().enumerate() {
+            if i > 0 {
+                w.s.push_str(", ");
             }
-            writeln!(w.s, "]").unwrap();
+            write!(
+                w.s,
+                "({}, {}, {})",
+                format_float(o[0] as f64),
+                format_float(o[1] as f64),
+                format_float(o[2] as f64)
+            )
+            .unwrap();
         }
-        if let Some(normals) = &target.normal {
-            w.write_indent();
-            write!(w.s, "uniform vector3f[] normalOffsets = [").unwrap();
-            for (i, o) in normals.iter().enumerate() {
-                if i > 0 {
-                    w.s.push_str(", ");
-                }
-                write!(
-                    w.s,
-                    "({}, {}, {})",
-                    format_float(o[0] as f64),
-                    format_float(o[1] as f64),
-                    format_float(o[2] as f64)
-                )
-                .unwrap();
+        writeln!(w.s, "]{trail}").unwrap();
+    };
+
+    let mut target_idx = 0usize;
+    for g in &groups {
+        let inb_targets: Vec<&oxideav_mesh3d::MorphTarget> = (0..g.inbetweens.len())
+            .filter_map(|j| prim.targets.get(target_idx + j))
+            .collect();
+        let primary = prim.targets.get(target_idx + g.inbetweens.len());
+        target_idx += g.inbetweens.len() + 1;
+        let Some(primary) = primary else { continue };
+        w.write_indent();
+        writeln!(w.s, "def BlendShape \"{}\" {{", g.name).unwrap();
+        w.indent += 1;
+        if let Some(offsets) = &primary.position {
+            write_deltas(w, "uniform vector3f[] offsets = [", offsets, "");
+        }
+        if let Some(normals) = &primary.normal {
+            write_deltas(w, "uniform vector3f[] normalOffsets = [", normals, "");
+        }
+        // §1.4.1: each inbetween is a single `inbetweens:<name>`
+        // attribute; its target weight rides in the attribute's
+        // `weight` metadata field.
+        for (inb, target) in g.inbetweens.iter().zip(&inb_targets) {
+            if let Some(offsets) = &target.position {
+                write_deltas(
+                    w,
+                    &format!(
+                        "uniform vector3f[] inbetweens:{} = [",
+                        sanitize_prim_name(&inb.name)
+                    ),
+                    offsets,
+                    &format!(" (weight = {})", format_float(inb.weight as f64)),
+                );
             }
-            writeln!(w.s, "]").unwrap();
+            // Normal offsets replay only under the exact authored
+            // spelling discovered on decode — the property name is
+            // not published (§1.4.2), so it is never constructed;
+            // typed-model-authored inbetween normals without a
+            // stashed spelling cannot be authored and are skipped.
+            if let (Some(attr_name), Some(normals)) = (&inb.normals_attr, &target.normal) {
+                write_deltas(
+                    w,
+                    &format!("uniform vector3f[] {attr_name} = ["),
+                    normals,
+                    "",
+                );
+            }
+        }
+        // §1.4.1 authoring-error inbetweens (weight 0/1, duplicate
+        // weights, missing weight metadata) were excluded from
+        // evaluation on decode but replay verbatim.
+        if let Some(malformed) = &g.malformed {
+            let shell = crate::variant_codec::decode_prim(malformed);
+            write_attr_map(w, &shell.attrs);
         }
         w.indent -= 1;
         w.write_indent();
         writeln!(w.s, "}}").unwrap();
     }
+}
+
+/// One §1.4.1 inbetween of a writer-side channel group.
+struct BlendInbetween {
+    name: String,
+    weight: f32,
+    /// Exact authored normal-offsets attribute spelling (§1.4.2 —
+    /// discovered, never constructed).
+    normals_attr: Option<String>,
+}
+
+/// One blend-shape channel on the writer side: its name plus the
+/// inbetween roster (empty = single-target channel).
+struct BlendChannelGroup {
+    name: String,
+    inbetweens: Vec<BlendInbetween>,
+    /// Tagged shell prim of malformed `inbetweens:*` attributes to
+    /// replay verbatim.
+    malformed: Option<serde_json::Value>,
+}
+
+/// Decode the per-channel group layout from the decoder's
+/// `usd:skel:blendShapes` + `usd:skel:inbetweens` extras.
+fn blend_channel_groups(prim: &Primitive) -> Vec<BlendChannelGroup> {
+    let names: Vec<String> = prim
+        .extras
+        .get("usd:skel:blendShapes")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(sanitize_prim_name))
+                .collect()
+        })
+        .unwrap_or_default();
+    let roster = prim
+        .extras
+        .get("usd:skel:inbetweens")
+        .and_then(|v| v.as_object());
+    names
+        .into_iter()
+        .map(|name| {
+            let entry = roster.and_then(|r| r.get(&name));
+            let inbetweens = entry
+                .and_then(|e| e.get("shapes"))
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|s| {
+                            Some(BlendInbetween {
+                                name: s.get("name")?.as_str()?.to_string(),
+                                weight: s.get("weight")?.as_f64()? as f32,
+                                normals_attr: s
+                                    .get("normalsAttr")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            BlendChannelGroup {
+                name,
+                inbetweens,
+                malformed: entry.and_then(|e| e.get("malformed")).cloned(),
+            }
+        })
+        .collect()
 }
 
 /// Reconstruct a 4x4 from the row-array JSON stash shape
@@ -2053,31 +2147,46 @@ fn write_skel_animation_prim(w: &mut Out, scene: &Scene3D, safe_name: &str, anim
         .iter()
         .find(|ch| ch.target.property == AnimationProperty::MorphWeights)
     {
-        let names: Vec<String> = scene
+        // §1.4.1 group layout of the bound mesh: channel i owns
+        // (inbetweens + 1) consecutive targets. The authored scalar
+        // channel weight is recovered exactly from the baked
+        // per-target sub-vector as Σ vⱼ·knotⱼ (each shape's own
+        // weight; the primary shape's is 1) — the inverse of the
+        // decoder's piecewise-linear expansion.
+        let groups: Vec<(String, Vec<f32>)> = scene
             .node(morph_ch.target.node)
             .and_then(|n| n.mesh)
             .and_then(|mid| scene.meshes.get(mid.0 as usize))
             .and_then(|m| m.primitives.first())
-            .and_then(|p| p.extras.get("usd:skel:blendShapes"))
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
+            .map(|p| crate::usd_to_scene::channel_inbetween_weights(&p.extras))
             .unwrap_or_default();
         if let AnimationValues::Scalar(weights) = &morph_ch.sampler.values {
             let n_frames = morph_ch.sampler.keyframes.len();
             let stride = weights.len().checked_div(n_frames).unwrap_or(0);
+            let grouped_stride: usize = groups.iter().map(|(_, ws)| ws.len() + 1).sum();
+            // Fall back to one-target-per-channel when the stashed
+            // roster doesn't cover the sampler stride (typed-model-
+            // authored scenes without the extras).
+            let groups: Vec<(String, Vec<f32>)> = if grouped_stride == stride && stride > 0 {
+                groups
+            } else {
+                (0..stride)
+                    .map(|i| {
+                        let name = groups
+                            .get(i)
+                            .map(|(n, _)| n.clone())
+                            .unwrap_or_else(|| format!("shape_{i}"));
+                        (name, Vec::new())
+                    })
+                    .collect()
+            };
             if stride > 0 {
                 w.write_indent();
                 write!(w.s, "uniform token[] blendShapes = [").unwrap();
-                for i in 0..stride {
+                for (i, (name, _)) in groups.iter().enumerate() {
                     if i > 0 {
                         w.s.push_str(", ");
                     }
-                    let fallback = format!("shape_{i}");
-                    let name = names.get(i).map(String::as_str).unwrap_or(&fallback);
                     write!(w.s, "\"{name}\"").unwrap();
                 }
                 writeln!(w.s, "]").unwrap();
@@ -2088,12 +2197,24 @@ fn write_skel_animation_prim(w: &mut Out, scene: &Scene3D, safe_name: &str, anim
                         w.s.push(',');
                     }
                     write!(w.s, " {}: [", format_float((*t as f64) * tcps)).unwrap();
-                    for i in 0..stride {
+                    let mut base = k * stride;
+                    for (i, (_, inb_weights)) in groups.iter().enumerate() {
                         if i > 0 {
                             w.s.push_str(", ");
                         }
-                        let val = weights.get(k * stride + i).copied().unwrap_or(0.0);
-                        write!(w.s, "{}", format_float(val as f64)).unwrap();
+                        let n_targets = inb_weights.len() + 1;
+                        let sub = &weights
+                            [base.min(weights.len())..(base + n_targets).min(weights.len())];
+                        let scalar: f32 = sub
+                            .iter()
+                            .enumerate()
+                            .map(|(j, &v)| {
+                                let knot = inb_weights.get(j).copied().unwrap_or(1.0);
+                                v * knot
+                            })
+                            .sum();
+                        base += n_targets;
+                        write!(w.s, "{}", format_float(scalar as f64)).unwrap();
                     }
                     w.s.push(']');
                 }
