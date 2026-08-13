@@ -14,15 +14,24 @@
 //! * **Attribute** (1) → an [`Attr`] on its parent prim, including
 //!   `<name>.timeSamples` and `<name>.connect` companion statements,
 //! * **Relationship** (8) → a `rel` [`Attr`] with its target paths,
-//! * **Variant / VariantSet** (10 / 11) → not yet bridged (refused
-//!   precisely),
+//! * **VariantSet** (11, at the `{set=}` path element) → declares the
+//!   set on its parent prim's `variant_sets` (its `variantChildren`
+//!   is ordering info the BTreeMap model doesn't carry),
+//! * **Variant** (10, at the `{set=sel}` path element) → a
+//!   [`Variant`] body under the parent prim's
+//!   `variant_sets[set][sel]`; prim / attribute / relationship
+//!   specs whose paths run through the selector element land inside
+//!   the variant body, exactly as the text parser's `variantSet`
+//!   block parse produces. A variant set nested *inside* a variant
+//!   is dropped structurally — the same documented limitation as
+//!   the text parser (`Variant` has no recursive variant-set slot),
 //! * the §16.3.8.4.6 compatibility forms (2–5, 9) and Unknown (0) →
 //!   inert, per the spec ("may be processed … but are inert").
 
 use std::collections::BTreeMap;
 
-use crate::error::{invalid, unsupported};
-use crate::usda::{Attr, Layer, ListOp, Prim, Value};
+use crate::error::invalid;
+use crate::usda::{Attr, Layer, ListOp, Prim, Value, Variant};
 use crate::usdc::{NamedSpec, UsdcFile, ValueRep};
 use crate::usdc_values::ValueDecoder;
 use crate::Result;
@@ -83,11 +92,27 @@ pub fn layer_from_usdc(bytes: &[u8]) -> Result<Layer> {
                 prim_order.push(path.to_owned());
             }
             FORM_ATTRIBUTE | FORM_RELATIONSHIP => properties.push((spec, path)),
+            // Variant (10) / VariantSet (11): the path's final
+            // element is the §8 variant selector (`{set=sel}`, with
+            // an empty selection naming the set spec itself). Both
+            // build like prims — a Variant's field set is the prim
+            // field set (§7.6.7: "all prim spec fields are
+            // inherited by variant specs") — and the assembly pass
+            // folds them into the parent's `variant_sets`.
             FORM_VARIANT | FORM_VARIANT_SET => {
-                return Err(unsupported(format!(
-                    "USDC layer: variant spec (form {}) at {path} — Crate variant blocks are not bridged to the text model yet",
-                    spec.spec_type
-                )));
+                if variant_element(path).is_none() {
+                    return Err(invalid(format!(
+                        "USDC layer: variant spec (form {}) at {path} whose path has no `{{set=sel}}` selector element",
+                        spec.spec_type
+                    )));
+                }
+                let build = build_prim(path, spec, &decoder)?;
+                if prims.insert(path.to_owned(), build).is_some() {
+                    return Err(invalid(format!(
+                        "USDC layer: two specs claim the path {path}"
+                    )));
+                }
+                prim_order.push(path.to_owned());
             }
             // §16.3.8.4.6: unknown and compatibility forms are inert.
             _ => {}
@@ -120,12 +145,39 @@ pub fn layer_from_usdc(bytes: &[u8]) -> Result<Layer> {
     order_deepest_first.sort_by_key(|p| std::cmp::Reverse(p.matches('/').count()));
     for path in order_deepest_first {
         let build = prims.remove(&path).expect("still present");
-        let prim = finish_prim(build);
         let parent_path = match path.rfind('/') {
             Some(0) => "/".to_owned(),
             Some(i) => path[..i].to_owned(),
             None => "/".to_owned(),
         };
+        // A build whose final path element is a `{set=sel}` variant
+        // selector folds into the parent's `variant_sets` instead of
+        // its child list. The empty-selection form (`{set=}`, the
+        // VariantSet spec) declares the set; a named selection is a
+        // Variant body. When the *parent* is itself a variant, its
+        // own conversion to `Variant` below drops the nested sets —
+        // the same documented structural limitation as the text
+        // parser.
+        if let Some((set, sel)) = variant_element(&path) {
+            let Some(parent) = prims.get_mut(&parent_path) else {
+                return Err(invalid(format!(
+                    "USDC layer: variant spec {path} has no parent prim spec at {parent_path}"
+                )));
+            };
+            let entry = parent.variant_sets.entry(set.to_owned()).or_default();
+            if !sel.is_empty() {
+                entry.insert(
+                    sel.to_owned(),
+                    Variant {
+                        metadata: build.metadata,
+                        attrs: build.attrs,
+                        children: finish_children(build.children, &build.child_order),
+                    },
+                );
+            }
+            continue;
+        }
+        let prim = finish_prim(build);
         if parent_path == "/" {
             // Root prim — re-insert finished, consumed below.
             prims.insert(
@@ -170,6 +222,9 @@ struct PrimBuild {
     /// The authored `primChildren` name order, used to sort `children`.
     child_order: Vec<String>,
     name: String,
+    /// Variant sets folded in from `{set=sel}` child specs (forms
+    /// 10 / 11).
+    variant_sets: BTreeMap<String, BTreeMap<String, Variant>>,
     finished: Option<Prim>,
 }
 
@@ -183,9 +238,20 @@ impl PrimBuild {
             children: Vec::new(),
             child_order: Vec::new(),
             name: String::new(),
+            variant_sets: BTreeMap::new(),
             finished: None,
         }
     }
+}
+
+/// When `path`'s final element is a §8 variant selector
+/// (`{set=sel}` — the form the §16.3.8.4.5.4 path construction
+/// yields for Variant / VariantSet specs), return `(set, sel)`.
+/// The VariantSet spec itself uses the empty selection (`{set=}`).
+fn variant_element(path: &str) -> Option<(&str, &str)> {
+    let last = path.rsplit('/').next()?;
+    let inner = last.strip_prefix('{')?.strip_suffix('}')?;
+    inner.split_once('=')
 }
 
 fn build_prim(path: &str, spec: &NamedSpec, decoder: &ValueDecoder<'_>) -> Result<PrimBuild> {
@@ -225,6 +291,24 @@ fn build_prim(path: &str, spec: &NamedSpec, decoder: &ValueDecoder<'_>) -> Resul
             // attributes; `Prim::attrs` is a BTreeMap so statement
             // order is not modelled — nothing to carry.
             "properties" => {}
+            // §7.6.4/§7.6.6 hierarchy fields ordering variant-set /
+            // variant child specs — the text model's BTreeMaps are
+            // name-ordered, so there is nothing to carry.
+            "variantSetChildren" | "variantChildren" => {}
+            // §16.3.10.30 variant-selection map → the text form's
+            // `variants = { string set = "sel" }` metadata dict.
+            "variantSelection" => {
+                build
+                    .metadata
+                    .insert("variants".to_owned(), decoder.decode(rep)?);
+            }
+            // The composition field listing the prim's variant sets
+            // → the text form's `variantSets` metadata key.
+            "variantSetNames" => {
+                build
+                    .metadata
+                    .insert("variantSets".to_owned(), decoder.decode(rep)?);
+            }
             other => {
                 build
                     .metadata
@@ -235,28 +319,29 @@ fn build_prim(path: &str, spec: &NamedSpec, decoder: &ValueDecoder<'_>) -> Resul
     Ok(build)
 }
 
-fn finish_prim(mut build: PrimBuild) -> Prim {
-    // Order children per the authored `primChildren` vector; names not
-    // listed keep their walk order after the listed ones.
-    if !build.child_order.is_empty() {
-        let order: BTreeMap<&str, usize> = build
-            .child_order
+/// Order `children` per the authored `primChildren` vector; names
+/// not listed keep their walk order after the listed ones.
+fn finish_children(mut children: Vec<Prim>, child_order: &[String]) -> Vec<Prim> {
+    if !child_order.is_empty() {
+        let order: BTreeMap<&str, usize> = child_order
             .iter()
             .enumerate()
             .map(|(i, n)| (n.as_str(), i))
             .collect();
-        build
-            .children
-            .sort_by_key(|c| order.get(c.name.as_str()).copied().unwrap_or(usize::MAX));
+        children.sort_by_key(|c| order.get(c.name.as_str()).copied().unwrap_or(usize::MAX));
     }
+    children
+}
+
+fn finish_prim(build: PrimBuild) -> Prim {
     Prim {
         spec: build.spec,
         type_name: build.type_name,
         name: build.name,
         metadata: build.metadata,
         attrs: build.attrs,
-        children: build.children,
-        variant_sets: BTreeMap::new(),
+        children: finish_children(build.children, &build.child_order),
+        variant_sets: build.variant_sets,
     }
 }
 

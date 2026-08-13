@@ -62,6 +62,27 @@ Full reader and symmetric writer for the `#usda 1.0` text format:
   are fan-triangulated; vertex normals and the first UV set are picked
   up. Multi-primitive meshes serialise as sibling `def Mesh` prims and
   fold back on decode.
+- **Per-face material subsets (`UsdGeomSubset`)** — face-element
+  subsets with material bindings split a mesh into one typed
+  `Primitive` per bound material (shared vertex arrays, the subset's
+  faces' triangles); unassigned faces keep the parent binding, the
+  `familyType` parent property is discovered by enumeration (its
+  spelling is unpublished) and preserved verbatim, non-face /
+  unbound subsets round-trip losslessly, and the writer re-emits a
+  single `def Mesh` + `def GeomSubset` children as a one-cycle
+  fixed point.
+- **Material binding resolution** — the full `MaterialBindingAPI`
+  surface: purpose-restricted spellings (`material:binding:preview`
+  preferred for the typed slot, `:full` as last resort, arbitrary
+  purposes preserved), `bindMaterialAs` strength, rule-1 namespace
+  inheritance from enclosing containers, and **collection
+  bindings** evaluated through the Core Specification §15
+  CollectionAPI (includes / excludes / expansionRule / includeRoot,
+  referenced collections, orphaned excludes inert) under the §3.4
+  ordered rules — collection-beats-direct at one prim, normative
+  property order (name-sorted + `propertyOrder`) among collections,
+  membership-not-specificity. Authored relationship sets and
+  CollectionAPI properties replay verbatim.
 - **Materials** — the full `UsdPreviewSurface` input set → `Material`:
   base color, metallic, roughness, emissive, opacity +
   `opacityThreshold` cutout (`AlphaMode::Mask` / `Blend`), occlusion
@@ -97,9 +118,15 @@ Full reader and symmetric writer for the `#usda 1.0` text format:
   quads (with `skel:joints` remap), animations become per-joint
   TRS channels (timeCodes → seconds) and blend-shape weight
   channels, and blend shapes become `MorphTarget`s (sparse
-  `pointIndices` scattered dense). The writer reconstructs the full
-  prim network from the typed model; round trips are a one-cycle
-  fixed point. Inbetween shapes are not yet modelled.
+  `pointIndices` scattered dense). **Inbetween shapes** (§1.4.1)
+  expand each channel into per-inbetween morph targets with the
+  scalar weight animation baked through the documented
+  piecewise-linear resolution (implicit 0/1 endpoints, unbounded
+  extrapolation, keyframes inserted at knot crossings so linear
+  interpolation is exact); the writer inverts the bake in closed
+  form and re-authors `inbetweens:<name>` attributes with their
+  `weight` metadata. The writer reconstructs the full prim network
+  from the typed model; round trips are a one-cycle fixed point.
 - **Transforms** — per-node `UsdGeomXformable` xformOps round-trip
   (`translate` + `orient` quatf + `scale`, or a `matrix4d` transform).
   `matrix4d` literals (row-vector, translation in the last row)
@@ -209,20 +236,23 @@ generic `.usd` layer dispatches on its header byte run (§16.1:
   Value reps ride through the writer losslessly as raw words — a
   typed value *writer* is not implemented yet.
 
-Not yet implemented on the Crate path: variant / variant-set spec
-forms (10/11) refuse precisely rather than bridging into the text
-model's `variantSet` blocks; `Relocates` (0.11) / `Splines` (0.12) /
+Variant / VariantSet spec forms (10/11) bridge into the text
+model's `variantSet` blocks — the `{set=sel}` selector paths fold
+each Variant's prim-field opinions (attributes, relationships,
+child prims) into `variant_sets`, `variantSelection` maps become
+`variants` metadata, and selections resolve through the ordinary
+composition pipeline (pinned against the staged
+`crate-variant-specs.usdc` fixture: 7 Variant + 3 VariantSet specs
+across two namespace levels). Not yet implemented on the Crate
+path: `Relocates` (0.11) / `Splines` (0.12) /
 `UnregisteredValueListOp` payloads refuse with precise messages.
 
 ## Not yet supported
 
-- `UsdGeomSubset` per-face material subsets — blocked on schema docs
-  not yet staged in `docs/3d/usd/`.
-- UsdSkel *inbetween* shapes (`inbetweens:` namespace attributes on a
-  `BlendShape`) — the base + full-shape channels round-trip; the
-  intermediate-weight shapes do not yet.
-- `UsdGeomCamera` / `UsdLux` light schemas — deferred observer rounds
-  per the staged schema doc's coverage table.
+- `UsdGeomPointInstancer` (staged schema Part 2) — vectorised
+  instancing is not yet mapped onto the typed model.
+- `UsdGeomCamera` / `UsdLux` light schemas — unstaged in
+  `docs/3d/usd/` (GAP-TRACKER Round F: on demand).
 - Cross-package `@foo.usdz[path/within.usd]@` selectors into a sibling
   archive — preserved as side-channel opinions rather than resolved.
 - SubLayer / reference / class-arc structure preservation on the writer

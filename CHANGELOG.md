@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **usdc: Variant / VariantSet spec forms (10/11) bridge into the
+  text model — the last refusing spec forms are gone.** Per Core
+  Specification §16.3.8.4.6, §7.6.6/§7.6.7 ("all prim spec fields
+  are inherited by variant specs") and the §8 variant-selector path
+  syntax, a Variant spec at `…{set=sel}` builds like a prim (its
+  attribute / relationship / child-prim specs address through the
+  selector element) and folds into the parent prim's
+  `variant_sets[set][sel]` as a text-model `Variant` body; the
+  VariantSet spec (`{set=}`) declares the set. `variantSelection`
+  maps (§16.3.10.30) become the text form's `variants` metadata
+  dict, `variantSetNames` becomes `variantSets`, and the
+  `variantSetChildren` / `variantChildren` hierarchy orderings are
+  inert in the name-ordered model. A variant set nested inside a
+  variant drops structurally — the text parser's documented
+  limitation, mirrored. Selections then resolve through the
+  ordinary composition pipeline. **Fixture proof** (staged
+  `crate-variant-specs.usdc`, authored for exactly this): all 7
+  Variant + 3 VariantSet specs bridge — three sets on two namespace
+  levels, variants authoring attributes and child prims — and a
+  USDZ whose default layer is that Crate file decodes end-to-end
+  with `shadingVariant=red` / `lodVariant=high` / `sizeVariant=small`
+  composed in and the unselected variants stashed for round-trip.
+  2 new fixture tests in `tests/usdc_variant_specs.rs`.
+
 - **UsdSkel inbetween shapes (staged schema §1.4.1, added
   2026-08-10) — the "inbetweens are not yet modelled" limitation is
   closed.** An `inbetweens:<name>` attribute on a `BlendShape` (its
