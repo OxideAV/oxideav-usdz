@@ -74,6 +74,17 @@ const PREPEND_LIST_EDIT_KEYS: &[&str] = &[
 /// [`collect_texture_assets`] returns the inner-file list the USDZ
 /// writer needs to embed alongside the USDA.
 pub fn write_layer(scene: &Scene3D) -> String {
+    // Typed per-reference UV transforms (`TextureRef::transform`)
+    // have no staged USD encoding — bake them into UV channels
+    // first (no-op on the common transform-free scene).
+    let baked;
+    let scene = match bake_texture_transforms(scene) {
+        Some(b) => {
+            baked = b;
+            &baked
+        }
+        None => scene,
+    };
     let mut w = Out::default();
     writeln!(w.s, "#usda 1.0").unwrap();
     write_layer_metadata(&mut w, scene);
@@ -104,6 +115,127 @@ pub fn write_layer(scene: &Scene3D) -> String {
         writeln!(w.s, "}}").unwrap();
     }
     w.s
+}
+
+/// Bake every typed per-reference UV transform
+/// (`TextureRef::transform`, the ratified `KHR_texture_transform`
+/// semantics carried by `oxideav-mesh3d` 0.0.5) into concrete UV
+/// channels, returning the rewritten scene — or `None` when the
+/// scene declares no transforms (the common case; zero cost).
+///
+/// The staged USD material schema gives this writer no way to
+/// express a UV-coordinate transform as a prim: `UsdUVTexture`'s
+/// §2.2 `scale` / `bias` inputs are per-channel *color* affines,
+/// and no 2D-transform shader-node schema is staged under
+/// `docs/3d/usd/`. `TextureTransform::apply_channel` is the typed
+/// model's documented baking lift for exporters targeting a
+/// transform-free encoding, so:
+///
+/// * each distinct `(source channel, transform)` pair on a material
+///   appends one pre-transformed UV channel to **every** primitive
+///   that can draw with that material (base binding or a
+///   `KHR_materials_variants` mapping) — allocated at a shared
+///   index so the single per-material `UsdPrimvarReader` varname
+///   (`st<N>`) is consistent across all of them; primitives with
+///   fewer channels pad with copies of the source channel so no
+///   index gap violates the typed model's parallel-array contract;
+/// * the reference retargets to the baked channel with its
+///   transform cleared (a `texCoord`-only override — affine
+///   identity — folds straight into `uv_set`, no new channel);
+/// * a transform whose source channel is missing on some bound
+///   primitive cannot be baked (the input scene fails
+///   `Scene3D::validate`'s `UvSetOutOfRange` there anyway) and is
+///   flattened to its `texCoord` half.
+///
+/// Like composition flattening, this is a *lossy-flattening* encode
+/// step: the transform itself is consumed, but the sampled
+/// coordinates — the ground truth — are preserved exactly, and the
+/// output round-trips through this crate's reader as a fixed point.
+fn bake_texture_transforms(scene: &Scene3D) -> Option<Scene3D> {
+    use oxideav_mesh3d::TextureTransform;
+    let affine_active =
+        |t: &TextureTransform| t.offset != [0.0, 0.0] || t.rotation != 0.0 || t.scale != [1.0, 1.0];
+    if !scene
+        .materials
+        .iter()
+        .any(|m| m.texture_refs().iter().any(|(_, r)| r.transform.is_some()))
+    {
+        return None;
+    }
+    let mut out = scene.clone();
+    for mid in 0..out.materials.len() {
+        // Distinct (source channel, transform) pairs needing a bake.
+        let plans: Vec<(u32, TextureTransform)> = {
+            let mut v: Vec<(u32, TextureTransform)> = Vec::new();
+            for (_, r) in out.materials[mid].texture_refs() {
+                if let Some(t) = r.transform {
+                    let key = (r.effective_uv_set(), t);
+                    if affine_active(&t) && !v.contains(&key) {
+                        v.push(key);
+                    }
+                }
+            }
+            v
+        };
+        // Primitives that can draw with this material.
+        let uses: Vec<(usize, usize)> = out
+            .meshes
+            .iter()
+            .enumerate()
+            .flat_map(|(mi, mesh)| {
+                mesh.primitives
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| {
+                        p.material.is_some_and(|id| id.0 as usize == mid)
+                            || p.variant_mappings
+                                .iter()
+                                .any(|vm| vm.material.0 as usize == mid)
+                    })
+                    .map(move |(pi, _)| (mi, pi))
+            })
+            .collect();
+        let mut alloc: Vec<((u32, TextureTransform), u32)> = Vec::new();
+        for (src, t) in plans {
+            let bakeable = !uses.is_empty()
+                && uses.iter().all(|&(mi, pi)| {
+                    out.meshes[mi].primitives[pi]
+                        .uvs
+                        .get(src as usize)
+                        .is_some_and(|c| !c.is_empty())
+                });
+            if !bakeable {
+                continue;
+            }
+            let n = uses
+                .iter()
+                .map(|&(mi, pi)| out.meshes[mi].primitives[pi].uvs.len())
+                .max()
+                .unwrap_or(0) as u32;
+            for &(mi, pi) in &uses {
+                let prim = &mut out.meshes[mi].primitives[pi];
+                let srcv = prim.uvs[src as usize].clone();
+                while (prim.uvs.len() as u32) < n {
+                    prim.uvs.push(srcv.clone());
+                }
+                prim.uvs.push(t.apply_channel(&srcv));
+            }
+            alloc.push(((src, t), n));
+        }
+        out.materials[mid].map_texture_refs(|mut r| {
+            if let Some(t) = r.transform {
+                let src = r.effective_uv_set();
+                r.uv_set = alloc
+                    .iter()
+                    .find(|((s, at), _)| *s == src && *at == t)
+                    .map(|&(_, n)| n)
+                    .unwrap_or(src);
+                r.transform = None;
+            }
+            r
+        });
+    }
+    Some(out)
 }
 
 /// Inner-file payload that the encoder needs to attach to the
@@ -3654,9 +3786,13 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
         // §2.3 UsdPrimvarReader wiring: a texture sampling a UV set
         // other than `st` (or a non-standard primvar name) gets an
         // explicit `st` connection to a reader sibling emitted below.
+        // `effective_uv_set` resolves a lingering `texCoord`
+        // override (post-bake references carry none, but a caller
+        // may hand `write_layer` an unbaked material directly).
+        let uv_set = tref.effective_uv_set();
         let varname = stash_str("varname")
             .map(str::to_owned)
-            .or_else(|| (tref.uv_set > 0).then(|| format!("st{}", tref.uv_set)));
+            .or_else(|| (uv_set > 0).then(|| format!("st{uv_set}")));
         if varname.is_some() {
             w.write_indent();
             writeln!(

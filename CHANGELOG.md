@@ -25,6 +25,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed per-reference UV transforms bake on encode
+  (`oxideav-mesh3d` 0.0.5 `TextureRef::transform` /
+  `TextureTransform`).** The staged material schema gives the writer
+  no UV-coordinate-transform prim (`UsdUVTexture`'s §2.2
+  `scale`/`bias` inputs are per-channel *color* affines, and no
+  2D-transform shader-node schema is staged in `docs/3d/usd/`), so a
+  declared transform is **baked** via the typed model's
+  `TextureTransform::apply_channel` lift: each distinct
+  (source channel, transform) pair on a material appends one
+  pre-transformed UV channel — at a shared index across every
+  primitive that can draw with the material (base binding or a
+  variants mapping), padding shorter channel lists with source-
+  channel copies so the parallel-array contract holds — and the
+  reference retargets to it (`primvars:st<N>` + the
+  `UsdPrimvarReader_float2` varname). A `texCoord`-only override
+  (affine identity) folds straight into `uv_set` with no new
+  channel; an explicit identity transform emits nothing extra. Like
+  composition flattening this is a lossy-flattening encode — the
+  transform is consumed but the sampled coordinates are preserved
+  exactly, and the baked output round-trips through the reader as a
+  one-cycle fixed point. The `UsdPrimvarReader` varname emission now
+  resolves through `TextureRef::effective_uv_set`, honouring a
+  lingering `texCoord` override even on an unbaked direct
+  `write_layer` call. 4 new integration tests in
+  `tests/texture_transform_bake.rs`. Decoding a UV-transform *prim*
+  into the typed surface stays blocked on an unstaged schema.
+
 - **Static blend-shape states land on the typed `Node::weights`
   override (`oxideav-mesh3d` 0.0.5 node-level morph-weight
   surface).** A `blendShapeWeights` authored as a plain **default**
