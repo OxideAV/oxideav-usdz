@@ -203,6 +203,30 @@ fn shared_transform_dedupes_the_baked_channel() {
 }
 
 #[test]
+fn non_finite_transform_never_bakes() {
+    // `TextureTransform::is_finite` guards the bake: a NaN offset
+    // (input already rejected by `Scene3D::validate`'s
+    // `TextureTransformNotFinite`) must not poison a baked channel.
+    let t = TextureTransform::new().with_offset([f32::NAN, 0.0]);
+    let scene = textured_scene(Some(t));
+    assert!(
+        scene.validate().is_err(),
+        "non-finite transform is a validation error upstream"
+    );
+    let report = UsdzEncoder::new()
+        .encode_with_report(&scene)
+        .expect("encode still succeeds (flattened)");
+    assert!(
+        !report.usda.contains("primvars:st1"),
+        "no poisoned baked channel:\n{}",
+        report.usda
+    );
+    let bytes = UsdzEncoder::new().encode_bytes(&scene).expect("encode ok");
+    let s2 = UsdzDecoder::new().decode_bytes(&bytes).expect("decode ok");
+    s2.validate().expect("flattened output validates");
+}
+
+#[test]
 fn shared_material_pads_shorter_channel_lists() {
     // Two meshes (separate nodes) draw with ONE material; one
     // primitive carries a single UV channel, the other two. The

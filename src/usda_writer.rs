@@ -170,7 +170,11 @@ fn bake_texture_transforms(scene: &Scene3D) -> Option<Scene3D> {
             for (_, r) in out.materials[mid].texture_refs() {
                 if let Some(t) = r.transform {
                     let key = (r.effective_uv_set(), t);
-                    if affine_active(&t) && !v.contains(&key) {
+                    // A non-finite transform (validate's
+                    // `TextureTransformNotFinite`) would poison every
+                    // baked coordinate — never bake it; the fold
+                    // below keeps its `texCoord` half only.
+                    if affine_active(&t) && t.is_finite() && !v.contains(&key) {
                         v.push(key);
                     }
                 }

@@ -58,10 +58,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one-cycle fixed point. The `UsdPrimvarReader` varname emission now
   resolves through `TextureRef::effective_uv_set`, honouring a
   lingering `texCoord` override even on an unbaked direct
-  `write_layer` call. 5 new integration tests in
+  `write_layer` call. 6 new integration tests in
   `tests/texture_transform_bake.rs` (bake exactness, `texCoord`
   fold, identity no-op, per-material channel dedupe, shorter-list
-  padding across a shared material). Decoding a UV-transform *prim*
+  padding across a shared material, and the
+  `TextureTransform::is_finite` bake guard — a non-finite transform
+  never poisons a baked channel). Decoding a UV-transform *prim*
   into the typed surface stays blocked on an unstaged schema.
 
 - **Static blend-shape states land on the typed `Node::weights`
