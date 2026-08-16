@@ -82,6 +82,11 @@ pub fn write_layer(scene: &Scene3D) -> String {
     for &root in &scene.roots {
         write_node(&mut w, scene, root, /*parent_path=*/ "");
     }
+    // Typed-model static morph states (`Node::weights`) with no
+    // SkelAnimation carrier get a synthesized root-level
+    // `def SkelAnimation "BlendState_<id>"` — USD's only encoding
+    // for a blend-shape weight state (§1.3/§1.5).
+    write_synth_blend_states(&mut w, scene);
     // Materials live outside the node tree in our model — emit any
     // material that wasn't already pulled in as a node child by
     // hanging them off a synthetic `/Materials` Scope. Real-world
@@ -469,7 +474,7 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
         .get("usd:skelAnimation")
         .and_then(|v| v.as_u64())
     {
-        write_skel_animation_prim(w, scene, &safe_name, anim_idx as usize);
+        write_skel_animation_prim(w, scene, &safe_name, anim_idx as usize, &node.extras);
         return;
     }
     // Round 8: surface the prim's variant declarations on the prim
@@ -518,7 +523,7 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
                         // BindingAPI opinion, so no Xform wrapper is
                         // needed (and keeping one would re-grow the
                         // tree each encode→decode cycle).
-                        let skel = skel_binding_paths(scene, node);
+                        let skel = skel_binding_paths(scene, id, node);
                         write_mesh(w, scene, mesh, mesh_id, parent_path, skel.as_ref());
                         return;
                     }
@@ -585,7 +590,7 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
     // carries the §1.5 BindingAPI opinions.
     if let Some(mesh_id) = node.mesh {
         if let Some(mesh) = scene.mesh(mesh_id) {
-            let skel = skel_binding_paths(scene, node);
+            let skel = skel_binding_paths(scene, id, node);
             write_mesh(w, scene, mesh, mesh_id, &path, skel.as_ref());
         }
     }
@@ -1219,7 +1224,7 @@ fn write_one_mesh_prim(
     if extras_no_fold(&prim.extras) {
         metadata_lines.push("usd:no_fold = 1".to_string());
     }
-    let skinned = skel.is_some() && prim.joints.is_some();
+    let skinned = skel.is_some_and(|s| s.skeleton.is_some()) && prim.joints.is_some();
     if skinned {
         // §1.5: BindingAPI is an applied API schema — declare it on
         // the skinned geometry prim.
@@ -1268,14 +1273,19 @@ fn write_one_mesh_prim(
     // (`vertex` interpolation, `elementSize = 4` matching the typed
     // quad width, indices in the Skeleton's own joint order — no
     // `skel:joints` override needed on output).
+    let mut anim_rel_emitted = false;
     if skinned {
-        if let (Some(joints), Some(weights), Some(skel)) = (&prim.joints, &prim.weights, skel) {
-            let skel_path = &skel.skeleton;
+        if let (Some(joints), Some(weights), Some(skel_path)) = (
+            &prim.joints,
+            &prim.weights,
+            skel.and_then(|s| s.skeleton.as_ref()),
+        ) {
             w.write_indent();
             writeln!(w.s, "rel skel:skeleton = <{skel_path}>").unwrap();
-            if let Some(anim_path) = &skel.animation {
+            if let Some(anim_path) = skel.and_then(|s| s.animation.as_ref()) {
                 w.write_indent();
                 writeln!(w.s, "rel skel:animationSource = <{anim_path}>").unwrap();
+                anim_rel_emitted = true;
             }
             w.write_indent();
             write!(w.s, "int[] primvars:skel:jointIndices = [").unwrap();
@@ -1329,6 +1339,15 @@ fn write_one_mesh_prim(
         }
     }
     write_blend_shapes(w, prim, prim_path);
+    // §1.5: bind the blend-weight animation source. Skinned geometry
+    // already authored the relationship above (one property per prim
+    // — the TRS source also carries the blend table in that case).
+    if !prim.targets.is_empty() && !anim_rel_emitted {
+        if let Some(bp) = skel.and_then(|s| s.blend_animation.as_ref()) {
+            w.write_indent();
+            writeln!(w.s, "rel skel:animationSource = <{bp}>").unwrap();
+        }
+    }
     // UsdGeomSubset (staged schema Part 1): §1.4 familyType
     // properties replay on the geometric prim with their exact
     // authored spelling (the property name is discovered by
@@ -1668,17 +1687,7 @@ fn write_blend_shapes(w: &mut Out, prim: &Primitive, prim_path: &str) {
     // consecutive targets. A plain roster (no `usd:skel:inbetweens`
     // stash) degenerates to one target per channel; targets beyond
     // the roster emit as `shape_<i>` single-target channels.
-    let mut groups = blend_channel_groups(prim);
-    {
-        let covered: usize = groups.iter().map(|g| g.inbetweens.len() + 1).sum();
-        for i in covered..prim.targets.len() {
-            groups.push(BlendChannelGroup {
-                name: format!("shape_{i}"),
-                inbetweens: Vec::new(),
-                malformed: None,
-            });
-        }
-    }
+    let groups = padded_blend_groups(prim);
 
     w.write_indent();
     write!(w.s, "uniform token[] skel:blendShapes = [").unwrap();
@@ -1888,21 +1897,94 @@ fn format_matrix4(m: [[f32; 4]; 4]) -> String {
 /// an animation drives that skeleton) the animation's emitted prim
 /// path for the `skel:animationSource` relationship.
 struct SkelBindingPaths {
-    skeleton: String,
+    /// Bound `Skeleton` carrier path — `Some` only for skinned nodes.
+    skeleton: Option<String>,
+    /// TRS animation source for the bound skeleton.
     animation: Option<String>,
+    /// Blend-weight animation source for this node's geometry: the
+    /// SkelAnimation whose `MorphWeights` channel targets the node,
+    /// or (static `Node::weights` state) the carrier the decoder
+    /// recorded / the `BlendState_<id>` prim the writer synthesizes.
+    blend_animation: Option<String>,
 }
 
-/// Resolve a skinned node's [`SkelBindingPaths`]. `None` when the
-/// node is unskinned or the scene carries no skeleton carrier.
-fn skel_binding_paths(scene: &Scene3D, node: &oxideav_mesh3d::Node) -> Option<SkelBindingPaths> {
-    let skin = scene.skins.get(node.skin?.0 as usize)?;
-    let skeleton = marker_prim_path(scene, "usd:skeleton", skin.skeleton.0 as u64)?;
-    let animation = animation_index_for_skeleton(scene, skin.skeleton)
-        .and_then(|idx| marker_prim_path(scene, "usd:skelAnimation", idx as u64));
+/// Resolve a node's [`SkelBindingPaths`]. `None` when the node
+/// carries neither a skin binding nor any blend-weight animation
+/// state.
+fn skel_binding_paths(
+    scene: &Scene3D,
+    id: NodeId,
+    node: &oxideav_mesh3d::Node,
+) -> Option<SkelBindingPaths> {
+    let skeleton = node
+        .skin
+        .and_then(|sid| scene.skins.get(sid.0 as usize))
+        .map(|skin| skin.skeleton)
+        .and_then(|sk| marker_prim_path(scene, "usd:skeleton", sk.0 as u64).map(|p| (sk, p)));
+    let animation = skeleton.as_ref().and_then(|(sk, _)| {
+        animation_index_for_skeleton(scene, *sk)
+            .and_then(|idx| marker_prim_path(scene, "usd:skelAnimation", idx as u64))
+    });
+    let blend_animation = blend_animation_rel_path(scene, id, node);
+    let skeleton = skeleton.map(|(_, p)| p);
+    if skeleton.is_none() && blend_animation.is_none() {
+        return None;
+    }
     Some(SkelBindingPaths {
         skeleton,
         animation,
+        blend_animation,
     })
+}
+
+/// Path of the SkelAnimation carrier already driving this node's
+/// morph state: (a) the animation with a `MorphWeights` channel
+/// targeting the node, else (b) the carrier index the decoder
+/// recorded on the node when it attached a static blend state
+/// (`usd:skel:weightsAnim`).
+fn existing_blend_anim_path(
+    scene: &Scene3D,
+    id: NodeId,
+    node: &oxideav_mesh3d::Node,
+) -> Option<String> {
+    use oxideav_mesh3d::AnimationProperty;
+    if let Some(idx) = scene.animations.iter().position(|a| {
+        a.channels
+            .iter()
+            .any(|ch| ch.target.property == AnimationProperty::MorphWeights && ch.target.node == id)
+    }) {
+        return marker_prim_path(scene, "usd:skelAnimation", idx as u64);
+    }
+    node.extras
+        .get("usd:skel:weightsAnim")
+        .and_then(|v| v.as_u64())
+        .and_then(|idx| marker_prim_path(scene, "usd:skelAnimation", idx))
+}
+
+/// `true` when the node holds a static morph state the output layer
+/// must express: a non-empty `Node::weights` override over a mesh
+/// that actually carries morph targets.
+fn node_static_morph_state(scene: &Scene3D, node: &oxideav_mesh3d::Node) -> bool {
+    !node.weights.is_empty()
+        && node
+            .mesh
+            .and_then(|m| scene.mesh(m))
+            .and_then(|m| m.primitives.first())
+            .is_some_and(|p| !p.targets.is_empty())
+}
+
+/// The `skel:animationSource` target for a node's blend-shape
+/// state: an existing carrier when one drives the node, else — for
+/// a typed-model `Node::weights` override with no carrier at all —
+/// the deterministic root-level `BlendState_<id>` prim
+/// [`write_synth_blend_states`] emits.
+fn blend_animation_rel_path(
+    scene: &Scene3D,
+    id: NodeId,
+    node: &oxideav_mesh3d::Node,
+) -> Option<String> {
+    existing_blend_anim_path(scene, id, node)
+        .or_else(|| node_static_morph_state(scene, node).then(|| format!("/BlendState_{}", id.0)))
 }
 
 /// Index of the first animation whose channels target the given
@@ -1983,7 +2065,20 @@ fn time_codes_per_second(scene: &Scene3D) -> f64 {
 ///   USD's `(w, x, y, z)` quatf literal. A joint lacking a channel
 ///   for an emitted property gets the identity default for that
 ///   slot.
-fn write_skel_animation_prim(w: &mut Out, scene: &Scene3D, safe_name: &str, anim_idx: usize) {
+/// * A *static* blend state (decoder stash
+///   `usd:skelAnim:staticWeights` on the carrier — the source file
+///   authored `blendShapeWeights` as a plain default, which landed
+///   on `Node::weights`) re-emits in the same default-value form,
+///   with each scalar refreshed from the live `Node::weights` of
+///   the node the state was attached to (so a typed-model edit of
+///   the override survives the round trip).
+fn write_skel_animation_prim(
+    w: &mut Out,
+    scene: &Scene3D,
+    safe_name: &str,
+    anim_idx: usize,
+    carrier_extras: &std::collections::HashMap<String, serde_json::Value>,
+) {
     use oxideav_mesh3d::{AnimationProperty, AnimationValues};
     let Some(anim) = scene.animations.get(anim_idx) else {
         return;
@@ -2223,9 +2318,189 @@ fn write_skel_animation_prim(w: &mut Out, scene: &Scene3D, safe_name: &str, anim
         }
     }
 
+    // Static blend state (default-value `blendShapeWeights`): replay
+    // the authored roster from the carrier stash, refreshing each
+    // scalar from the live `Node::weights` of the node the decoder
+    // attached the state to (inverting the §1.4.1 inbetween bake).
+    if let Some(stash) = carrier_extras
+        .get("usd:skelAnim:staticWeights")
+        .and_then(|v| v.as_object())
+    {
+        let names: Vec<String> = stash
+            .get("names")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let stashed: Vec<f32> = stash
+            .get("weights")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_f64().map(|f| f as f32))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Live values from the marked node, keyed by channel name.
+        let mut live: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+        for node in &scene.nodes {
+            if node
+                .extras
+                .get("usd:skel:weightsAnim")
+                .and_then(|v| v.as_u64())
+                != Some(anim_idx as u64)
+            {
+                continue;
+            }
+            if let Some(prim) = node
+                .mesh
+                .and_then(|m| scene.meshes.get(m.0 as usize))
+                .and_then(|m| m.primitives.first())
+            {
+                let groups = padded_blend_groups(prim);
+                for (g, scalar) in groups
+                    .iter()
+                    .zip(invert_group_scalars(&groups, &node.weights))
+                {
+                    live.entry(g.name.clone()).or_insert(scalar);
+                }
+            }
+        }
+        if !names.is_empty() {
+            let weights: Vec<f32> = names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    live.get(n.as_str())
+                        .copied()
+                        .or_else(|| stashed.get(i).copied())
+                        .unwrap_or(0.0)
+                })
+                .collect();
+            write_static_blend_weights(w, &names, &weights);
+        }
+    }
+
     w.indent -= 1;
     w.write_indent();
     writeln!(w.s, "}}").unwrap();
+}
+
+/// Synthesize one root-level `def SkelAnimation "BlendState_<id>"`
+/// per reachable node that holds a static morph state
+/// ([`node_static_morph_state`]) with no existing carrier — the
+/// counterpart of the geometry prim's
+/// `rel skel:animationSource = </BlendState_<id>>` authored by
+/// [`write_one_mesh_prim`]. Channel names come from the same padded
+/// group roster the geometry's `skel:blendShapes` uses, scalars from
+/// inverting the §1.4.1 expansion of `Node::weights`, so the decoder
+/// reattaches exactly this state (scoped by the relationship even
+/// when several nodes share one mesh with divergent overrides).
+fn write_synth_blend_states(w: &mut Out, scene: &Scene3D) {
+    fn collect(scene: &Scene3D, id: NodeId, out: &mut Vec<NodeId>) {
+        let Some(node) = scene.node(id) else { return };
+        out.push(id);
+        for &child in &node.children {
+            collect(scene, child, out);
+        }
+    }
+    let mut ids: Vec<NodeId> = Vec::new();
+    for &root in &scene.roots {
+        collect(scene, root, &mut ids);
+    }
+    for id in ids {
+        let Some(node) = scene.node(id) else { continue };
+        if !node_static_morph_state(scene, node)
+            || existing_blend_anim_path(scene, id, node).is_some()
+        {
+            continue;
+        }
+        let Some(prim) = node
+            .mesh
+            .and_then(|m| scene.mesh(m))
+            .and_then(|m| m.primitives.first())
+        else {
+            continue;
+        };
+        let groups = padded_blend_groups(prim);
+        let names: Vec<String> = groups.iter().map(|g| g.name.clone()).collect();
+        let scalars = invert_group_scalars(&groups, &node.weights);
+        w.write_indent();
+        writeln!(w.s, "def SkelAnimation \"BlendState_{}\" {{", id.0).unwrap();
+        w.indent += 1;
+        write_static_blend_weights(w, &names, &scalars);
+        w.indent -= 1;
+        w.write_indent();
+        writeln!(w.s, "}}").unwrap();
+    }
+}
+
+/// Emit the §1.3 static (default-value) blend-weight pair:
+/// `uniform token[] blendShapes` + a non-sampled
+/// `float[] blendShapeWeights`.
+fn write_static_blend_weights(w: &mut Out, names: &[String], weights: &[f32]) {
+    w.write_indent();
+    write!(w.s, "uniform token[] blendShapes = [").unwrap();
+    for (i, name) in names.iter().enumerate() {
+        if i > 0 {
+            w.s.push_str(", ");
+        }
+        write!(w.s, "\"{name}\"").unwrap();
+    }
+    writeln!(w.s, "]").unwrap();
+    w.write_indent();
+    write!(w.s, "float[] blendShapeWeights = [").unwrap();
+    for (i, wt) in weights.iter().enumerate() {
+        if i > 0 {
+            w.s.push_str(", ");
+        }
+        write!(w.s, "{}", format_float(*wt as f64)).unwrap();
+    }
+    writeln!(w.s, "]").unwrap();
+}
+
+/// The §1.4.1 writer-side channel groups of a primitive, padded so
+/// every morph target beyond the stashed roster gets its own
+/// single-target `shape_<i>` channel — the exact roster
+/// [`write_blend_shapes`] authors.
+fn padded_blend_groups(prim: &Primitive) -> Vec<BlendChannelGroup> {
+    let mut groups = blend_channel_groups(prim);
+    let covered: usize = groups.iter().map(|g| g.inbetweens.len() + 1).sum();
+    for i in covered..prim.targets.len() {
+        groups.push(BlendChannelGroup {
+            name: format!("shape_{i}"),
+            inbetweens: Vec::new(),
+            malformed: None,
+        });
+    }
+    groups
+}
+
+/// Invert the decoder's §1.4.1 piecewise-linear expansion for one
+/// per-target weight vector: each channel's authored scalar is
+/// `Σ vⱼ·knotⱼ` over its group's consecutive targets (an inbetween's
+/// knot is its own weight; the primary shape's is 1).
+fn invert_group_scalars(groups: &[BlendChannelGroup], expanded: &[f32]) -> Vec<f32> {
+    let mut base = 0usize;
+    let mut out = Vec::with_capacity(groups.len());
+    for g in groups {
+        let n_targets = g.inbetweens.len() + 1;
+        let sub = &expanded[base.min(expanded.len())..(base + n_targets).min(expanded.len())];
+        let scalar: f32 = sub
+            .iter()
+            .enumerate()
+            .map(|(j, &v)| {
+                let knot = g.inbetweens.get(j).map(|inb| inb.weight).unwrap_or(1.0);
+                v * knot
+            })
+            .sum();
+        base += n_targets;
+        out.push(scalar);
+    }
+    out
 }
 
 /// DFS from a joint node assigning slash-joined name-path tokens —

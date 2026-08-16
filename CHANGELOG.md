@@ -25,6 +25,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Static blend-shape states land on the typed `Node::weights`
+  override (`oxideav-mesh3d` 0.0.5 node-level morph-weight
+  surface).** A `blendShapeWeights` authored as a plain **default**
+  value (§1.3's arrays are time-varying only when `.timeSamples` is
+  authored) is a static weight state, not an animation — it now
+  expands through the §1.4.1 inbetween layout onto the mesh node's
+  `Node::weights` (the glTF `node.weights` per-instance override,
+  resolved by `Scene3D::effective_morph_weights`) instead of
+  fabricating a one-keyframe `MorphWeights` channel. The writer
+  re-emits the state in the same default-value form — roster from
+  the carrier stash, each scalar refreshed from the live
+  `Node::weights` via the closed-form `Σ vⱼ·knotⱼ` inversion, so a
+  typed-model edit of the override survives re-encode — and the
+  round trip is a one-cycle fixed point.
+  - **§1.5 `skel:animationSource` scoping**: geometry that authored
+    (or inherited) the relationship accepts blend weights only from
+    *that* SkelAnimation — two animations over identical channel
+    rosters bound to different geometry no longer clobber each
+    other; roster intersection still decides for unbound geometry.
+    The writer re-authors the relationship on blend-shape geometry
+    (previously only skinned geometry got one).
+  - **Typed-model scenes synthesize a carrier**: a `Node::weights`
+    override with no SkelAnimation anywhere emits a root-level
+    `def SkelAnimation "BlendState_<id>"` plus the geometry-side
+    `skel:animationSource` binding — USD's only encoding for a
+    static blend state — so the override survives encode → decode.
+    Two nodes sharing ONE mesh with divergent overrides (exactly
+    the state the new mesh3d surface exists for) round-trip to two
+    scoped carriers. 9 new integration tests in
+    `tests/node_weights_static.rs`.
+
 - **usdc: Variant / VariantSet spec forms (10/11) bridge into the
   text model — the last refusing spec forms are gone.** Per Core
   Specification §16.3.8.4.6, §7.6.6/§7.6.7 ("all prim spec fields

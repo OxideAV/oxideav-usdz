@@ -1586,11 +1586,21 @@ struct InbetweenShape {
 /// bound geometry's `skel:blendShapes`).
 struct PendingBlendWeights {
     anim_idx: usize,
+    /// The SkelAnimation prim's own path — an authored (or §1.5
+    /// inherited) `skel:animationSource` on bound geometry scopes
+    /// attachment to exactly this animation.
+    anim_path: String,
     channel_names: Vec<String>,
     /// Keyframe times in seconds.
     times: Vec<f32>,
     /// One weight per channel name, per keyframe.
     frames: Vec<Vec<f32>>,
+    /// `true` when `blendShapeWeights` was authored as a plain
+    /// default value (no `.timeSamples`) — a *static* blend state,
+    /// which lands on `Node::weights` (the glTF `node.weights`
+    /// override) instead of fabricating a one-keyframe animation
+    /// channel.
+    static_default: bool,
 }
 
 /// Pre-pass record for one `def Skeleton` (UsdSkel §1.2).
@@ -2140,6 +2150,48 @@ fn build_node(ctx: &mut Ctx, parent: &str, prim: &Prim) -> Result<Option<oxideav
                 "usd:skelAnimation".into(),
                 serde_json::Value::Number(anim_idx.into()),
             );
+            // A static (default-value) `blendShapeWeights` table has
+            // no animation channel to invert on the writer side —
+            // stash the authored roster + scalars on the carrier so
+            // the `def SkelAnimation` re-emits them verbatim in the
+            // default-value form.
+            if let Some(entry) = ctx
+                .pending_blend_weights
+                .iter()
+                .find(|e| e.anim_idx == anim_idx && e.static_default)
+            {
+                let mut stash = serde_json::Map::new();
+                stash.insert(
+                    "names".into(),
+                    serde_json::Value::Array(
+                        entry
+                            .channel_names
+                            .iter()
+                            .map(|n| serde_json::Value::String(n.clone()))
+                            .collect(),
+                    ),
+                );
+                stash.insert(
+                    "weights".into(),
+                    serde_json::Value::Array(
+                        entry
+                            .frames
+                            .first()
+                            .map(|f| f.as_slice())
+                            .unwrap_or_default()
+                            .iter()
+                            .filter_map(|w| {
+                                serde_json::Number::from_f64(*w as f64)
+                                    .map(serde_json::Value::Number)
+                            })
+                            .collect(),
+                    ),
+                );
+                node.extras.insert(
+                    "usd:skelAnim:staticWeights".into(),
+                    serde_json::Value::Object(stash),
+                );
+            }
             stash_extras(&mut node.extras, prim);
             Ok(Some(ctx.scene.add_node(node)))
         }
@@ -3393,6 +3445,17 @@ fn apply_blend_shapes(ctx: &mut Ctx, path: &str, prim: &Prim, out: &mut Primitiv
                 .collect(),
         ),
     );
+    // §1.5: an authored (or inherited) `skel:animationSource` names
+    // THE animation that drives this geometry — stash the target
+    // path so the blend-weight post-pass scopes attachment to it
+    // (without it, roster-name intersection alone decides, which
+    // cannot distinguish two animations over identical rosters).
+    if let Some(Value::Path(p)) = prim.attrs.get("skel:animationSource").map(|a| &a.value) {
+        out.extras.insert(
+            "usd:skel:animationSource".into(),
+            serde_json::Value::String(p.clone()),
+        );
+    }
     if !inbetween_roster.is_empty() {
         out.extras.insert(
             "usd:skel:inbetweens".into(),
@@ -3963,6 +4026,16 @@ fn build_skel_animation(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Option
     let mut pending_blend: Option<PendingBlendWeights> = None;
     if !blend_names.is_empty() {
         if let Some((times, frames)) = read_samples("blendShapeWeights") {
+            // A `.timeSamples` map is animation; a plain default
+            // value is a *static* weight state (§1.3's arrays are
+            // time-varying only when sampled) and maps onto the
+            // typed model's per-instance `Node::weights` override.
+            let static_default = !matches!(
+                prim.attrs
+                    .get("blendShapeWeights.timeSamples")
+                    .map(|a| &a.value),
+                Some(Value::TimeSamples(_))
+            );
             let mut weight_frames = Vec::with_capacity(frames.len());
             for frame in &frames {
                 if frame.len() != blend_names.len() {
@@ -3982,9 +4055,11 @@ fn build_skel_animation(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Option
             }
             pending_blend = Some(PendingBlendWeights {
                 anim_idx: 0, // patched below once the index is known
+                anim_path: path.to_string(),
                 channel_names: blend_names,
                 times,
                 frames: weight_frames,
+                static_default,
             });
         }
     }
@@ -4010,6 +4085,21 @@ fn build_skel_animation(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Option
 /// the mesh's target order, and attach one `MorphWeights` channel
 /// targeting that node. Channels the animation doesn't drive hold
 /// weight 0.
+///
+/// Scoping: geometry that authored (or §1.5-inherited) a
+/// `skel:animationSource` relationship accepts weights only from
+/// *that* SkelAnimation prim; roster intersection alone decides for
+/// geometry without one.
+///
+/// A *static* table (`blendShapeWeights` authored as a plain default
+/// value, not `.timeSamples`) does not fabricate an animation
+/// channel: the single frame expands through the §1.4.1 inbetween
+/// layout and lands on `Node::weights` — the typed model's
+/// per-instance morph-weight override — so two nodes bound to
+/// different animation sources can hold divergent static blend
+/// states over one shared mesh. The carrier node records the source
+/// animation index (`usd:skel:weightsAnim`) for the writer's
+/// `skel:animationSource` re-authoring.
 fn attach_blend_weight_channels(ctx: &mut Ctx) {
     let pending = std::mem::take(&mut ctx.pending_blend_weights);
     for entry in &pending {
@@ -4037,6 +4127,17 @@ fn attach_blend_weight_channels(ctx: &mut Ctx) {
             {
                 continue;
             }
+            // §1.5 scoping: an authored/inherited animation source
+            // on the geometry names THE animation that drives it.
+            if let Some(source) = prim
+                .extras
+                .get("usd:skel:animationSource")
+                .and_then(|v| v.as_str())
+            {
+                if source != entry.anim_path {
+                    continue;
+                }
+            }
             // §1.4.1 group layout: each channel occupies
             // (inbetweens + 1) consecutive targets.
             let groups = channel_inbetween_weights(&prim.extras);
@@ -4050,6 +4151,25 @@ fn attach_blend_weight_channels(ctx: &mut Ctx) {
                     .and_then(|i| frame.get(i).copied())
                     .unwrap_or(0.0)
             };
+            // Static state → `Node::weights` (no animation channel).
+            if entry.static_default {
+                let Some(frame) = entry.frames.first() else {
+                    continue;
+                };
+                let expanded: Vec<f32> = groups
+                    .iter()
+                    .flat_map(|(name, inb_weights)| {
+                        expand_channel_weight(channel_w(name, frame), inb_weights)
+                    })
+                    .collect();
+                let node = &mut ctx.scene.nodes[node_idx];
+                node.weights = expanded;
+                node.extras.insert(
+                    "usd:skel:weightsAnim".into(),
+                    serde_json::Value::Number(entry.anim_idx.into()),
+                );
+                continue;
+            }
             // §1.4.1 resolution is piecewise-linear in the channel
             // weight, with knots at the inbetween weights; the
             // typed model interpolates the *expanded* vectors
