@@ -201,3 +201,63 @@ fn shared_transform_dedupes_the_baked_channel() {
     assert_eq!(emis.effective_uv_set(), 1);
     s2.validate().expect("round-tripped scene validates");
 }
+
+#[test]
+fn shared_material_pads_shorter_channel_lists() {
+    // Two meshes (separate nodes) draw with ONE material; one
+    // primitive carries a single UV channel, the other two. The
+    // baked channel must land at the SAME index on both — the
+    // per-material `UsdPrimvarReader` varname is single — so the
+    // shorter primitive pads with a source-channel copy.
+    let t = TextureTransform::new().with_offset([0.5, 0.0]);
+    let mut s = Scene3D::new();
+    let tid = add_texture(&mut s, "Diff");
+    let mut m = Material::new().with_name("Mat");
+    m.metallic = 0.0;
+    m.roughness = 0.5;
+    m.base_color_texture = Some(TextureRef::new(tid).with_transform(t));
+    let mid = s.add_material(m);
+
+    let mut p_short = tri_prim(); // 1 UV channel
+    p_short.material = Some(mid);
+    let mut p_long = tri_prim(); // 2 UV channels
+    p_long
+        .uvs
+        .push(vec![[0.25, 0.25], [0.75, 0.25], [0.25, 0.75]]);
+    p_long.material = Some(mid);
+
+    let mesh_a = s.add_mesh(Mesh::new(Some("A".into())).with_primitive(p_short));
+    let mesh_b = s.add_mesh(Mesh::new(Some("B".into())).with_primitive(p_long));
+    let ra = s.add_node(Node::new().with_name("A").with_mesh(mesh_a));
+    let rb = s.add_node(Node::new().with_name("B").with_mesh(mesh_b));
+    s.add_root(ra);
+    s.add_root(rb);
+    s.validate().expect("input validates");
+
+    let bytes = UsdzEncoder::new().encode_bytes(&s).expect("encode ok");
+    let s2 = UsdzDecoder::new().decode_bytes(&bytes).expect("decode ok");
+    s2.validate().expect("round-tripped scene validates");
+
+    let tref = s2.materials[0].base_color_texture.expect("texture ref");
+    assert_eq!(
+        tref.effective_uv_set(),
+        2,
+        "baked channel allocated past the longest channel list"
+    );
+    for mesh in &s2.meshes {
+        let p = &mesh.primitives[0];
+        assert_eq!(
+            p.uvs.len(),
+            3,
+            "every bound primitive carries the shared baked index"
+        );
+        // Channel 2 is the baked source channel on both primitives.
+        for (src, got) in p.uvs[0].iter().zip(&p.uvs[2]) {
+            let want = t.apply(*src);
+            assert!(
+                approx(got[0], want[0]) && approx(got[1], want[1]),
+                "baked {got:?} vs expected {want:?}"
+            );
+        }
+    }
+}
