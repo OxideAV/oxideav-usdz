@@ -5014,9 +5014,15 @@ fn resolve_shader_connect(
             serde_json::Value::Object(stash),
         );
     }
+    // No `TextureTransform` is ever attached on decode: the staged
+    // schema (§2.2) gives `UsdUVTexture` no UV-transform inputs (its
+    // `scale`/`bias` are per-channel *color* affines, not coordinate
+    // transforms), and no 2D-transform node schema is staged in
+    // `docs/3d/usd/`.
     let tref = TextureRef {
         texture: tex_id,
         uv_set,
+        transform: None,
     };
     ctx.textures_by_path.insert(prim_path.to_string(), tref);
     Ok(Some(ShaderConnect::Texture(tref)))

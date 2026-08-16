@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Build against the published `oxideav-mesh3d` 0.0.5 surface.**
+  `TextureRef` gained a typed per-reference UV-transform slot
+  (`transform: Option<TextureTransform>`); the two struct-literal
+  construction sites (the `UsdUVTexture` connection resolver and the
+  `usd:tex:<input>` extras replay) now build with `transform: None` —
+  the staged schema (§2.2) gives `UsdUVTexture` no UV-transform
+  inputs and no 2D-transform node schema is staged, so a decoded
+  reference never carries one. `Sampler`'s magnification /
+  minification filters are now `Option`-shaped upstream; the decoder
+  already built samplers via `Sampler::default_sampler()`, so decoded
+  USD textures now correctly report *undefined* filters (USD's
+  `UsdUVTexture` authors no filter inputs) instead of a fabricated
+  explicit linear/trilinear choice.
+
 ### Added
 
 - **usdc: Variant / VariantSet spec forms (10/11) bridge into the

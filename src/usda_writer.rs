@@ -3488,6 +3488,10 @@ fn texref_from_extras(
     Some(TextureRef {
         texture: oxideav_mesh3d::TextureId(texture),
         uv_set,
+        // The stash shape is decoder-authored and the decoder never
+        // attaches a UV transform (no 2D-transform node schema is
+        // staged), so the replayed reference carries none either.
+        transform: None,
     })
 }
 
