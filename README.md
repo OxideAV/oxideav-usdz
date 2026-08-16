@@ -98,10 +98,20 @@ Full reader and symmetric writer for the `#usda 1.0` text format:
   the authored-input record, the specular-F0 and clearcoat maps into
   the typed extension slots, the rest via `usd:tex:*` extras.
 - **Texture network** — `UsdUVTexture` `wrapS`/`wrapT` map to sampler
-  wrap modes; `scale` / `bias` / `fallback` / `sourceColorSpace`
+  wrap modes (filters decode as *undefined* — the Option-shaped
+  sampler state — since §2.2 authors no filter inputs);
+  `scale` / `bias` / `fallback` / `sourceColorSpace`
   round-trip; the `st` connection is followed to its
   `UsdPrimvarReader_float2` so `varname` selects the UV set
-  (`st` → 0, `st<N>` → N). A `file` path carrying the `<UDIM>` token
+  (`st` → 0, `st<N>` → N). A typed per-reference UV transform
+  (`TextureRef::transform`) **bakes on encode** — one
+  pre-transformed `primvars:st<N>` channel per distinct
+  (source channel, transform) pair, shared across every primitive
+  drawing with the material, references retargeted and the
+  transform consumed (`texCoord`-only overrides fold into the UV
+  set; identities are no-ops) — the sampled coordinates are
+  preserved exactly and the baked output is a one-cycle round-trip
+  fixed point. A `file` path carrying the `<UDIM>` token
   (a tile set — no single archive entry) decodes to an
   `ImageData::External` reference and re-emits the URI verbatim.
   Material inputs connected to a `UsdPrimvarReader_<T>` (any of the
@@ -118,7 +128,17 @@ Full reader and symmetric writer for the `#usda 1.0` text format:
   quads (with `skel:joints` remap), animations become per-joint
   TRS channels (timeCodes → seconds) and blend-shape weight
   channels, and blend shapes become `MorphTarget`s (sparse
-  `pointIndices` scattered dense). **Inbetween shapes** (§1.4.1)
+  `pointIndices` scattered dense). A **static** blend state
+  (`blendShapeWeights` authored as a plain default value) lands on
+  `Node::weights` — the per-instance morph-weight override —
+  instead of a fabricated one-keyframe channel;
+  `skel:animationSource` scopes which SkelAnimation drives which
+  geometry (divergent states over identical rosters stay apart);
+  the writer re-emits the state in default-value form (scalars
+  refreshed from the live override via the closed-form inversion)
+  and synthesizes a root-level `BlendState_<id>` SkelAnimation for
+  a typed-model override with no carrier — so two nodes sharing one
+  mesh with different static blend states survive the round trip. **Inbetween shapes** (§1.4.1)
   expand each channel into per-inbetween morph targets with the
   scalar weight animation baked through the documented
   piecewise-linear resolution (implicit 0/1 endpoints, unbounded

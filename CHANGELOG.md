@@ -25,6 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Sampler filter-state pins (`oxideav-mesh3d` 0.0.5
+  Option-shaped filters).** 2 new integration tests in
+  `tests/sampler_filters.rs`: a decoded `UsdUVTexture` sampler
+  reports *undefined* filters (schema §2.2 authors no filter
+  inputs) equal to `Sampler::default_sampler()`, with the
+  documented `Linear` / trilinear fallbacks (and `uses_mipmaps`)
+  resolving only on demand; wrap tokens keep their typed mapping and
+  the new per-axis `wrap_uv` reference semantics evaluate clamp /
+  mirror correctly on decoded state.
+
 - **Typed per-reference UV transforms bake on encode
   (`oxideav-mesh3d` 0.0.5 `TextureRef::transform` /
   `TextureTransform`).** The staged material schema gives the writer
