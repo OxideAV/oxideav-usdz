@@ -9,6 +9,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Build against the published `oxideav-mesh3d` 0.0.6 morph
+  surfaces — the blend-shape extras side-channels are retired.**
+  - **§1.4.1 inbetween shapes → `MorphTarget::inbetweens`.** A
+    channel is now ONE typed `MorphTarget`; each valid
+    `inbetweens:<name>` attribute (weight strictly inside (0, 1),
+    unique) becomes a named, `weight`-pinned `Inbetween` station on
+    it (position + discovered normal deltas, `pointIndices`-scattered
+    dense). The decoder no longer expands a channel into
+    `k + 1` sibling targets, no longer bakes the scalar channel
+    weight through its own piecewise-linear resolution, and no
+    longer inserts knot-crossing keyframes — `MorphTarget::at_weight`
+    resolves the stations (implicit 0/1 endpoints, unbounded) inside
+    the typed model, so `Node::weights` and sampled channels hold
+    **one scalar per channel, verbatim**. The
+    `usd:skel:inbetweens` roster stash is gone; only two wire-only
+    details stay on `Primitive::extras` because the typed model has
+    no slot for them — the exact authored inbetween normal-offsets
+    attribute spelling (`usd:skel:inbetweenNormalsAttr`, §1.4.2:
+    discovered by enumeration, never constructed) and the malformed
+    `inbetweens:*` attributes preserved for verbatim replay
+    (`usd:skel:malformedInbetweens`).
+  - **`skel:blendShapes` → `Mesh::target_names`.** The channel-name
+    roster is the typed per-mesh target-name list (`target_name(i)`
+    / `find_target(name)` work on decoded scenes); the
+    `usd:skel:blendShapes` extras roster is gone. A GeomSubset split
+    shares the roster across every primitive, so
+    `Scene3D::validate`'s length rule holds.
+  - **Sampled `blendShapeWeights` → `AnimationSampler::morph_weights`.**
+    The `MorphWeights` channel is synthesized from the per-keyframe
+    vectors (remapped into mesh channel order, undriven channels 0)
+    through the typed constructor and attached via
+    `AnimationChannel::new`; the writer reads the authored vectors
+    back losslessly through `morph_weight_frames` (a CubicSpline
+    sampler contributes its centre values; a Step sampler's frames
+    emit verbatim — USD time samples carry no tangents or step
+    flag).
+  - **Writer.** `skel:blendShapes` / `def BlendShape` children /
+    the animation `blendShapes` roster all name channels from
+    `Mesh::target_names` (`shape_<i>` for unnamed slots); each typed
+    inbetween re-authors as `uniform vector3f[] inbetweens:<name>`
+    with `(weight = …)` metadata (anonymous stations get
+    `inbetween_<j>`); static `Node::weights` and `BlendState_<id>`
+    scalars emit straight from the override (zero-padded to the
+    target count) — the closed-form `Σ vⱼ·knotⱼ` inversion is gone
+    with the bake it inverted. A typed-model animation that drives
+    `MorphWeights` with no decoder carrier now gets a synthesized
+    root-level `def SkelAnimation "BlendAnim_<idx>"` plus the
+    geometry's `skel:animationSource` binding (previously such an
+    animation was silently dropped on encode).
+  - Tests: `tests/usdskel_inbetweens.rs` re-pinned on the typed
+    roster + `at_weight` (the staged doc's worked extrapolation
+    example now evaluates through the typed model),
+    `tests/node_weights_static.rs` / `tests/usdskel_blendshapes.rs`
+    moved onto `target_names` / scalar `Node::weights`, and 5 new
+    tests in `tests/typed_morph_surface.rs` author the surfaces
+    purely through the typed model (constructor-built sampler,
+    named + anonymous inbetweens, typed roster, static override,
+    Step sampler, endpoint-station authoring error) and pin the
+    encode → decode → encode fixed point with lossless
+    `morph_weight_frames` read-back.
+
 - **Build against the published `oxideav-mesh3d` 0.0.5 surface.**
   `TextureRef` gained a typed per-reference UV-transform slot
   (`transform: Option<TextureTransform>`); the two struct-literal

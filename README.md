@@ -134,19 +134,21 @@ Full reader and symmetric writer for the `#usda 1.0` text format:
   instead of a fabricated one-keyframe channel;
   `skel:animationSource` scopes which SkelAnimation drives which
   geometry (divergent states over identical rosters stay apart);
-  the writer re-emits the state in default-value form (scalars
-  refreshed from the live override via the closed-form inversion)
-  and synthesizes a root-level `BlendState_<id>` SkelAnimation for
-  a typed-model override with no carrier — so two nodes sharing one
-  mesh with different static blend states survive the round trip. **Inbetween shapes** (§1.4.1)
-  expand each channel into per-inbetween morph targets with the
-  scalar weight animation baked through the documented
-  piecewise-linear resolution (implicit 0/1 endpoints, unbounded
-  extrapolation, keyframes inserted at knot crossings so linear
-  interpolation is exact); the writer inverts the bake in closed
-  form and re-authors `inbetweens:<name>` attributes with their
-  `weight` metadata. The writer reconstructs the full prim network
-  from the typed model; round trips are a one-cycle fixed point.
+  the writer re-emits the state in default-value form and
+  synthesizes a root-level `BlendState_<id>` SkelAnimation for a
+  typed-model override with no carrier — so two nodes sharing one
+  mesh with different static blend states survive the round trip.
+  Channel names are the typed `Mesh::target_names`; **inbetween
+  shapes** (§1.4.1) are typed `MorphTarget::inbetweens` stations
+  (named, `weight`-pinned, `pointIndices`-scattered dense) that the
+  typed model resolves at sample time, and sampled
+  `blendShapeWeights` become a `MorphWeights` channel built through
+  `AnimationSampler::morph_weights` — scalar channel weights stored
+  verbatim, read back losslessly on encode. The writer reconstructs
+  the full prim network from the typed model (a typed-model
+  `MorphWeights` animation with no carrier gets a synthesized
+  `BlendAnim_<idx>` SkelAnimation); round trips are a one-cycle
+  fixed point.
 - **Transforms** — per-node `UsdGeomXformable` xformOps round-trip
   (`translate` + `orient` quatf + `scale`, or a `matrix4d` transform).
   `matrix4d` literals (row-vector, translation in the last row)
