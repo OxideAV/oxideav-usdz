@@ -82,14 +82,13 @@ fn blend_shapes_become_morph_targets() {
     assert!(approx(pos[1][1], 0.25));
     let nrm = smile.normal.as_ref().expect("normal deltas");
     assert!(approx(nrm[0][2], 0.1));
-    // Channel-name roster preserved for the writer + weight remap.
-    let names = prim
-        .extras
-        .get("usd:skel:blendShapes")
-        .and_then(|v| v.as_array())
-        .expect("channel roster");
-    assert_eq!(names.len(), 2);
-    assert_eq!(names[0].as_str(), Some("smile"));
+    // Channel-name roster lands on the typed `Mesh::target_names`
+    // (one name per morph-target slot) — no extras side-channel.
+    let mesh = &scene.meshes[0];
+    assert_eq!(mesh.target_names.len(), 2);
+    assert_eq!(mesh.target_name(0), Some("smile"));
+    assert_eq!(mesh.find_target("frown"), Some(1));
+    assert!(!prim.extras.contains_key("usd:skel:blendShapes"));
 }
 
 #[test]
@@ -191,11 +190,9 @@ fn blend_shapes_round_trip() {
         }
         other => panic!("expected Scalar values, got {other:?}"),
     }
-    // Channel names survive.
-    assert_eq!(
-        pa.extras.get("usd:skel:blendShapes"),
-        pb.extras.get("usd:skel:blendShapes")
-    );
+    // Channel names survive on the typed mesh roster.
+    assert_eq!(scene.meshes[0].target_names, s2.meshes[0].target_names);
+    assert!(!s2.meshes[0].target_names.is_empty());
 }
 
 #[test]

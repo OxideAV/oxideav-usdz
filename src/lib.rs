@@ -508,7 +508,8 @@
 //!   primitives don't yet carry.
 //! * `UsdGeomSubset` per-face material binding subsets — schema-doc
 //!   gap. (UsdSkel skinning + animation + blend shapes landed in
-//!   r407 from the staged schema tables; inbetween shapes remain.)
+//!   r407 from the staged schema tables; §1.4.1 inbetween shapes
+//!   ride the typed `MorphTarget::inbetweens` roster.)
 //! * Cross-package `@foo.usdz[path/within.usd]@` package-relative
 //!   references — round 11 resolves `references` / `payload` targets
 //!   that live as their own entries in the *same* archive; nested

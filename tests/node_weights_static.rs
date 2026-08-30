@@ -202,10 +202,12 @@ fn live_node_weight_edit_survives_reencode() {
 }
 
 /// §1.4.1: a channel with one inbetween (weight 0.5) at static
-/// scalar 0.25 expands to [0.5, 0.0] — halfway up the ramp to the
-/// inbetween, primary untouched.
+/// scalar 0.25 stays ONE channel weight on `Node::weights`; the
+/// inbetween lives on the typed `MorphTarget::inbetweens` roster
+/// and the typed model resolves the station interpolation — at
+/// 0.25 the surface sits halfway up the ramp to the inbetween.
 #[test]
-fn static_weights_expand_through_inbetweens() {
+fn static_weights_stay_scalar_with_typed_inbetweens() {
     let usda = r#"#usda 1.0
 (
     defaultPrim = "Model"
@@ -235,16 +237,23 @@ def SkelRoot "Model" {
         .iter()
         .find(|n| n.mesh.is_some())
         .expect("mesh node");
-    assert_eq!(node.weights.len(), 2, "inbetween + primary targets");
-    assert!(approx(node.weights[0], 0.5), "inbetween at half its knot");
-    assert!(approx(node.weights[1], 0.0), "primary untouched");
-    // Writer inverts the bake back to the authored scalar.
+    assert_eq!(node.weights, vec![0.25], "one scalar per channel, verbatim");
+    let mesh = scene.mesh(node.mesh.unwrap()).unwrap();
+    let target = &mesh.primitives[0].targets[0];
+    assert_eq!(target.inbetweens.len(), 1);
+    assert!(approx(target.inbetweens[0].weight, 0.5));
+    // Typed resolution at the static weight: halfway to the 0.4
+    // inbetween = 0.2 on y.
+    let morphed = mesh.morphed(&node.weights);
+    assert!(approx(morphed.primitives[0].positions[0][1], 0.2));
+    scene.validate().expect("validates");
+    // Writer re-emits the scalar as authored.
     let report = UsdzEncoder::new()
         .encode_with_report(&scene)
         .expect("encode ok");
     assert!(
         report.usda.contains("float[] blendShapeWeights = [0.25]"),
-        "closed-form inversion recovers the authored scalar:\n{}",
+        "the authored scalar re-emits verbatim:\n{}",
         report.usda
     );
 }

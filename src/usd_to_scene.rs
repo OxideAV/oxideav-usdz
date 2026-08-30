@@ -2382,6 +2382,9 @@ fn build_mesh_group(
     for sibling in &group[1..] {
         let sibling_path = join_path(parent_path, &sibling.name);
         let extra = build_mesh(ctx, &sibling_path, sibling)?;
+        if seed_mesh.target_names.is_empty() {
+            seed_mesh.target_names = extra.target_names;
+        }
         for p in extra.primitives {
             seed_mesh.primitives.push(p);
         }
@@ -2824,8 +2827,31 @@ fn build_mesh(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Mesh> {
 
     let mut mesh = Mesh::new(Some(prim.name.clone()));
     mesh.primitives = primitives;
+    // §1.5 `skel:blendShapes` → typed `Mesh::target_names` (one name
+    // per morph-target slot, shared by every primitive of the mesh —
+    // a GeomSubset split clones the base roster).
+    for p in &mut mesh.primitives {
+        if let Some(v) = p.extras.remove(PENDING_TARGET_NAMES) {
+            if mesh.target_names.is_empty() {
+                mesh.target_names = v
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|n| n.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+            }
+        }
+    }
     Ok(mesh)
 }
+
+/// Transient `Primitive::extras` key carrying a gprim's
+/// `skel:blendShapes` roster from [`apply_blend_shapes`] up to
+/// [`build_mesh`], which lifts it onto `Mesh::target_names` and
+/// removes it — never visible on a decoded scene.
+const PENDING_TARGET_NAMES: &str = "usd:skel:blendShapes.pending";
 
 /// One material-bound face subset gathered by [`apply_geom_subsets`].
 struct MaterialFaceSubset {
@@ -3297,7 +3323,20 @@ fn build_triangle_primitive(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Pr
     apply_material_binding(ctx, path, prim, &mut prim_out, double_sided);
 
     apply_skel_binding(ctx, path, prim, &mut prim_out)?;
-    apply_blend_shapes(ctx, path, prim, &mut prim_out)?;
+    let channel_names = apply_blend_shapes(ctx, path, prim, &mut prim_out)?;
+    if !channel_names.is_empty() {
+        // Hand the roster up to `build_mesh`, which lifts it onto the
+        // typed `Mesh::target_names` and strips this transient key.
+        prim_out.extras.insert(
+            PENDING_TARGET_NAMES.into(),
+            serde_json::Value::Array(
+                channel_names
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
     apply_mesh_metadata_to_primitive(prim, &mut prim_out);
     Ok(prim_out)
 }
@@ -3305,17 +3344,29 @@ fn build_triangle_primitive(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Pr
 /// UsdSkel blend shapes (§1.4 / §1.5 / §1.8): resolve the geometry's
 /// `skel:blendShapes` channel names + positionally matched
 /// `rel skel:blendShapeTargets` into typed
-/// [`MorphTarget`](oxideav_mesh3d::MorphTarget)s.
+/// [`MorphTarget`](oxideav_mesh3d::MorphTarget)s — **one target per
+/// channel**, its §1.4.1 inbetween shapes on the target's typed
+/// `inbetweens` roster.
 ///
 /// Each target's `offsets` (and optional `normalOffsets`) expand to
 /// dense per-point deltas — a sparse shape (`pointIndices`) scatters
-/// into a zero-filled buffer. The channel-name roster rides on
-/// `Primitive::extras["usd:skel:blendShapes"]` so (a) the writer
-/// re-authors the names and (b) animation `blendShapeWeights` remap
-/// into the mesh's target order by name (§1.8 step 1).
-fn apply_blend_shapes(ctx: &mut Ctx, path: &str, prim: &Prim, out: &mut Primitive) -> Result<()> {
+/// into a zero-filled buffer; the same map governs every inbetween.
+/// The channel-name roster is returned for the mesh's typed
+/// `Mesh::target_names` (the caller lifts it — every primitive of
+/// one mesh shares the roster). Two wire-only details stay on
+/// `Primitive::extras` because the typed model has no slot for
+/// them: the exact authored inbetween normal-offsets attribute
+/// spelling (§1.4.2 — discovered, never constructed) and the
+/// malformed `inbetweens:*` attributes preserved for verbatim
+/// replay.
+fn apply_blend_shapes(
+    ctx: &mut Ctx,
+    path: &str,
+    prim: &Prim,
+    out: &mut Primitive,
+) -> Result<Vec<String>> {
     let Some(names_attr) = prim.attrs.get("skel:blendShapes") else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let names: Vec<String> = names_attr
         .value
@@ -3338,52 +3389,26 @@ fn apply_blend_shapes(ctx: &mut Ctx, path: &str, prim: &Prim, out: &mut Primitiv
         _ => Vec::new(),
     };
     if names.is_empty() || targets.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     if names.len() != targets.len() {
         return Err(invalid(format!(
-            "Mesh `{path}`: skel:blendShapes has {} names for {} blendShapeTargets              (§1.5 requires positional match)",
+            "Mesh `{path}`: skel:blendShapes has {} names for {} blendShapeTargets \
+             (§1.5 requires positional match)",
             names.len(),
             targets.len()
         )));
     }
     let n_points = out.positions.len();
-    let mut inbetween_roster = serde_json::Map::new();
+    let mut normals_attr_roster = serde_json::Map::new();
+    let mut malformed_roster = serde_json::Map::new();
     for (name, target_path) in names.iter().zip(&targets) {
         let Some(shape) = ctx.blendshapes_by_path.get(target_path).cloned() else {
             return Err(invalid(format!(
-                "Mesh `{path}`: skel:blendShapeTargets entry `{target_path}` names no                  BlendShape prim (channel `{name}`)"
+                "Mesh `{path}`: skel:blendShapeTargets entry `{target_path}` names no \
+                 BlendShape prim (channel `{name}`)"
             )));
         };
-        // §1.4.1: a channel with k valid inbetweens expands into
-        // k + 1 consecutive morph targets — the inbetweens in
-        // ascending-weight order, then the primary shape. The
-        // channel's scalar weight bakes into per-target weights by
-        // `attach_blend_weight_channels`' piecewise-linear
-        // expansion, which the roster stashed below makes exactly
-        // invertible on the writer side.
-        for inb in &shape.inbetweens {
-            let mut morph = oxideav_mesh3d::MorphTarget::new();
-            morph.position = Some(expand_deltas(
-                &inb.offsets,
-                // §1.4.1: the prim-level pointIndices governs every
-                // inbetween's arrays too.
-                shape.point_indices.as_deref(),
-                n_points,
-                path,
-                name,
-            )?);
-            if let Some((_, normals)) = &inb.normal_offsets {
-                morph.normal = Some(expand_deltas(
-                    normals,
-                    shape.point_indices.as_deref(),
-                    n_points,
-                    path,
-                    name,
-                )?);
-            }
-            out.targets.push(morph);
-        }
         let mut morph = oxideav_mesh3d::MorphTarget::new();
         morph.position = Some(expand_deltas(
             &shape.offsets,
@@ -3401,50 +3426,46 @@ fn apply_blend_shapes(ctx: &mut Ctx, path: &str, prim: &Prim, out: &mut Primitiv
                 name,
             )?);
         }
-        out.targets.push(morph);
-        if !shape.inbetweens.is_empty() || shape.malformed_inbetweens.is_some() {
-            let mut entry = serde_json::Map::new();
-            entry.insert(
-                "shapes".into(),
-                serde_json::Value::Array(
-                    shape
-                        .inbetweens
-                        .iter()
-                        .map(|inb| {
-                            let mut o = serde_json::Map::new();
-                            o.insert("name".into(), serde_json::Value::String(inb.name.clone()));
-                            o.insert(
-                                "weight".into(),
-                                serde_json::Number::from_f64(inb.weight as f64)
-                                    .map(serde_json::Value::Number)
-                                    .unwrap_or(serde_json::Value::Null),
-                            );
-                            if let Some((attr_name, _)) = &inb.normal_offsets {
-                                o.insert(
-                                    "normalsAttr".into(),
-                                    serde_json::Value::String(attr_name.clone()),
-                                );
-                            }
-                            serde_json::Value::Object(o)
-                        })
-                        .collect(),
-                ),
-            );
-            if let Some(m) = &shape.malformed_inbetweens {
-                entry.insert("malformed".into(), m.clone());
+        // §1.4.1: each valid inbetween becomes a typed station on
+        // the channel's target; the typed model resolves the
+        // piecewise-linear interpolation (implicit 0/1 endpoints,
+        // unbounded) itself, so the scalar channel weight is stored
+        // verbatim downstream.
+        let mut spellings = serde_json::Map::new();
+        for inb in &shape.inbetweens {
+            let mut typed = oxideav_mesh3d::Inbetween::new(inb.weight).with_name(inb.name.clone());
+            typed.position = Some(expand_deltas(
+                &inb.offsets,
+                // §1.4.1: the prim-level pointIndices governs every
+                // inbetween's arrays too.
+                shape.point_indices.as_deref(),
+                n_points,
+                path,
+                name,
+            )?);
+            if let Some((attr_name, normals)) = &inb.normal_offsets {
+                typed.normal = Some(expand_deltas(
+                    normals,
+                    shape.point_indices.as_deref(),
+                    n_points,
+                    path,
+                    name,
+                )?);
+                spellings.insert(
+                    inb.name.clone(),
+                    serde_json::Value::String(attr_name.clone()),
+                );
             }
-            inbetween_roster.insert(name.clone(), serde_json::Value::Object(entry));
+            morph.inbetweens.push(typed);
+        }
+        out.targets.push(morph);
+        if !spellings.is_empty() {
+            normals_attr_roster.insert(name.clone(), serde_json::Value::Object(spellings));
+        }
+        if let Some(m) = &shape.malformed_inbetweens {
+            malformed_roster.insert(name.clone(), m.clone());
         }
     }
-    out.extras.insert(
-        "usd:skel:blendShapes".into(),
-        serde_json::Value::Array(
-            names
-                .iter()
-                .map(|n| serde_json::Value::String(n.clone()))
-                .collect(),
-        ),
-    );
     // §1.5: an authored (or inherited) `skel:animationSource` names
     // THE animation that drives this geometry — stash the target
     // path so the blend-weight post-pass scopes attachment to it
@@ -3456,95 +3477,19 @@ fn apply_blend_shapes(ctx: &mut Ctx, path: &str, prim: &Prim, out: &mut Primitiv
             serde_json::Value::String(p.clone()),
         );
     }
-    if !inbetween_roster.is_empty() {
+    if !normals_attr_roster.is_empty() {
         out.extras.insert(
-            "usd:skel:inbetweens".into(),
-            serde_json::Value::Object(inbetween_roster),
+            "usd:skel:inbetweenNormalsAttr".into(),
+            serde_json::Value::Object(normals_attr_roster),
         );
     }
-    Ok(())
-}
-
-/// The §1.4.1 per-channel target-group layout of a primitive with
-/// (possibly) inbetween-expanded morph targets: for each channel
-/// name, the ascending inbetween weights of its group (empty = the
-/// plain single-target channel). Group `i` occupies
-/// `weights[i].len() + 1` consecutive targets — inbetweens in
-/// weight order, then the primary shape.
-pub(crate) fn channel_inbetween_weights(
-    extras: &HashMap<String, serde_json::Value>,
-) -> Vec<(String, Vec<f32>)> {
-    let names: Vec<String> = extras
-        .get("usd:skel:blendShapes")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    let roster = extras
-        .get("usd:skel:inbetweens")
-        .and_then(|v| v.as_object());
-    names
-        .into_iter()
-        .map(|name| {
-            let weights: Vec<f32> = roster
-                .and_then(|r| r.get(&name))
-                .and_then(|e| e.get("shapes"))
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|s| s.get("weight").and_then(|w| w.as_f64()))
-                        .map(|w| w as f32)
-                        .collect()
-                })
-                .unwrap_or_default();
-            (name, weights)
-        })
-        .collect()
-}
-
-/// §1.4.1 resolution, baked: expand a channel's scalar weight `w`
-/// into the per-target weight sub-vector of its group (`k`
-/// inbetweens at ascending `inb_weights` + the primary shape).
-/// Sort order + implicit endpoints per the staged doc: knots are
-/// `[0, w₁ … w_k, 1]` over shapes `[null, S₁ … S_k, primary]`;
-/// find the bracketing pair and interpolate linearly — unbounded
-/// (extrapolates outside [0, 1] rather than clamping), so
-/// `w = −0.25` with an inbetween at `0.25` applies that shape with
-/// weight `−1`. The mapping is exactly inverted by
-/// `w = Σ vⱼ·knotⱼ` (each shape's own weight), which the writer
-/// uses to reconstruct the authored scalar samples.
-pub(crate) fn expand_channel_weight(w: f32, inb_weights: &[f32]) -> Vec<f32> {
-    let k = inb_weights.len();
-    let mut out = vec![0.0f32; k + 1];
-    if k == 0 {
-        out[0] = w;
-        return out;
+    if !malformed_roster.is_empty() {
+        out.extras.insert(
+            "usd:skel:malformedInbetweens".into(),
+            serde_json::Value::Object(malformed_roster),
+        );
     }
-    // Knots over [null, S1..Sk, primary]; shape index j maps to
-    // out[j-1] (the null shape has no output slot).
-    let mut knots = Vec::with_capacity(k + 2);
-    knots.push(0.0f32);
-    knots.extend_from_slice(inb_weights);
-    knots.push(1.0);
-    // Bracketing segment (first end-segment claims everything
-    // outside — unbounded extrapolation).
-    let mut seg = knots.len() - 2;
-    for i in 0..knots.len() - 1 {
-        if w <= knots[i + 1] || i == knots.len() - 2 {
-            seg = i;
-            break;
-        }
-    }
-    let (a, b) = (knots[seg], knots[seg + 1]);
-    let t = if b != a { (w - a) / (b - a) } else { 0.0 };
-    if seg > 0 {
-        out[seg - 1] = 1.0 - t;
-    }
-    out[seg] = t;
-    out
+    Ok(names)
 }
 
 /// Expand a BlendShape delta array to one dense entry per base
@@ -4080,10 +4025,12 @@ fn build_skel_animation(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Option
 
 /// Post-pass (§1.8 step 1): for every gathered SkelAnimation
 /// blend-weight table, find each mesh node whose morph-channel
-/// roster (`Primitive::extras["usd:skel:blendShapes"]`) intersects
-/// the animation's channel names, remap the per-frame weights into
-/// the mesh's target order, and attach one `MorphWeights` channel
-/// targeting that node. Channels the animation doesn't drive hold
+/// roster (`Mesh::target_names`) intersects the animation's channel
+/// names, remap the per-frame weights into the mesh's target order,
+/// and attach one `MorphWeights` channel targeting that node
+/// (synthesized through `AnimationSampler::morph_weights`, so the
+/// authored per-keyframe vectors read back losslessly via
+/// `morph_weight_frames`). Channels the animation doesn't drive hold
 /// weight 0.
 ///
 /// Scoping: geometry that authored (or §1.5-inherited) a
@@ -4093,13 +4040,16 @@ fn build_skel_animation(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Option
 ///
 /// A *static* table (`blendShapeWeights` authored as a plain default
 /// value, not `.timeSamples`) does not fabricate an animation
-/// channel: the single frame expands through the §1.4.1 inbetween
-/// layout and lands on `Node::weights` — the typed model's
-/// per-instance morph-weight override — so two nodes bound to
-/// different animation sources can hold divergent static blend
+/// channel: the single frame lands on `Node::weights` — the typed
+/// model's per-instance morph-weight override — so two nodes bound
+/// to different animation sources can hold divergent static blend
 /// states over one shared mesh. The carrier node records the source
 /// animation index (`usd:skel:weightsAnim`) for the writer's
 /// `skel:animationSource` re-authoring.
+///
+/// Scalar channel weights are stored **verbatim** — §1.4.1 inbetween
+/// resolution lives on the typed `MorphTarget::inbetweens` roster
+/// and is evaluated by the typed model at sample time.
 fn attach_blend_weight_channels(ctx: &mut Ctx) {
     let pending = std::mem::take(&mut ctx.pending_blend_weights);
     for entry in &pending {
@@ -4113,16 +4063,7 @@ fn attach_blend_weight_channels(ctx: &mut Ctx) {
             let Some(prim) = mesh.primitives.first() else {
                 continue;
             };
-            let mesh_names: Vec<String> = prim
-                .extras
-                .get("usd:skel:blendShapes")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let mesh_names = &mesh.target_names;
             if mesh_names.is_empty() || !mesh_names.iter().any(|n| entry.channel_names.contains(n))
             {
                 continue;
@@ -4138,114 +4079,50 @@ fn attach_blend_weight_channels(ctx: &mut Ctx) {
                     continue;
                 }
             }
-            // §1.4.1 group layout: each channel occupies
-            // (inbetweens + 1) consecutive targets.
-            let groups = channel_inbetween_weights(&prim.extras);
-            debug_assert_eq!(groups.len(), mesh_names.len());
-            // Per-channel scalar samples in mesh channel order.
-            let channel_w = |name: &str, frame: &[f32]| -> f32 {
-                entry
-                    .channel_names
+            // Per-frame weight vector in mesh channel order.
+            let remap = |frame: &[f32]| -> Vec<f32> {
+                mesh_names
                     .iter()
-                    .position(|c| c == name)
-                    .and_then(|i| frame.get(i).copied())
-                    .unwrap_or(0.0)
+                    .map(|name| {
+                        entry
+                            .channel_names
+                            .iter()
+                            .position(|c| c == name)
+                            .and_then(|i| frame.get(i).copied())
+                            .unwrap_or(0.0)
+                    })
+                    .collect()
             };
             // Static state → `Node::weights` (no animation channel).
             if entry.static_default {
                 let Some(frame) = entry.frames.first() else {
                     continue;
                 };
-                let expanded: Vec<f32> = groups
-                    .iter()
-                    .flat_map(|(name, inb_weights)| {
-                        expand_channel_weight(channel_w(name, frame), inb_weights)
-                    })
-                    .collect();
+                let weights = remap(frame);
                 let node = &mut ctx.scene.nodes[node_idx];
-                node.weights = expanded;
+                node.weights = weights;
                 node.extras.insert(
                     "usd:skel:weightsAnim".into(),
                     serde_json::Value::Number(entry.anim_idx.into()),
                 );
                 continue;
             }
-            // §1.4.1 resolution is piecewise-linear in the channel
-            // weight, with knots at the inbetween weights; the
-            // typed model interpolates the *expanded* vectors
-            // linearly, so a keyframe interval whose scalar ramp
-            // crosses a knot must gain a keyframe at the crossing
-            // for the bake to be exact. Collect every crossing
-            // across all channels, then sample the merged timeline.
-            let mut times: Vec<f32> = entry.times.clone();
-            for (name, inb_weights) in &groups {
-                if inb_weights.is_empty() {
-                    continue;
-                }
-                for k in 0..entry.times.len().saturating_sub(1) {
-                    let (t0, t1) = (entry.times[k], entry.times[k + 1]);
-                    let w0 = channel_w(name, &entry.frames[k]);
-                    let w1 = channel_w(name, &entry.frames[k + 1]);
-                    if w0 == w1 {
-                        continue;
-                    }
-                    for &v in inb_weights {
-                        let lo = w0.min(w1);
-                        let hi = w0.max(w1);
-                        if v > lo && v < hi {
-                            times.push(t0 + (t1 - t0) * (v - w0) / (w1 - w0));
-                        }
-                    }
-                }
-            }
-            times.sort_by(f32::total_cmp);
-            times.dedup();
-            // Linear scalar interpolation of an authored channel at
-            // time t (constant extrapolation outside the sampled
-            // range, matching timeSamples resolution).
-            let scalar_at = |name: &str, t: f32| -> f32 {
-                if entry.times.is_empty() {
-                    return 0.0;
-                }
-                let idx = entry.times.partition_point(|&x| x <= t);
-                if idx == 0 {
-                    return channel_w(name, &entry.frames[0]);
-                }
-                if idx >= entry.times.len() {
-                    return channel_w(name, &entry.frames[entry.times.len() - 1]);
-                }
-                let (t0, t1) = (entry.times[idx - 1], entry.times[idx]);
-                let (w0, w1) = (
-                    channel_w(name, &entry.frames[idx - 1]),
-                    channel_w(name, &entry.frames[idx]),
-                );
-                if t1 == t0 {
-                    w0
-                } else {
-                    w0 + (w1 - w0) * (t - t0) / (t1 - t0)
-                }
-            };
-            let stride: usize = groups.iter().map(|(_, ws)| ws.len() + 1).sum();
-            let mut values = Vec::with_capacity(times.len() * stride);
-            for &t in &times {
-                for (name, inb_weights) in &groups {
-                    let w = scalar_at(name, t);
-                    values.extend(expand_channel_weight(w, inb_weights));
-                }
-            }
-            let channel = oxideav_mesh3d::AnimationChannel {
-                target: oxideav_mesh3d::AnimationTarget {
-                    node: oxideav_mesh3d::NodeId(node_idx as u32),
-                    property: oxideav_mesh3d::AnimationProperty::MorphWeights,
-                },
-                sampler: oxideav_mesh3d::AnimationSampler {
-                    keyframes: times,
-                    values: oxideav_mesh3d::AnimationValues::Scalar(values),
-                    interpolation: oxideav_mesh3d::Interpolation::Linear,
-                },
+            let frames: Vec<Vec<f32>> = entry.frames.iter().map(|f| remap(f)).collect();
+            let Some(sampler) = oxideav_mesh3d::AnimationSampler::morph_weights(
+                entry.times.clone(),
+                frames,
+                oxideav_mesh3d::Interpolation::Linear,
+            ) else {
+                // Structurally unusable table (no keyframes / not
+                // strictly increasing) — nothing to attach.
+                continue;
             };
             if let Some(anim) = ctx.scene.animations.get_mut(entry.anim_idx) {
-                anim.channels.push(channel);
+                anim.channels.push(oxideav_mesh3d::AnimationChannel::new(
+                    oxideav_mesh3d::NodeId(node_idx as u32),
+                    oxideav_mesh3d::AnimationProperty::MorphWeights,
+                    sampler,
+                ));
             }
         }
     }

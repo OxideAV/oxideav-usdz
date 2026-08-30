@@ -1287,7 +1287,17 @@ fn write_mesh(
         match prim.topology {
             Topology::Triangles => {
                 let prim_path = format!("{parent_path}/{prim_name}");
-                write_one_mesh_prim(w, scene, prim, &prim_name, &prim_path, None, skel, &[])
+                write_one_mesh_prim(
+                    w,
+                    scene,
+                    prim,
+                    &prim_name,
+                    &prim_path,
+                    None,
+                    skel,
+                    &[],
+                    &mesh.target_names,
+                )
             }
             Topology::TriangleStrip => {
                 let expanded = expand_strip_to_triangle_list(prim);
@@ -1301,6 +1311,7 @@ fn write_mesh(
                     Some("triangleStrip"),
                     skel,
                     &[],
+                    &mesh.target_names,
                 );
             }
             Topology::TriangleFan => {
@@ -1315,6 +1326,7 @@ fn write_mesh(
                     Some("triangleFan"),
                     skel,
                     &[],
+                    &mesh.target_names,
                 );
             }
             Topology::Lines | Topology::LineStrip | Topology::LineLoop => {
@@ -1352,6 +1364,7 @@ fn write_one_mesh_prim(
     original_topology_hint: Option<&str>,
     skel: Option<&SkelBindingPaths>,
     subsets: &[SubsetChild],
+    target_names: &[String],
 ) {
     let mut metadata_lines: Vec<String> = Vec::new();
     if let Some(token) = original_topology_hint {
@@ -1474,7 +1487,7 @@ fn write_one_mesh_prim(
             .unwrap();
         }
     }
-    write_blend_shapes(w, prim, prim_path);
+    write_blend_shapes(w, prim, prim_path, target_names);
     // §1.5: bind the blend-weight animation source. Skinned geometry
     // already authored the relationship above (one property per prim
     // — the TRS source also carries the blend table in that case).
@@ -1754,7 +1767,15 @@ fn write_subset_mesh(
 
     let prim_path = format!("{parent_path}/{mesh_name}");
     write_one_mesh_prim(
-        w, scene, &combined, mesh_name, &prim_path, None, skel, &children,
+        w,
+        scene,
+        &combined,
+        mesh_name,
+        &prim_path,
+        None,
+        skel,
+        &children,
+        &mesh.target_names,
     );
 
     // Any additional unmarked primitives beyond the base re-emit as
@@ -1770,7 +1791,17 @@ fn write_subset_mesh(
         match prim.topology {
             Topology::Triangles => {
                 let p_path = format!("{parent_path}/{prim_name}");
-                write_one_mesh_prim(w, scene, prim, &prim_name, &p_path, None, skel, &[]);
+                write_one_mesh_prim(
+                    w,
+                    scene,
+                    prim,
+                    &prim_name,
+                    &p_path,
+                    None,
+                    skel,
+                    &[],
+                    &mesh.target_names,
+                );
             }
             Topology::TriangleStrip => {
                 let expanded = expand_strip_to_triangle_list(prim);
@@ -1784,6 +1815,7 @@ fn write_subset_mesh(
                     Some("triangleStrip"),
                     skel,
                     &[],
+                    &mesh.target_names,
                 );
             }
             Topology::TriangleFan => {
@@ -1798,6 +1830,7 @@ fn write_subset_mesh(
                     Some("triangleFan"),
                     skel,
                     &[],
+                    &mesh.target_names,
                 );
             }
             Topology::Lines | Topology::LineStrip | Topology::LineLoop => {
@@ -1811,36 +1844,43 @@ fn write_subset_mesh(
 /// UsdSkel blend shapes (§1.4 / §1.5): emit the geometry's
 /// morph-target roster back as `def BlendShape` children of the
 /// mesh prim plus the positional `skel:blendShapes` /
-/// `skel:blendShapeTargets` pair. Channel names replay from the
-/// decoder's `usd:skel:blendShapes` extras roster (falling back to
-/// `shape_<i>`); targets emit dense (a decoded sparse shape was
-/// already scattered into per-point deltas).
-fn write_blend_shapes(w: &mut Out, prim: &Primitive, prim_path: &str) {
+/// `skel:blendShapeTargets` pair. Channel names come from the typed
+/// `Mesh::target_names` (falling back to `shape_<i>` for unnamed
+/// slots — see [`blend_channel_names`]); targets emit dense (a
+/// decoded sparse shape was already scattered into per-point
+/// deltas); each typed `MorphTarget::inbetweens` station re-authors
+/// as a §1.4.1 `inbetweens:<name>` attribute with its `weight`
+/// metadata.
+fn write_blend_shapes(w: &mut Out, prim: &Primitive, prim_path: &str, target_names: &[String]) {
     if prim.targets.is_empty() {
         return;
     }
-    // §1.4.1 group layout: channel i owns (inbetweens + 1)
-    // consecutive targets. A plain roster (no `usd:skel:inbetweens`
-    // stash) degenerates to one target per channel; targets beyond
-    // the roster emit as `shape_<i>` single-target channels.
-    let groups = padded_blend_groups(prim);
+    let names = blend_channel_names(prim, target_names);
+    let normals_attrs = prim
+        .extras
+        .get("usd:skel:inbetweenNormalsAttr")
+        .and_then(|v| v.as_object());
+    let malformed = prim
+        .extras
+        .get("usd:skel:malformedInbetweens")
+        .and_then(|v| v.as_object());
 
     w.write_indent();
     write!(w.s, "uniform token[] skel:blendShapes = [").unwrap();
-    for (i, g) in groups.iter().enumerate() {
+    for (i, name) in names.iter().enumerate() {
         if i > 0 {
             w.s.push_str(", ");
         }
-        write!(w.s, "\"{}\"", g.name).unwrap();
+        write!(w.s, "\"{name}\"").unwrap();
     }
     writeln!(w.s, "]").unwrap();
     w.write_indent();
     write!(w.s, "rel skel:blendShapeTargets = [").unwrap();
-    for (i, g) in groups.iter().enumerate() {
+    for (i, name) in names.iter().enumerate() {
         if i > 0 {
             w.s.push_str(", ");
         }
-        write!(w.s, "<{prim_path}/{}>", g.name).unwrap();
+        write!(w.s, "<{prim_path}/{name}>").unwrap();
     }
     writeln!(w.s, "]").unwrap();
 
@@ -1863,34 +1903,30 @@ fn write_blend_shapes(w: &mut Out, prim: &Primitive, prim_path: &str) {
         writeln!(w.s, "]{trail}").unwrap();
     };
 
-    let mut target_idx = 0usize;
-    for g in &groups {
-        let inb_targets: Vec<&oxideav_mesh3d::MorphTarget> = (0..g.inbetweens.len())
-            .filter_map(|j| prim.targets.get(target_idx + j))
-            .collect();
-        let primary = prim.targets.get(target_idx + g.inbetweens.len());
-        target_idx += g.inbetweens.len() + 1;
-        let Some(primary) = primary else { continue };
+    for (name, target) in names.iter().zip(&prim.targets) {
         w.write_indent();
-        writeln!(w.s, "def BlendShape \"{}\" {{", g.name).unwrap();
+        writeln!(w.s, "def BlendShape \"{name}\" {{").unwrap();
         w.indent += 1;
-        if let Some(offsets) = &primary.position {
+        if let Some(offsets) = &target.position {
             write_deltas(w, "uniform vector3f[] offsets = [", offsets, "");
         }
-        if let Some(normals) = &primary.normal {
+        if let Some(normals) = &target.normal {
             write_deltas(w, "uniform vector3f[] normalOffsets = [", normals, "");
         }
         // §1.4.1: each inbetween is a single `inbetweens:<name>`
-        // attribute; its target weight rides in the attribute's
-        // `weight` metadata field.
-        for (inb, target) in g.inbetweens.iter().zip(&inb_targets) {
-            if let Some(offsets) = &target.position {
+        // attribute; its station weight rides in the attribute's
+        // `weight` metadata field. Anonymous typed-model stations
+        // get a deterministic `inbetween_<j>` name.
+        for (j, inb) in target.inbetweens.iter().enumerate() {
+            let inb_name = inb
+                .name
+                .as_deref()
+                .map(sanitize_prim_name)
+                .unwrap_or_else(|| format!("inbetween_{j}"));
+            if let Some(offsets) = &inb.position {
                 write_deltas(
                     w,
-                    &format!(
-                        "uniform vector3f[] inbetweens:{} = [",
-                        sanitize_prim_name(&inb.name)
-                    ),
+                    &format!("uniform vector3f[] inbetweens:{inb_name} = ["),
                     offsets,
                     &format!(" (weight = {})", format_float(inb.weight as f64)),
                 );
@@ -1900,7 +1936,11 @@ fn write_blend_shapes(w: &mut Out, prim: &Primitive, prim_path: &str) {
             // not published (§1.4.2), so it is never constructed;
             // typed-model-authored inbetween normals without a
             // stashed spelling cannot be authored and are skipped.
-            if let (Some(attr_name), Some(normals)) = (&inb.normals_attr, &target.normal) {
+            let spelling = normals_attrs
+                .and_then(|r| r.get(name))
+                .and_then(|m| inb.name.as_deref().and_then(|n| m.get(n)))
+                .and_then(|v| v.as_str());
+            if let (Some(attr_name), Some(normals)) = (spelling, &inb.normal) {
                 write_deltas(
                     w,
                     &format!("uniform vector3f[] {attr_name} = ["),
@@ -1912,8 +1952,8 @@ fn write_blend_shapes(w: &mut Out, prim: &Primitive, prim_path: &str) {
         // §1.4.1 authoring-error inbetweens (weight 0/1, duplicate
         // weights, missing weight metadata) were excluded from
         // evaluation on decode but replay verbatim.
-        if let Some(malformed) = &g.malformed {
-            let shell = crate::variant_codec::decode_prim(malformed);
+        if let Some(shell) = malformed.and_then(|m| m.get(name)) {
+            let shell = crate::variant_codec::decode_prim(shell);
             write_attr_map(w, &shell.attrs);
         }
         w.indent -= 1;
@@ -1922,69 +1962,17 @@ fn write_blend_shapes(w: &mut Out, prim: &Primitive, prim_path: &str) {
     }
 }
 
-/// One §1.4.1 inbetween of a writer-side channel group.
-struct BlendInbetween {
-    name: String,
-    weight: f32,
-    /// Exact authored normal-offsets attribute spelling (§1.4.2 —
-    /// discovered, never constructed).
-    normals_attr: Option<String>,
-}
-
-/// One blend-shape channel on the writer side: its name plus the
-/// inbetween roster (empty = single-target channel).
-struct BlendChannelGroup {
-    name: String,
-    inbetweens: Vec<BlendInbetween>,
-    /// Tagged shell prim of malformed `inbetweens:*` attributes to
-    /// replay verbatim.
-    malformed: Option<serde_json::Value>,
-}
-
-/// Decode the per-channel group layout from the decoder's
-/// `usd:skel:blendShapes` + `usd:skel:inbetweens` extras.
-fn blend_channel_groups(prim: &Primitive) -> Vec<BlendChannelGroup> {
-    let names: Vec<String> = prim
-        .extras
-        .get("usd:skel:blendShapes")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(sanitize_prim_name))
-                .collect()
-        })
-        .unwrap_or_default();
-    let roster = prim
-        .extras
-        .get("usd:skel:inbetweens")
-        .and_then(|v| v.as_object());
-    names
-        .into_iter()
-        .map(|name| {
-            let entry = roster.and_then(|r| r.get(&name));
-            let inbetweens = entry
-                .and_then(|e| e.get("shapes"))
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|s| {
-                            Some(BlendInbetween {
-                                name: s.get("name")?.as_str()?.to_string(),
-                                weight: s.get("weight")?.as_f64()? as f32,
-                                normals_attr: s
-                                    .get("normalsAttr")
-                                    .and_then(|v| v.as_str())
-                                    .map(str::to_string),
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            BlendChannelGroup {
-                name,
-                inbetweens,
-                malformed: entry.and_then(|e| e.get("malformed")).cloned(),
-            }
+/// The writer-side channel roster of a primitive: one sanitized
+/// name per morph target — the typed `Mesh::target_names` entry
+/// when present, else `shape_<i>` — exactly the roster
+/// [`write_blend_shapes`] authors as `skel:blendShapes`.
+fn blend_channel_names(prim: &Primitive, target_names: &[String]) -> Vec<String> {
+    (0..prim.targets.len())
+        .map(|i| {
+            target_names
+                .get(i)
+                .map(|n| sanitize_prim_name(n))
+                .unwrap_or_else(|| format!("shape_{i}"))
         })
         .collect()
 }
@@ -2089,7 +2077,10 @@ fn existing_blend_anim_path(
             .iter()
             .any(|ch| ch.target.property == AnimationProperty::MorphWeights && ch.target.node == id)
     }) {
-        return marker_prim_path(scene, "usd:skelAnimation", idx as u64);
+        // A typed-model animation with no decoder carrier node gets
+        // the root-level prim `write_synth_blend_states` synthesizes.
+        return marker_prim_path(scene, "usd:skelAnimation", idx as u64)
+            .or_else(|| Some(format!("/{}", synth_blend_anim_name(idx))));
     }
     node.extras
         .get("usd:skel:weightsAnim")
@@ -2370,94 +2361,72 @@ fn write_skel_animation_prim(
     }
 
     // §1.3 blend-shape weights: a MorphWeights channel re-emits as
-    // the `blendShapes` channel-name roster (from the target mesh's
-    // `usd:skel:blendShapes` extras) + the per-keyframe
-    // `blendShapeWeights` map.
+    // the `blendShapes` channel-name roster (the target mesh's typed
+    // `Mesh::target_names`, `shape_<i>` for unnamed slots) + the
+    // per-keyframe `blendShapeWeights` map, read back losslessly
+    // through `morph_weight_frames` (the stored per-keyframe
+    // vectors; a CubicSpline sampler contributes its centre values —
+    // USD timeSamples carry no tangents).
     if let Some(morph_ch) = anim
         .channels
         .iter()
         .find(|ch| ch.target.property == AnimationProperty::MorphWeights)
     {
-        // §1.4.1 group layout of the bound mesh: channel i owns
-        // (inbetweens + 1) consecutive targets. The authored scalar
-        // channel weight is recovered exactly from the baked
-        // per-target sub-vector as Σ vⱼ·knotⱼ (each shape's own
-        // weight; the primary shape's is 1) — the inverse of the
-        // decoder's piecewise-linear expansion.
-        let groups: Vec<(String, Vec<f32>)> = scene
+        let names: Vec<String> = scene
             .node(morph_ch.target.node)
             .and_then(|n| n.mesh)
             .and_then(|mid| scene.meshes.get(mid.0 as usize))
-            .and_then(|m| m.primitives.first())
-            .map(|p| crate::usd_to_scene::channel_inbetween_weights(&p.extras))
+            .and_then(|m| m.primitives.first().map(|p| (m, p)))
+            .map(|(m, p)| blend_channel_names(p, &m.target_names))
             .unwrap_or_default();
-        if let AnimationValues::Scalar(weights) = &morph_ch.sampler.values {
-            let n_frames = morph_ch.sampler.keyframes.len();
-            let stride = weights.len().checked_div(n_frames).unwrap_or(0);
-            let grouped_stride: usize = groups.iter().map(|(_, ws)| ws.len() + 1).sum();
-            // Fall back to one-target-per-channel when the stashed
-            // roster doesn't cover the sampler stride (typed-model-
-            // authored scenes without the extras).
-            let groups: Vec<(String, Vec<f32>)> = if grouped_stride == stride && stride > 0 {
-                groups
-            } else {
-                (0..stride)
-                    .map(|i| {
-                        let name = groups
-                            .get(i)
-                            .map(|(n, _)| n.clone())
-                            .unwrap_or_else(|| format!("shape_{i}"));
-                        (name, Vec::new())
-                    })
-                    .collect()
-            };
-            if stride > 0 {
-                w.write_indent();
-                write!(w.s, "uniform token[] blendShapes = [").unwrap();
-                for (i, (name, _)) in groups.iter().enumerate() {
+        if let (Some(stride), Some(frames)) = (
+            morph_ch.sampler.morph_weight_stride(),
+            morph_ch.sampler.morph_weight_frames(),
+        ) {
+            // A sampler wider than the mesh roster (typed-model
+            // authored without matching targets) still emits every
+            // slot under a `shape_<i>` fallback name.
+            let names: Vec<String> = (0..stride)
+                .map(|i| {
+                    names
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| format!("shape_{i}"))
+                })
+                .collect();
+            w.write_indent();
+            write!(w.s, "uniform token[] blendShapes = [").unwrap();
+            for (i, name) in names.iter().enumerate() {
+                if i > 0 {
+                    w.s.push_str(", ");
+                }
+                write!(w.s, "\"{name}\"").unwrap();
+            }
+            writeln!(w.s, "]").unwrap();
+            w.write_indent();
+            write!(w.s, "float[] blendShapeWeights.timeSamples = {{").unwrap();
+            for (k, (t, frame)) in morph_ch.sampler.keyframes.iter().zip(frames).enumerate() {
+                if k > 0 {
+                    w.s.push(',');
+                }
+                write!(w.s, " {}: [", format_float((*t as f64) * tcps)).unwrap();
+                for (i, v) in frame.iter().enumerate() {
                     if i > 0 {
                         w.s.push_str(", ");
                     }
-                    write!(w.s, "\"{name}\"").unwrap();
+                    write!(w.s, "{}", format_float(*v as f64)).unwrap();
                 }
-                writeln!(w.s, "]").unwrap();
-                w.write_indent();
-                write!(w.s, "float[] blendShapeWeights.timeSamples = {{").unwrap();
-                for (k, t) in morph_ch.sampler.keyframes.iter().enumerate() {
-                    if k > 0 {
-                        w.s.push(',');
-                    }
-                    write!(w.s, " {}: [", format_float((*t as f64) * tcps)).unwrap();
-                    let mut base = k * stride;
-                    for (i, (_, inb_weights)) in groups.iter().enumerate() {
-                        if i > 0 {
-                            w.s.push_str(", ");
-                        }
-                        let n_targets = inb_weights.len() + 1;
-                        let sub = &weights
-                            [base.min(weights.len())..(base + n_targets).min(weights.len())];
-                        let scalar: f32 = sub
-                            .iter()
-                            .enumerate()
-                            .map(|(j, &v)| {
-                                let knot = inb_weights.get(j).copied().unwrap_or(1.0);
-                                v * knot
-                            })
-                            .sum();
-                        base += n_targets;
-                        write!(w.s, "{}", format_float(scalar as f64)).unwrap();
-                    }
-                    w.s.push(']');
-                }
-                writeln!(w.s, " }}").unwrap();
+                w.s.push(']');
             }
+            writeln!(w.s, " }}").unwrap();
         }
     }
 
     // Static blend state (default-value `blendShapeWeights`): replay
     // the authored roster from the carrier stash, refreshing each
     // scalar from the live `Node::weights` of the node the decoder
-    // attached the state to (inverting the §1.4.1 inbetween bake).
+    // attached the state to (one scalar per channel — the typed
+    // model holds §1.4.1 inbetweens on the target, not the weight).
     if let Some(stash) = carrier_extras
         .get("usd:skelAnim:staticWeights")
         .and_then(|v| v.as_object())
@@ -2491,17 +2460,16 @@ fn write_skel_animation_prim(
             {
                 continue;
             }
-            if let Some(prim) = node
+            if let Some((mesh, prim)) = node
                 .mesh
                 .and_then(|m| scene.meshes.get(m.0 as usize))
-                .and_then(|m| m.primitives.first())
+                .and_then(|m| m.primitives.first().map(|p| (m, p)))
             {
-                let groups = padded_blend_groups(prim);
-                for (g, scalar) in groups
-                    .iter()
-                    .zip(invert_group_scalars(&groups, &node.weights))
+                for (name, scalar) in blend_channel_names(prim, &mesh.target_names)
+                    .into_iter()
+                    .zip(padded_weights(&node.weights, prim.targets.len()))
                 {
-                    live.entry(g.name.clone()).or_insert(scalar);
+                    live.entry(name).or_insert(scalar);
                 }
             }
         }
@@ -2525,16 +2493,32 @@ fn write_skel_animation_prim(
     writeln!(w.s, "}}").unwrap();
 }
 
-/// Synthesize one root-level `def SkelAnimation "BlendState_<id>"`
-/// per reachable node that holds a static morph state
-/// ([`node_static_morph_state`]) with no existing carrier — the
-/// counterpart of the geometry prim's
-/// `rel skel:animationSource = </BlendState_<id>>` authored by
-/// [`write_one_mesh_prim`]. Channel names come from the same padded
-/// group roster the geometry's `skel:blendShapes` uses, scalars from
-/// inverting the §1.4.1 expansion of `Node::weights`, so the decoder
-/// reattaches exactly this state (scoped by the relationship even
-/// when several nodes share one mesh with divergent overrides).
+/// Deterministic prim name of the root-level `def SkelAnimation`
+/// synthesized for a typed-model animation (index `idx`) that drives
+/// `MorphWeights` but has no decoder carrier node.
+fn synth_blend_anim_name(idx: usize) -> String {
+    format!("BlendAnim_{idx}")
+}
+
+/// Synthesize the root-level `def SkelAnimation` prims a typed-model
+/// scene needs for its morph state:
+///
+/// * one `BlendAnim_<idx>` per animation carrying a sampled
+///   `MorphWeights` channel (e.g. built through
+///   `AnimationSampler::morph_weights`) with no decoder carrier
+///   node — the `blendShapes` / `blendShapeWeights.timeSamples`
+///   table, bound from the geometry via `skel:animationSource`;
+/// * one `BlendState_<id>` per reachable node that holds a static
+///   morph state ([`node_static_morph_state`]) with no existing
+///   carrier — the counterpart of the geometry prim's
+///   `rel skel:animationSource = </BlendState_<id>>` authored by
+///   [`write_one_mesh_prim`].
+///
+/// Channel names come from the same roster the geometry's
+/// `skel:blendShapes` uses, scalars straight from `Node::weights`
+/// (zero-padded to the target count), so the decoder reattaches
+/// exactly this state (scoped by the relationship even when several
+/// nodes share one mesh with divergent overrides).
 fn write_synth_blend_states(w: &mut Out, scene: &Scene3D) {
     fn collect(scene: &Scene3D, id: NodeId, out: &mut Vec<NodeId>) {
         let Some(node) = scene.node(id) else { return };
@@ -2542,6 +2526,22 @@ fn write_synth_blend_states(w: &mut Out, scene: &Scene3D) {
         for &child in &node.children {
             collect(scene, child, out);
         }
+    }
+    for (idx, anim) in scene.animations.iter().enumerate() {
+        let drives_morph = anim
+            .channels
+            .iter()
+            .any(|ch| ch.target.property == oxideav_mesh3d::AnimationProperty::MorphWeights);
+        if !drives_morph || marker_prim_path(scene, "usd:skelAnimation", idx as u64).is_some() {
+            continue;
+        }
+        write_skel_animation_prim(
+            w,
+            scene,
+            &synth_blend_anim_name(idx),
+            idx,
+            &std::collections::HashMap::new(),
+        );
     }
     let mut ids: Vec<NodeId> = Vec::new();
     for &root in &scene.roots {
@@ -2554,16 +2554,15 @@ fn write_synth_blend_states(w: &mut Out, scene: &Scene3D) {
         {
             continue;
         }
-        let Some(prim) = node
+        let Some((mesh, prim)) = node
             .mesh
             .and_then(|m| scene.mesh(m))
-            .and_then(|m| m.primitives.first())
+            .and_then(|m| m.primitives.first().map(|p| (m, p)))
         else {
             continue;
         };
-        let groups = padded_blend_groups(prim);
-        let names: Vec<String> = groups.iter().map(|g| g.name.clone()).collect();
-        let scalars = invert_group_scalars(&groups, &node.weights);
+        let names = blend_channel_names(prim, &mesh.target_names);
+        let scalars = padded_weights(&node.weights, prim.targets.len());
         w.write_indent();
         writeln!(w.s, "def SkelAnimation \"BlendState_{}\" {{", id.0).unwrap();
         w.indent += 1;
@@ -2598,45 +2597,13 @@ fn write_static_blend_weights(w: &mut Out, names: &[String], weights: &[f32]) {
     writeln!(w.s, "]").unwrap();
 }
 
-/// The §1.4.1 writer-side channel groups of a primitive, padded so
-/// every morph target beyond the stashed roster gets its own
-/// single-target `shape_<i>` channel — the exact roster
-/// [`write_blend_shapes`] authors.
-fn padded_blend_groups(prim: &Primitive) -> Vec<BlendChannelGroup> {
-    let mut groups = blend_channel_groups(prim);
-    let covered: usize = groups.iter().map(|g| g.inbetweens.len() + 1).sum();
-    for i in covered..prim.targets.len() {
-        groups.push(BlendChannelGroup {
-            name: format!("shape_{i}"),
-            inbetweens: Vec::new(),
-            malformed: None,
-        });
-    }
-    groups
-}
-
-/// Invert the decoder's §1.4.1 piecewise-linear expansion for one
-/// per-target weight vector: each channel's authored scalar is
-/// `Σ vⱼ·knotⱼ` over its group's consecutive targets (an inbetween's
-/// knot is its own weight; the primary shape's is 1).
-fn invert_group_scalars(groups: &[BlendChannelGroup], expanded: &[f32]) -> Vec<f32> {
-    let mut base = 0usize;
-    let mut out = Vec::with_capacity(groups.len());
-    for g in groups {
-        let n_targets = g.inbetweens.len() + 1;
-        let sub = &expanded[base.min(expanded.len())..(base + n_targets).min(expanded.len())];
-        let scalar: f32 = sub
-            .iter()
-            .enumerate()
-            .map(|(j, &v)| {
-                let knot = g.inbetweens.get(j).map(|inb| inb.weight).unwrap_or(1.0);
-                v * knot
-            })
-            .sum();
-        base += n_targets;
-        out.push(scalar);
-    }
-    out
+/// `Node::weights` sized to the mesh's morph-target roster: one
+/// scalar per channel, missing tail entries read as `0` (glTF's
+/// "absent override = zero weight"), surplus entries dropped.
+fn padded_weights(weights: &[f32], n_targets: usize) -> Vec<f32> {
+    (0..n_targets)
+        .map(|i| weights.get(i).copied().unwrap_or(0.0))
+        .collect()
 }
 
 /// DFS from a joint node assigning slash-joined name-path tokens —
