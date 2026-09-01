@@ -7,6 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/OxideAV/oxideav-usdz/compare/v0.0.3...v0.0.4) - 2026-08-30
+
+### Other
+
+- typed morph surface pins + README/CHANGELOG refresh for the mesh3d 0.0.6 adoption
+- adopt the mesh3d 0.0.6 morph surfaces — typed inbetweens, Mesh::target_names, sampled MorphWeights synthesis
+- TextureTransform::is_finite guard — non-finite transforms never bake
+- shared-material shorter-channel-list padding test
+- sampler surface pins + README refresh for the mesh3d 0.0.5 adoption
+- bake TextureRef::transform UV transforms on encode
+- static blendShapeWeights onto Node::weights + animationSource scoping + BlendState synthesis
+- mesh3d 0.0.5 adoption: TextureRef::transform construction sites + Option-shaped sampler filters
+- bridge Variant/VariantSet spec forms (10/11) into variantSet blocks
+- §1.4.1 inbetween shapes — exact piecewise-linear bake + closed-form inverse
+- collection bindings — Core-Spec §15 CollectionAPI membership + §3.4 rules 2/4/5/6
+- direct-binding resolution — purpose forms, bindMaterialAs, namespace inheritance
+- UsdGeomSubset per-face material subsets — split, remainder, familyType, round-trip
+- §16.2.5 literal conformance — full escape set + inf/nan spellings
+- README — USDC full-reader status, spec-grounded container rules
+- §16.4 normative container restrictions
+- bridge Crate layers into the scene pipeline — .usdc decodes end-to-end
+- §16.3.9/§16.3.10 typed value decoding — every Crate field value decodes
+- int-coded full-width codepoint is a delta (§16.3.7.2.2) + 64-bit variant
+- §16.3.8.4.5.4 path construction + spec-corrected element-token mapping
+- §16.3.10.1 value-type table — ValueType IDs 1–59 + ValueRep::value_type()
+- README — primvar-reader inputs, <UDIM> external references, matrix convention
+- transpose at the matrix4d <-> typed-model boundary; validate() guard suite
+- enforce the §1.6 cross-primvar consistency constraint
+- <UDIM> tile-set file references decode to External (schema §2.2)
+- UsdPrimvarReader_<T>-connected inputs (schema §2.3) round-trip
+- README — typed MaterialExt slots for the migrated preview-surface inputs
+- specular workflow onto the typed MaterialExt::specular slot
+- clearcoat lobe onto the typed MaterialExt::clearcoat slot
+- inputs:ior onto the typed MaterialExt::ior slot
+- BlendShape morph targets + blendShapeWeights channels (decode + encode)
+- SkelAnimation to typed Animation channels (decode + encode)
+- UsdSkel core — SkelRoot / Skeleton / BindingAPI (decode + encode)
+- keep §2.1 expansion within the published typed-model surface
+- material network: UsdUVTexture + UsdPrimvarReader schema tables (decode + encode)
+- mechanical lint fix (contains_key over get().is_none())
+- full UsdPreviewSurface §2.1 input set (decode + encode)
+- parse timeSamples attribute maps into Value::TimeSamples
+- stop curves/points round-trip drift (geometry-hint stash leak)
+- fix two round-trip asymmetries (bare-mesh collapse + empty Materials root)
+- add CI / crates.io / docs.rs / MIT-license badges
+- document ZIP64 rejection, fallible writer, compressed-int-array decode
+- real-fixture test pins compressed arrays are not §3b integer form
+- fallible try_add_stored/try_finish guarding ZIP64 boundary
+- reject ZIP64 sentinels + validate EOCD entry count
+- usdc §4.3/§3b: materialise compressed-integer arrays
+- README — document list-edit-operator-aware composition arcs
+- end-to-end tests for list-edit composition semantics
+- list-edit-operator-aware composition arcs (Value::ListOp)
+- usdc §4.5/§5: PATHS↔SPECS join — name each spec's leaf component
+- usdc §4.5: observer-grounded PATHS structural join (PathElement)
+- paraphrase inherited GAP-TRACKER off-limits-source naming to neutral wording
+- README — document USDC value-rep flag decode + value-region resolution
+- usdc §4.3: typed ValueRegion accessors (inline bit-cast + array element slicing)
+- usdc §4.3: value-region resolution (UsdcFile::value_region → ValueRegion)
+- usdc §4.3: observer-grounded ValueRep flag bits (is_array/is_inline/is_compressed + raw type_code)
+- assert the full §5 named-spec join survives a USDC writer round-trip
+- README — document the USDC structural writer + read-modify-write
+- USDC writer authoring surface + read-modify-write round-trip
+- clean-room USDC structural writer (CrateImage round-trips real fixture)
+- usdc §4.3: split FIELDS value-rep word into typed ValueRep (high-16 type/flags + low-48 payload)
+- usdc §3b: reject int-coded buffers with unconsumed trailing payload
+- usdc §5: bounds-check spec pathIndex against §4.5 PATHS numPaths
+- end-to-end §3a→LZ4→§3b section-content fixture regression test
+- refresh to current status, drop per-round changelog cruft
+
 ### Changed
 
 - **Build against the published `oxideav-mesh3d` 0.0.6 morph
