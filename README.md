@@ -270,6 +270,16 @@ order (*prepended* → *explicit* → *appended*) and then removes any
 removal rather than being treated as an add. The writer re-emits each
 authored operator on its own line.
 
+### Unmodelled properties
+
+Every authored property the typed model has no slot for — custom
+attributes, `visibility` / `purpose`, tool namespaces, time-sampled
+scalars on containers — rides on `Node::extras["usd:attrs"]` (the
+tagged `Attr` codec) and replays verbatim; an unknown-schema prim
+(`Cube`, `Camera`, a light) keeps its type token, transform, whole
+body and children the same way, so nothing authored is dropped by a
+USDZ → `Scene3D` → USDZ pass.
+
 ### Round-trip fidelity
 
 `tests/fixture_fixed_point.rs` runs every staged fixture under

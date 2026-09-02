@@ -33,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0.11.0; composition applies each entry per §10.3.2.6 (audit on
   `Scene3D::extras["usd:composedRelocates"]`), the flattening writer
   prunes applied entries and the preserving writer re-authors them.
+- Unmodelled properties (custom attributes, `visibility` / `purpose`,
+  tool namespaces) and unknown-schema prim bodies (`Cube`, `Camera`,
+  lights — transform, attributes, children) ride on
+  `Node::extras["usd:attrs"]` and replay verbatim instead of being
+  dropped.
 - Typed Crate writer (`usdc_encode::encode_layer`) — the §16.3 binary
   form of the text model (path tree, every spec form, every value
   encoding incl. relocates and splines, lowest-needed version stamp),

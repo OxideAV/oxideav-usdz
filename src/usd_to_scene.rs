@@ -1878,6 +1878,43 @@ fn resolve_binding(
 /// Collect every authored `material:binding*` attribute on a prim —
 /// the direct forms *and* the collection forms — for the verbatim
 /// round-trip stash.
+/// The authored properties the typed pipeline does not consume on a
+/// container / unknown-schema prim: everything except the transform
+/// ops, material bindings, collections, skeleton bindings, and — on a
+/// `PointInstancer` — the §2.1 / §2.2 instancing arrays.
+fn collect_unconsumed_attrs(prim: &Prim, type_name: &str) -> BTreeMap<String, Attr> {
+    const INSTANCER_ATTRS: [&str; 11] = [
+        "prototypes",
+        "protoIndices",
+        "positions",
+        "orientations",
+        "orientationsf",
+        "scales",
+        "ids",
+        "invisibleIds",
+        "velocities",
+        "angularVelocities",
+        "accelerations",
+    ];
+    prim.attrs
+        .iter()
+        .filter(|(name, _)| {
+            let base = name.split('.').next().unwrap_or(name);
+            let consumed = name.starts_with("xformOp:")
+                || base == "xformOpOrder"
+                || base == "material:binding"
+                || name.starts_with("material:binding:")
+                || name.starts_with("collection:")
+                || name.starts_with("skel:")
+                || name.starts_with("primvars:skel:")
+                || (type_name == crate::point_instancer::TYPE_NAME
+                    && INSTANCER_ATTRS.contains(&base));
+            !consumed
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
 fn collect_binding_attrs(prim: &Prim) -> BTreeMap<String, Attr> {
     prim.attrs
         .iter()
@@ -2692,6 +2729,15 @@ fn build_node(ctx: &mut Ctx, parent: &str, prim: &Prim) -> Result<Option<oxideav
                     binding_stash_json(&authored_collections),
                 );
             }
+            // Every other authored property (custom attributes,
+            // `visibility` / `purpose`, tool namespaces …) has no
+            // typed slot: it rides on `usd:attrs` and the writer
+            // replays it verbatim.
+            let unconsumed = collect_unconsumed_attrs(prim, &prim.type_name);
+            if !unconsumed.is_empty() {
+                node.extras
+                    .insert("usd:attrs".into(), binding_stash_json(&unconsumed));
+            }
             ctx.binding_levels.push(binding_level);
             // Recurse children — collect the scene-graph children
             // first, push attribute extras after. Mesh children
@@ -2782,12 +2828,27 @@ fn build_node(ctx: &mut Ctx, parent: &str, prim: &Prim) -> Result<Option<oxideav
             Ok(Some(id))
         }
         other => {
-            // Unknown / not-yet-supported schema — preserve as an
-            // empty node with the type token in extras so a writer
-            // could round-trip even what we don't model.
+            // Unknown / not-yet-supported schema (`Cube`, `Camera`,
+            // lights, …) — preserve as a node carrying the type token,
+            // its transform, and every authored property on
+            // `usd:attrs`, so the writer round-trips what the typed
+            // model does not model. Children still walk.
             let mut node = Node::new().with_name(prim.name.clone());
+            node.transform = read_node_transform(prim);
             node.extras
                 .insert("usd:type".into(), serde_json::Value::String(other.into()));
+            let unconsumed = collect_unconsumed_attrs(prim, other);
+            if !unconsumed.is_empty() {
+                node.extras
+                    .insert("usd:attrs".into(), binding_stash_json(&unconsumed));
+            }
+            let mut child_ids = Vec::new();
+            for child in &prim.children {
+                if let Some(id) = build_node(ctx, &path, child)? {
+                    child_ids.push(id);
+                }
+            }
+            node.children = child_ids;
             stash_extras(&mut node.extras, prim);
             let id = ctx.scene.add_node(node);
             Ok(Some(id))

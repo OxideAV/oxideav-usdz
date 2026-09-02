@@ -1000,6 +1000,10 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
     // the decoder's stashes.
     replay_attr_stash(w, &node.extras, "usd:materialBindings");
     replay_attr_stash(w, &node.extras, "usd:collections");
+    // Properties the typed model has no slot for (custom attributes,
+    // `visibility` / `purpose`, unknown-schema prim bodies) replay
+    // verbatim from the decoder's `usd:attrs` stash.
+    replay_attr_stash(w, &node.extras, "usd:attrs");
 
     // Mesh attachment — emit an inner `def Mesh` so its prim path is
     // `<parent>/<node_name>/<mesh_name>`. A skinned node passes its
