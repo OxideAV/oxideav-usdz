@@ -866,17 +866,11 @@ fn emit_sampled<T>(
 }
 
 fn fmt_f(f: f64) -> String {
-    if f.is_nan() {
-        return "nan".into();
-    }
-    if f.is_infinite() {
-        return if f < 0.0 { "-inf" } else { "inf" }.into();
-    }
-    if f == f.trunc() && f.abs() < 1e16 {
-        return format!("{}", f as i64);
-    }
-    let s = format!("{f:.6}");
-    s.trim_end_matches('0').trim_end_matches('.').to_string()
+    crate::usda_writer::format_float(f)
+}
+
+fn fmt_f32(f: f32) -> String {
+    crate::usda_writer::format_f32(f)
 }
 
 fn fmt_ints(v: &[u32]) -> String {
@@ -892,14 +886,7 @@ fn fmt_i64s(v: &[i64]) -> String {
 fn fmt_vec3s(v: &[[f32; 3]]) -> String {
     let items: Vec<String> = v
         .iter()
-        .map(|p| {
-            format!(
-                "({}, {}, {})",
-                fmt_f(p[0] as f64),
-                fmt_f(p[1] as f64),
-                fmt_f(p[2] as f64)
-            )
-        })
+        .map(|p| format!("({}, {}, {})", fmt_f32(p[0]), fmt_f32(p[1]), fmt_f32(p[2])))
         .collect();
     format!("[{}]", items.join(", "))
 }
@@ -911,10 +898,10 @@ fn fmt_quats(v: &[[f32; 4]]) -> String {
         .map(|q| {
             format!(
                 "({}, {}, {}, {})",
-                fmt_f(q[3] as f64),
-                fmt_f(q[0] as f64),
-                fmt_f(q[1] as f64),
-                fmt_f(q[2] as f64)
+                fmt_f32(q[3]),
+                fmt_f32(q[0]),
+                fmt_f32(q[1]),
+                fmt_f32(q[2])
             )
         })
         .collect();

@@ -270,6 +270,28 @@ order (*prepended* → *explicit* → *appended*) and then removes any
 removal rather than being treated as an add. The writer re-emits each
 authored operator on its own line.
 
+### Round-trip fidelity
+
+`tests/fixture_fixed_point.rs` runs every staged fixture under
+`docs/3d/usd/fixtures/` (the production Elephant Crate, the
+variant-spec Crate, the alignment package) through decode → encode →
+decode in both composition modes and pins a **one-cycle fixed
+point**: byte-identical second package, identical typed-model digest
+(node / mesh / primitive / vertex / index / UV / normal / joint /
+morph / material / texture / skeleton / skin / animation / channel /
+keyframe / audio counts and names), exact positions, indices,
+normals, UVs and keyframes. The channels that used to degrade are
+closed: a Mesh prim's own `xformOp` lives once on the carrier node
+(the writer collapses the carrier back onto the `def Mesh`, metadata
+and all); a `SpatialAudio` carrier re-emits as that prim; each
+SkelAnimation array is written on its own keyframe timeline (a
+static `scales` no longer resamples onto the `rotations` timeline,
+and a joint's value is held, never defaulted); authored
+`bindTransforms` replay verbatim while they still invert onto the
+typed matrices; `f32` data prints the shortest round-trip digits and
+`f64` values (timeCodes included) the §16.2.5 double-precision
+spelling, `-0` normalised.
+
 ## USDC (binary crate file) — full reader + structural writer
 
 A clean-room Crate reader implemented from the AOUSD *USD Core

@@ -2020,6 +2020,11 @@ struct SkelInfo {
     /// The joints with no parent among `joint_tokens` — the carrier
     /// node's children.
     root_joints: Vec<oxideav_mesh3d::NodeId>,
+    /// The authored `bindTransforms` literals (USD row-vector layout),
+    /// replayed verbatim by the writer while they still agree with
+    /// the typed inverse-bind matrices — inverting twice in `f32` is
+    /// not an identity at the last digit.
+    bind_rows: Option<Vec<[[f32; 4]; 4]>>,
 }
 
 fn apply_layer_metadata(scene: &mut Scene3D, meta: &BTreeMap<String, Value>) {
@@ -2354,6 +2359,7 @@ fn build_skeleton(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<SkelInfo> {
         joint_tokens,
         joint_nodes,
         root_joints,
+        bind_rows: bind,
     })
 }
 
@@ -2520,6 +2526,28 @@ fn build_node(ctx: &mut Ctx, parent: &str, prim: &Prim) -> Result<Option<oxideav
                 "usd:skeleton".into(),
                 serde_json::Value::Number(info.skeleton.0.into()),
             );
+            if let Some(rows) = &info.bind_rows {
+                node.extras.insert(
+                    "usd:skel:bindTransforms".into(),
+                    serde_json::Value::Array(
+                        rows.iter()
+                            .map(|m| {
+                                serde_json::Value::Array(
+                                    m.iter()
+                                        .map(|r| {
+                                            serde_json::Value::Array(
+                                                r.iter()
+                                                    .map(|&c| serde_json::Value::from(c as f64))
+                                                    .collect(),
+                                            )
+                                        })
+                                        .collect(),
+                                )
+                            })
+                            .collect(),
+                    ),
+                );
+            }
             // §1.2 jointNames (presentational) ride on extras.
             if let Some(names) = prim.attrs.get("jointNames").and_then(|a| a.value.as_seq()) {
                 let arr: Vec<serde_json::Value> = names
@@ -4712,89 +4740,13 @@ fn apply_mesh_metadata_to_primitive(prim: &Prim, out: &mut Primitive) {
             );
         }
     }
-    if let Some(t) = read_inner_mesh_transform(prim) {
-        out.extras.insert("usd:mesh_transform".into(), t);
-    }
-}
-
-/// Read an inner-def-Mesh `xformOp:transform` opinion (or the
-/// matching TRS triple) into a JSON-shaped value suitable for the
-/// `usd:mesh_transform` extras slot.
-///
-/// Output schema mirrors what
-/// [`crate::usda_writer::transform_from_extras`] consumes:
-///
-/// * Matrix opinion → `{"matrix": [[a,b,c,d], …]}` (4 rows of 4).
-/// * TRS triple → `{"trs": {"translation": [...], "rotation": [...],
-///   "scale": [...]}}`.
-///
-/// Returns `None` when the prim doesn't carry an `xformOpOrder`
-/// (the common case — most authoring tools put the transform on
-/// the parent Xform, not the inner def Mesh).
-fn read_inner_mesh_transform(prim: &Prim) -> Option<serde_json::Value> {
-    let order_attr = prim.attrs.get("xformOpOrder")?;
-    let order_seq = order_attr.value.as_seq()?;
-    let order: Vec<&str> = order_seq.iter().filter_map(|v| v.as_text()).collect();
-    if order.is_empty() {
-        return None;
-    }
-    if order.len() == 1 && order[0] == "xformOp:transform" {
-        let m_attr = prim.attrs.get("xformOp:transform")?;
-        let m = read_matrix4(&m_attr.value)?;
-        let rows: Vec<serde_json::Value> = m
-            .iter()
-            .map(|row| {
-                serde_json::Value::Array(
-                    row.iter()
-                        .filter_map(|c| {
-                            serde_json::Number::from_f64(*c as f64).map(serde_json::Value::Number)
-                        })
-                        .collect(),
-                )
-            })
-            .collect();
-        let mut obj = serde_json::Map::new();
-        obj.insert("matrix".into(), serde_json::Value::Array(rows));
-        return Some(serde_json::Value::Object(obj));
-    }
-    if order
-        .iter()
-        .all(|t| matches!(*t, "xformOp:translate" | "xformOp:orient" | "xformOp:scale"))
-    {
-        let translation = prim
-            .attrs
-            .get("xformOp:translate")
-            .and_then(|a| a.value.as_floatn::<3>())
-            .unwrap_or([0.0; 3]);
-        let rotation = prim
-            .attrs
-            .get("xformOp:orient")
-            .and_then(|a| a.value.as_floatn::<4>())
-            .map(|wxyz| [wxyz[1], wxyz[2], wxyz[3], wxyz[0]])
-            .unwrap_or([0.0, 0.0, 0.0, 1.0]);
-        let scale = prim
-            .attrs
-            .get("xformOp:scale")
-            .and_then(|a| a.value.as_floatn::<3>())
-            .unwrap_or([1.0, 1.0, 1.0]);
-        let to_arr = |xs: &[f32]| {
-            serde_json::Value::Array(
-                xs.iter()
-                    .filter_map(|c| {
-                        serde_json::Number::from_f64(*c as f64).map(serde_json::Value::Number)
-                    })
-                    .collect(),
-            )
-        };
-        let mut trs = serde_json::Map::new();
-        trs.insert("translation".into(), to_arr(&translation));
-        trs.insert("rotation".into(), to_arr(&rotation));
-        trs.insert("scale".into(), to_arr(&scale));
-        let mut obj = serde_json::Map::new();
-        obj.insert("trs".into(), serde_json::Value::Object(trs));
-        return Some(serde_json::Value::Object(obj));
-    }
-    None
+    // A Mesh prim's own `xformOp:*` opinions land on the typed
+    // carrier node's `Transform` (see `build_mesh_group` /
+    // `build_standalone_mesh_node`) — the one place the typed model
+    // keeps a transform. Recording them a second time on
+    // `Primitive::extras["usd:mesh_transform"]` used to make every
+    // encode → decode cycle apply the transform twice and wrap the
+    // mesh in one more Xform.
 }
 
 /// Fan-triangulate a polygon soup described by USD's `(counts,

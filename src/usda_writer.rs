@@ -555,6 +555,14 @@ struct Out {
     /// Composition-preserving write: the decoder's typed opinion
     /// model. `None` flattens.
     record: Option<CompositionRecord>,
+    /// The transform of a collapsed mesh-carrier node, emitted on
+    /// the `def Mesh` (a `UsdGeomXformable`) instead of an Xform
+    /// wrapper. Set around the carrier's mesh emission only.
+    carrier_transform: Option<Transform>,
+    /// The `( … )` metadata lines of a collapsed mesh-carrier node,
+    /// emitted on the first geometry prim's header. Taken (consumed)
+    /// by the prim writer that emits it.
+    carrier_metadata: Option<Vec<String>>,
 }
 
 impl Out {
@@ -597,7 +605,7 @@ fn write_layer_metadata(w: &mut Out, scene: &Scene3D) {
     };
     writeln!(w.s, "(").unwrap();
     writeln!(w.s, "    upAxis = \"{up_axis}\"").unwrap();
-    writeln!(w.s, "    metersPerUnit = {}", format_float(mpu as f64)).unwrap();
+    writeln!(w.s, "    metersPerUnit = {}", format_f32(mpu)).unwrap();
     // Round 9: re-emit `defaultPrim`, `subLayers`, `customLayerData`,
     // and any other layer-metadata key picked up by the decoder.  The
     // canonical [`USD glossary`][1] LIVRPS section + the `subLayers` /
@@ -864,25 +872,68 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
     // mesh) keep the Xform and are unaffected, so hand-authored layers
     // round-trip byte-for-byte as before. This makes the round-trip a
     // fixed point instead of a monotonically-growing tree.
-    if prim_metadata_lines.is_empty() {
+    // The carrier may also carry prim metadata (`kind`, `apiSchemas`,
+    // custom keys) — those go on the geometry prim's own header. A
+    // variant block or a binding / collection stash needs the Xform
+    // body, so such carriers keep the wrapper.
+    let carrier_metadata_ok = variant_sets.is_empty()
+        && !node.extras.contains_key("usd:materialBindings")
+        && !node.extras.contains_key("usd:collections");
+    if prim_metadata_lines.is_empty() || carrier_metadata_ok {
         if let Some(mesh_id) = node.mesh {
             if node.children.is_empty()
                 && node.audio_emitter.is_none()
                 && node.camera.is_none()
                 && node.light.is_none()
-                && is_identity(&node.transform)
             {
                 if let Some(mesh) = scene.mesh(mesh_id) {
                     let mesh_name = sanitize_prim_name(mesh.name.as_deref().unwrap_or("Mesh"));
-                    if mesh_name == safe_name {
+                    // A hand-built primitive carrying its own
+                    // `usd:mesh_transform` keeps the Xform wrapper for
+                    // a non-identity carrier transform (both apply).
+                    let explicit_inner = mesh
+                        .primitives
+                        .iter()
+                        .any(|p| p.extras.contains_key("usd:mesh_transform"));
+                    if mesh_name == safe_name && (is_identity(&node.transform) || !explicit_inner) {
                         // A skinned carrier still collapses — the
                         // geometry prim itself carries every §1.5
                         // BindingAPI opinion, so no Xform wrapper is
                         // needed (and keeping one would re-grow the
-                        // tree each encode→decode cycle).
+                        // tree each encode→decode cycle). The carrier's
+                        // transform goes on the Mesh prim itself
+                        // (UsdGeomXformable), which the decoder maps
+                        // straight back onto the carrier node.
                         let skel = skel_binding_paths(scene, id, node);
+                        w.carrier_transform =
+                            (!is_identity(&node.transform)).then_some(node.transform);
+                        w.carrier_metadata =
+                            (!prim_metadata_lines.is_empty()).then(|| prim_metadata_lines.clone());
                         write_mesh(w, scene, mesh, mesh_id, parent_path, skel.as_ref());
+                        w.carrier_transform = None;
+                        w.carrier_metadata = None;
                         return;
+                    }
+                }
+            }
+        }
+        // An audio-carrier node (the decoder's shape for a
+        // `SpatialAudio` prim) re-emits as that prim directly, its
+        // transform inside — otherwise each cycle wraps it in one
+        // more Xform.
+        if let Some(emitter_id) = node.audio_emitter {
+            if prim_metadata_lines.is_empty()
+                && node.mesh.is_none()
+                && node.children.is_empty()
+                && node.camera.is_none()
+                && node.light.is_none()
+            {
+                if let Some(emitter) = scene.audio_emitter(emitter_id) {
+                    if let Some(source) = scene.audio_source(emitter.source) {
+                        if spatial_audio_prim_name(emitter, source) == safe_name {
+                            write_spatial_audio(w, emitter, source, Some(&node.transform));
+                            return;
+                        }
                     }
                 }
             }
@@ -969,7 +1020,7 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
     if let Some(emitter_id) = node.audio_emitter {
         if let Some(emitter) = scene.audio_emitter(emitter_id) {
             if let Some(source) = scene.audio_source(emitter.source) {
-                write_spatial_audio(w, emitter, source);
+                write_spatial_audio(w, emitter, source, None);
             }
         }
     }
@@ -1392,9 +1443,9 @@ fn write_node_transform(w: &mut Out, t: &Transform) {
             writeln!(
                 w.s,
                 "double3 xformOp:translate = ({}, {}, {})",
-                format_float(translation[0] as f64),
-                format_float(translation[1] as f64),
-                format_float(translation[2] as f64)
+                format_f32(translation[0]),
+                format_f32(translation[1]),
+                format_f32(translation[2])
             )
             .unwrap();
             // Quaternion order: USD's `quatf` literal is
@@ -1404,19 +1455,19 @@ fn write_node_transform(w: &mut Out, t: &Transform) {
             writeln!(
                 w.s,
                 "quatf xformOp:orient = ({}, {}, {}, {})",
-                format_float(rotation[3] as f64),
-                format_float(rotation[0] as f64),
-                format_float(rotation[1] as f64),
-                format_float(rotation[2] as f64)
+                format_f32(rotation[3]),
+                format_f32(rotation[0]),
+                format_f32(rotation[1]),
+                format_f32(rotation[2])
             )
             .unwrap();
             w.write_indent();
             writeln!(
                 w.s,
                 "float3 xformOp:scale = ({}, {}, {})",
-                format_float(scale[0] as f64),
-                format_float(scale[1] as f64),
-                format_float(scale[2] as f64)
+                format_f32(scale[0]),
+                format_f32(scale[1]),
+                format_f32(scale[2])
             )
             .unwrap();
             w.write_indent();
@@ -1438,10 +1489,10 @@ fn write_node_transform(w: &mut Out, t: &Transform) {
                 write!(
                     w.s,
                     "({}, {}, {}, {})",
-                    format_float(row[0] as f64),
-                    format_float(row[1] as f64),
-                    format_float(row[2] as f64),
-                    format_float(row[3] as f64)
+                    format_f32(row[0]),
+                    format_f32(row[1]),
+                    format_f32(row[2]),
+                    format_f32(row[3])
                 )
                 .unwrap();
             }
@@ -1632,7 +1683,7 @@ fn write_one_mesh_prim(
     subsets: &[SubsetChild],
     target_names: &[String],
 ) {
-    let mut metadata_lines: Vec<String> = Vec::new();
+    let mut metadata_lines: Vec<String> = w.carrier_metadata.take().unwrap_or_default();
     if let Some(token) = original_topology_hint {
         metadata_lines.push(format!("usd:original_topology = \"{token}\""));
     }
@@ -1652,7 +1703,7 @@ fn write_one_mesh_prim(
         writeln!(
             w.s,
             "def Mesh \"{prim_name}\" ({}) {{",
-            metadata_lines.join(" ")
+            metadata_lines.join("; ")
         )
         .unwrap();
     }
@@ -1661,7 +1712,7 @@ fn write_one_mesh_prim(
     // when the source carries a `usd:mesh_transform` extras entry.
     // Mirrors `write_node_transform` but writes onto the Mesh prim
     // directly per the UsdGeomXformable schema (which Mesh inherits).
-    if let Some(t) = transform_from_extras(&prim.extras) {
+    if let Some(t) = transform_from_extras(&prim.extras).or(w.carrier_transform) {
         write_node_transform(w, &t);
     }
     write_triangle_mesh(w, prim);
@@ -1720,7 +1771,7 @@ fn write_one_mesh_prim(
                     if i > 0 || e > 0 {
                         w.s.push_str(", ");
                     }
-                    write!(w.s, "{}", format_float(*wgt as f64)).unwrap();
+                    write!(w.s, "{}", format_f32(*wgt)).unwrap();
                 }
             }
             writeln!(w.s, "] (elementSize = 4, interpolation = \"vertex\")").unwrap();
@@ -2160,9 +2211,9 @@ fn write_blend_shapes(w: &mut Out, prim: &Primitive, prim_path: &str, target_nam
             write!(
                 w.s,
                 "({}, {}, {})",
-                format_float(o[0] as f64),
-                format_float(o[1] as f64),
-                format_float(o[2] as f64)
+                format_f32(o[0]),
+                format_f32(o[1]),
+                format_f32(o[2])
             )
             .unwrap();
         }
@@ -2194,7 +2245,7 @@ fn write_blend_shapes(w: &mut Out, prim: &Primitive, prim_path: &str, target_nam
                     w,
                     &format!("uniform vector3f[] inbetweens:{inb_name} = ["),
                     offsets,
-                    &format!(" (weight = {})", format_float(inb.weight as f64)),
+                    &format!(" (weight = {})", format_f32(inb.weight)),
                 );
             }
             // Normal offsets replay only under the exact authored
@@ -2272,10 +2323,10 @@ fn format_matrix4(m: [[f32; 4]; 4]) -> String {
         }
         s.push_str(&format!(
             "({}, {}, {}, {})",
-            format_float(row[0] as f64),
-            format_float(row[1] as f64),
-            format_float(row[2] as f64),
-            format_float(row[3] as f64)
+            format_f32(row[0]),
+            format_f32(row[1]),
+            format_f32(row[2]),
+            format_f32(row[3])
         ));
     }
     s.push(')');
@@ -2525,21 +2576,35 @@ fn write_skel_animation_prim(
             .iter()
             .find(|ch| ch.target.node == node && ch.target.property == property)
     };
-    // Keyframe timeline: the decoder produces parallel samplers, so
-    // the first TRS channel's keyframes are the shared timeline.
-    let timeline: Vec<f32> = anim
-        .channels
-        .iter()
-        .find(|ch| {
-            matches!(
-                ch.target.property,
-                AnimationProperty::Translation
-                    | AnimationProperty::Rotation
-                    | AnimationProperty::Scale
-            )
-        })
-        .map(|ch| ch.sampler.keyframes.clone())
-        .unwrap_or_default();
+    // Keyframe timeline — one per array. USD authors `translations`,
+    // `rotations` and `scales` as independent time-sampled arrays,
+    // each with its own sample times (a static `scales` is one
+    // sample beside thousands of `rotations` samples), and the
+    // decoder produces per-joint channels carrying exactly those
+    // keyframes. The timeline of an array is the union of its
+    // channels' keyframes; a joint's value at a time it has no key
+    // for is held from its previous key (never a default) — so the
+    // parallel channels the decoder produces write back verbatim.
+    let property_timeline = |property: AnimationProperty| -> Vec<f32> {
+        let mut times: Vec<f32> = joints
+            .iter()
+            .filter_map(|&j| channel_for(j, property))
+            .flat_map(|ch| ch.sampler.keyframes.iter().copied())
+            .collect();
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        times.dedup();
+        times
+    };
+    /// Index of the sample in force at `t`: the exact key, else the
+    /// last key before it (held); `None` before the first key.
+    fn sample_index(keyframes: &[f32], t: f32) -> Option<usize> {
+        match keyframes.binary_search_by(|k| k.partial_cmp(&t).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            Ok(i) => Some(i),
+            Err(0) => None,
+            Err(i) => Some(i - 1),
+        }
+    }
 
     for (attr_name, type_token, property, default) in [
         (
@@ -2558,6 +2623,7 @@ fn write_skel_animation_prim(
         if !joints.iter().any(|&j| channel_for(j, property).is_some()) {
             continue;
         }
+        let timeline = property_timeline(property);
         w.write_indent();
         write!(w.s, "{type_token} {attr_name}.timeSamples = {{").unwrap();
         for (k, t) in timeline.iter().enumerate() {
@@ -2570,17 +2636,20 @@ fn write_skel_animation_prim(
                     w.s.push_str(", ");
                 }
                 let v = channel_for(joint, property)
-                    .and_then(|ch| match &ch.sampler.values {
-                        AnimationValues::Vec3(vals) => vals.get(k).copied(),
-                        _ => None,
+                    .and_then(|ch| {
+                        let k = sample_index(&ch.sampler.keyframes, *t)?;
+                        match &ch.sampler.values {
+                            AnimationValues::Vec3(vals) => vals.get(k).copied(),
+                            _ => None,
+                        }
                     })
                     .unwrap_or(default);
                 write!(
                     w.s,
                     "({}, {}, {})",
-                    format_float(v[0] as f64),
-                    format_float(v[1] as f64),
-                    format_float(v[2] as f64)
+                    format_f32(v[0]),
+                    format_f32(v[1]),
+                    format_f32(v[2])
                 )
                 .unwrap();
             }
@@ -2593,6 +2662,7 @@ fn write_skel_animation_prim(
         .iter()
         .any(|&j| channel_for(j, AnimationProperty::Rotation).is_some())
     {
+        let timeline = property_timeline(AnimationProperty::Rotation);
         w.write_indent();
         write!(w.s, "quatf[] rotations.timeSamples = {{").unwrap();
         for (k, t) in timeline.iter().enumerate() {
@@ -2605,19 +2675,22 @@ fn write_skel_animation_prim(
                     w.s.push_str(", ");
                 }
                 let q = channel_for(joint, AnimationProperty::Rotation)
-                    .and_then(|ch| match &ch.sampler.values {
-                        AnimationValues::Quat(vals) => vals.get(k).copied(),
-                        _ => None,
+                    .and_then(|ch| {
+                        let k = sample_index(&ch.sampler.keyframes, *t)?;
+                        match &ch.sampler.values {
+                            AnimationValues::Quat(vals) => vals.get(k).copied(),
+                            _ => None,
+                        }
                     })
                     .unwrap_or([0.0, 0.0, 0.0, 1.0]);
                 // Internal xyzw → USD's (w, x, y, z) literal.
                 write!(
                     w.s,
                     "({}, {}, {}, {})",
-                    format_float(q[3] as f64),
-                    format_float(q[0] as f64),
-                    format_float(q[1] as f64),
-                    format_float(q[2] as f64)
+                    format_f32(q[3]),
+                    format_f32(q[0]),
+                    format_f32(q[1]),
+                    format_f32(q[2])
                 )
                 .unwrap();
             }
@@ -2680,7 +2753,7 @@ fn write_skel_animation_prim(
                     if i > 0 {
                         w.s.push_str(", ");
                     }
-                    write!(w.s, "{}", format_float(*v as f64)).unwrap();
+                    write!(w.s, "{}", format_f32(*v)).unwrap();
                 }
                 w.s.push(']');
             }
@@ -2858,7 +2931,7 @@ fn write_static_blend_weights(w: &mut Out, names: &[String], weights: &[f32]) {
         if i > 0 {
             w.s.push_str(", ");
         }
-        write!(w.s, "{}", format_float(*wt as f64)).unwrap();
+        write!(w.s, "{}", format_f32(*wt)).unwrap();
     }
     writeln!(w.s, "]").unwrap();
 }
@@ -2957,15 +3030,44 @@ fn write_skeleton_prim(
         writeln!(w.s, "]").unwrap();
     }
 
+    // The authored `bindTransforms` literals are replayed verbatim
+    // while each still inverts (via the typed column-vector layout)
+    // onto the skeleton's inverse-bind matrix — a typed edit makes the
+    // stash stale and the matrix is recomputed. Inverting the inverse
+    // in `f32` drifts at the last digit, so the replay is what keeps
+    // an unedited skeleton a fixed point.
+    let authored: Option<Vec<[[f32; 4]; 4]>> = node
+        .extras
+        .get("usd:skel:bindTransforms")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.as_array().and_then(|r| json_matrix4(r)))
+                .collect()
+        })
+        .filter(|rows: &Vec<[[f32; 4]; 4]>| rows.len() == skeleton.inverse_bind_matrices.len());
+    let agrees = |authored: &[[f32; 4]; 4], ibm: &[[f32; 4]; 4]| -> bool {
+        let inv = crate::usd_to_scene::invert_matrix4(crate::usd_to_scene::transpose4(*authored));
+        inv.iter()
+            .flatten()
+            .zip(ibm.iter().flatten())
+            .all(|(a, b)| {
+                let tol = 1e-4 * a.abs().max(b.abs()).max(1.0);
+                (a - b).abs() <= tol
+            })
+    };
     w.write_indent();
     write!(w.s, "uniform matrix4d[] bindTransforms = [").unwrap();
     for (i, ibm) in skeleton.inverse_bind_matrices.iter().enumerate() {
         if i > 0 {
             w.s.push_str(", ");
         }
-        // Typed column-vector inverse-bind → bind, then into the USD
-        // row-vector literal layout.
-        let bind = crate::usd_to_scene::transpose4(crate::usd_to_scene::invert_matrix4(*ibm));
+        let bind = match authored.as_ref().map(|rows| rows[i]) {
+            Some(rows) if agrees(&rows, ibm) => rows,
+            // Typed column-vector inverse-bind → bind, then into the
+            // USD row-vector literal layout.
+            _ => crate::usd_to_scene::transpose4(crate::usd_to_scene::invert_matrix4(*ibm)),
+        };
         write!(w.s, "{}", format_matrix4(bind)).unwrap();
     }
     writeln!(w.s, "]").unwrap();
@@ -3179,7 +3281,7 @@ fn clone_prim_metadata(prim: &Primitive) -> Primitive {
 /// * `material:binding` — same per-primitive binding shape used by
 ///   `write_one_mesh_prim`.
 fn write_basis_curves_prim(w: &mut Out, scene: &Scene3D, prim: &Primitive, prim_name: &str) {
-    let mut metadata_lines: Vec<String> = Vec::new();
+    let mut metadata_lines: Vec<String> = w.carrier_metadata.take().unwrap_or_default();
     let original = match prim.topology {
         Topology::Lines => "lines",
         Topology::LineStrip => "lineStrip",
@@ -3194,13 +3296,13 @@ fn write_basis_curves_prim(w: &mut Out, scene: &Scene3D, prim: &Primitive, prim_
     writeln!(
         w.s,
         "def BasisCurves \"{prim_name}\" ({}) {{",
-        metadata_lines.join(" ")
+        metadata_lines.join("; ")
     )
     .unwrap();
     w.indent += 1;
 
-    // Optional per-primitive transform.
-    if let Some(t) = transform_from_extras(&prim.extras) {
+    // Optional per-primitive transform (or the collapsed carrier's).
+    if let Some(t) = transform_from_extras(&prim.extras).or(w.carrier_transform) {
         write_node_transform(w, &t);
     }
 
@@ -3253,9 +3355,9 @@ fn write_basis_curves_prim(w: &mut Out, scene: &Scene3D, prim: &Primitive, prim_
         write!(
             w.s,
             "({}, {}, {})",
-            format_float(p[0] as f64),
-            format_float(p[1] as f64),
-            format_float(p[2] as f64)
+            format_f32(p[0]),
+            format_f32(p[1]),
+            format_f32(p[2])
         )
         .unwrap();
     }
@@ -3285,7 +3387,8 @@ fn write_basis_curves_prim(w: &mut Out, scene: &Scene3D, prim: &Primitive, prim_
 /// buffer is present). No per-point `widths` are authored in r5;
 /// downstream renderers fall back to a sensible default.
 fn write_points_prim(w: &mut Out, scene: &Scene3D, prim: &Primitive, prim_name: &str) {
-    let mut metadata_lines = vec!["usd:original_topology = \"points\"".to_string()];
+    let mut metadata_lines = w.carrier_metadata.take().unwrap_or_default();
+    metadata_lines.push("usd:original_topology = \"points\"".to_string());
     if extras_no_fold(&prim.extras) {
         metadata_lines.push("usd:no_fold = 1".to_string());
     }
@@ -3293,12 +3396,12 @@ fn write_points_prim(w: &mut Out, scene: &Scene3D, prim: &Primitive, prim_name: 
     writeln!(
         w.s,
         "def Points \"{prim_name}\" ({}) {{",
-        metadata_lines.join(" ")
+        metadata_lines.join("; ")
     )
     .unwrap();
     w.indent += 1;
 
-    if let Some(t) = transform_from_extras(&prim.extras) {
+    if let Some(t) = transform_from_extras(&prim.extras).or(w.carrier_transform) {
         write_node_transform(w, &t);
     }
 
@@ -3321,9 +3424,9 @@ fn write_points_prim(w: &mut Out, scene: &Scene3D, prim: &Primitive, prim_name: 
         write!(
             w.s,
             "({}, {}, {})",
-            format_float(p[0] as f64),
-            format_float(p[1] as f64),
-            format_float(p[2] as f64)
+            format_f32(p[0]),
+            format_f32(p[1]),
+            format_f32(p[2])
         )
         .unwrap();
     }
@@ -3349,17 +3452,32 @@ fn write_points_prim(w: &mut Out, scene: &Scene3D, prim: &Primitive, prim_name: 
 /// ([`AudioData::Source`](oxideav_mesh3d::AudioData::Source)) or the
 /// raw URI when it's external
 /// ([`AudioData::External`](oxideav_mesh3d::AudioData::External)).
-fn write_spatial_audio(w: &mut Out, emitter: &AudioEmitter, source: &AudioSource) {
+/// The prim name [`write_spatial_audio`] emits for an emitter.
+fn spatial_audio_prim_name(emitter: &AudioEmitter, source: &AudioSource) -> String {
     let raw_name = emitter
         .name
         .clone()
         .or_else(|| source.name.clone())
         .unwrap_or_else(|| format!("audio_{}", emitter.source.0));
-    let safe_name = sanitize_prim_name(&raw_name);
+    sanitize_prim_name(&raw_name)
+}
+
+fn write_spatial_audio(
+    w: &mut Out,
+    emitter: &AudioEmitter,
+    source: &AudioSource,
+    transform: Option<&Transform>,
+) {
+    let safe_name = spatial_audio_prim_name(emitter, source);
 
     w.write_indent();
     writeln!(w.s, "def SpatialAudio \"{safe_name}\" {{").unwrap();
     w.indent += 1;
+    // A collapsed audio carrier's transform lives on the SpatialAudio
+    // prim itself (it is Xformable).
+    if let Some(t) = transform {
+        write_node_transform(w, t);
+    }
 
     // filePath — in-archive sources use the per-source filename
     // (matches the entry the encoder writes via
@@ -3396,12 +3514,7 @@ fn write_spatial_audio(w: &mut Out, emitter: &AudioEmitter, source: &AudioSource
     // round-trip is value-faithful even when a downstream tool
     // tweaks it.
     w.write_indent();
-    writeln!(
-        w.s,
-        "uniform double gain = {}",
-        format_float(emitter.gain as f64)
-    )
-    .unwrap();
+    writeln!(w.s, "uniform double gain = {}", format_f32(emitter.gain)).unwrap();
 
     // Per-source extras land back as their original USD attributes.
     for (extra_key, attr_key) in [
@@ -3495,9 +3608,9 @@ fn write_triangle_mesh(w: &mut Out, prim: &Primitive) {
         write!(
             w.s,
             "({}, {}, {})",
-            format_float(p[0] as f64),
-            format_float(p[1] as f64),
-            format_float(p[2] as f64)
+            format_f32(p[0]),
+            format_f32(p[1]),
+            format_f32(p[2])
         )
         .unwrap();
     }
@@ -3514,9 +3627,9 @@ fn write_triangle_mesh(w: &mut Out, prim: &Primitive) {
             write!(
                 w.s,
                 "({}, {}, {})",
-                format_float(n[0] as f64),
-                format_float(n[1] as f64),
-                format_float(n[2] as f64)
+                format_f32(n[0]),
+                format_f32(n[1]),
+                format_f32(n[2])
             )
             .unwrap();
         }
@@ -3542,13 +3655,7 @@ fn write_triangle_mesh(w: &mut Out, prim: &Primitive) {
             if i > 0 {
                 w.s.push_str(", ");
             }
-            write!(
-                w.s,
-                "({}, {})",
-                format_float(uv[0] as f64),
-                format_float(uv[1] as f64)
-            )
-            .unwrap();
+            write!(w.s, "({}, {})", format_f32(uv[0]), format_f32(uv[1])).unwrap();
         }
         writeln!(w.s, "]").unwrap();
     }
@@ -3567,9 +3674,9 @@ fn write_triangle_mesh(w: &mut Out, prim: &Primitive) {
             write!(
                 w.s,
                 "({}, {}, {})",
-                format_float(c[0] as f64),
-                format_float(c[1] as f64),
-                format_float(c[2] as f64)
+                format_f32(c[0]),
+                format_f32(c[1]),
+                format_f32(c[2])
             )
             .unwrap();
         }
@@ -3581,7 +3688,7 @@ fn write_triangle_mesh(w: &mut Out, prim: &Primitive) {
                 if i > 0 {
                     w.s.push_str(", ");
                 }
-                write!(w.s, "{}", format_float(c[3] as f64)).unwrap();
+                write!(w.s, "{}", format_f32(c[3])).unwrap();
             }
             writeln!(w.s, "]").unwrap();
         }
@@ -3650,25 +3757,20 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
     writeln!(
         w.s,
         "color3f inputs:diffuseColor = ({}, {}, {})",
-        format_float(bc[0] as f64),
-        format_float(bc[1] as f64),
-        format_float(bc[2] as f64)
+        format_f32(bc[0]),
+        format_f32(bc[1]),
+        format_f32(bc[2])
     )
     .unwrap();
     w.write_indent();
-    writeln!(w.s, "float inputs:opacity = {}", format_float(bc[3] as f64)).unwrap();
+    writeln!(w.s, "float inputs:opacity = {}", format_f32(bc[3])).unwrap();
     w.write_indent();
-    writeln!(
-        w.s,
-        "float inputs:metallic = {}",
-        format_float(mat.metallic as f64)
-    )
-    .unwrap();
+    writeln!(w.s, "float inputs:metallic = {}", format_f32(mat.metallic)).unwrap();
     w.write_indent();
     writeln!(
         w.s,
         "float inputs:roughness = {}",
-        format_float(mat.roughness as f64)
+        format_f32(mat.roughness)
     )
     .unwrap();
     let ec = mat.emissive_factor;
@@ -3677,9 +3779,9 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
         writeln!(
             w.s,
             "color3f inputs:emissiveColor = ({}, {}, {})",
-            format_float(ec[0] as f64),
-            format_float(ec[1] as f64),
-            format_float(ec[2] as f64)
+            format_f32(ec[0]),
+            format_f32(ec[1]),
+            format_f32(ec[2])
         )
         .unwrap();
     }
@@ -3692,7 +3794,7 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
         writeln!(
             w.s,
             "float inputs:opacityThreshold = {}",
-            format_float(cutoff as f64)
+            format_f32(cutoff)
         )
         .unwrap();
     }
@@ -3711,9 +3813,9 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
             writeln!(
                 w.s,
                 "color3f inputs:specularColor = ({}, {}, {})",
-                format_float(c[0] as f64),
-                format_float(c[1] as f64),
-                format_float(c[2] as f64)
+                format_f32(c[0]),
+                format_f32(c[1]),
+                format_f32(c[2])
             )
             .unwrap();
         }
@@ -3740,7 +3842,7 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
     // opinion" and re-emits verbatim (including an explicit 1.5).
     if let Some(ior) = mat.ext.ior {
         w.write_indent();
-        writeln!(w.s, "float inputs:ior = {}", format_float(ior as f64)).unwrap();
+        writeln!(w.s, "float inputs:ior = {}", format_f32(ior)).unwrap();
     }
     // Clearcoat lobe — re-emit from the typed slot. Values equal to
     // the schema §2.1 defaults (`clearcoat` 0, `clearcoatRoughness`
@@ -3750,19 +3852,14 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
     if let Some(cc) = &mat.ext.clearcoat {
         if cc.factor != 0.0 {
             w.write_indent();
-            writeln!(
-                w.s,
-                "float inputs:clearcoat = {}",
-                format_float(cc.factor as f64)
-            )
-            .unwrap();
+            writeln!(w.s, "float inputs:clearcoat = {}", format_f32(cc.factor)).unwrap();
         }
         if cc.roughness != 0.01 {
             w.write_indent();
             writeln!(
                 w.s,
                 "float inputs:clearcoatRoughness = {}",
-                format_float(cc.roughness as f64)
+                format_f32(cc.roughness)
             )
             .unwrap();
         }
@@ -3782,7 +3879,7 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
         writeln!(
             w.s,
             "float inputs:occlusion = {}",
-            format_float(mat.occlusion_strength as f64)
+            format_f32(mat.occlusion_strength)
         )
         .unwrap();
     }
@@ -4356,7 +4453,26 @@ fn format_metadata_lines(key: &str, value: &Value) -> Vec<String> {
     }
 }
 
-fn format_float(f: f64) -> String {
+/// Shortest round-trip spelling of a single-precision value (§16.2.5
+/// Number). The typed model's geometry, transforms and material
+/// factors are `f32`; printing them through the six-fractional-digit
+/// `f64` path rounded `0.0013888899` to `0.001389`, a lossy channel
+/// on every encode → decode cycle. Rust's `Display` for `f32` prints
+/// the shortest digits that parse back to the same `f32`.
+pub(crate) fn format_f32(f: f32) -> String {
+    if f.is_nan() {
+        return "nan".to_owned();
+    }
+    if f.is_infinite() {
+        return if f < 0.0 { "-inf" } else { "inf" }.to_owned();
+    }
+    if f == f.trunc() && f.abs() < 1e7 {
+        return format!("{}", f as i64);
+    }
+    format!("{f}")
+}
+
+pub(crate) fn format_float(f: f64) -> String {
     // §16.2.5 Number: the non-finite spellings are `inf`, `-inf`,
     // and `nan` (Rust's default `NaN` is not valid USDA).
     if f.is_nan() {
@@ -4365,15 +4481,20 @@ fn format_float(f: f64) -> String {
     if f.is_infinite() {
         return if f < 0.0 { "-inf" } else { "inf" }.to_owned();
     }
-    // USD canonical: keep at most 6 fractional digits, strip
-    // trailing zeros so `1.0` round-trips as `1` (USD parses both
-    // identically via our own `read_number`).
+    // Integral values print as integers (`1.0` → `1`; USD parses both
+    // identically via our own `read_number`); anything else prints the
+    // shortest digits that parse back to the same `f64` (§16.2.5's
+    // double-precision round-trip rule), so a parsed value re-emits
+    // exactly and a timeCode derived from `f32` seconds survives the
+    // `× timeCodesPerSecond` / `÷ timeCodesPerSecond` cycle.
     if f == f.trunc() && f.abs() < 1e16 {
         return format!("{}", f as i64);
     }
-    let s = format!("{f:.6}");
-    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
-    trimmed.to_string()
+    let s = format!("{f}");
+    if s == "-0" {
+        return "0".to_owned();
+    }
+    s
 }
 
 #[cfg(test)]

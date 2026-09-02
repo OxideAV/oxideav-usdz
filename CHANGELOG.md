@@ -51,6 +51,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- decode → encode → decode is a one-cycle fixed point on every staged
+  fixture (`tests/fixture_fixed_point.rs`): a Mesh prim's own `xformOp`
+  is recorded once (carrier node transform) and the carrier collapses
+  back onto the `def Mesh` with its transform and metadata; a
+  `SpatialAudio` carrier re-emits as that prim (no Xform growth per
+  cycle); SkelAnimation `translations` / `rotations` / `scales` each
+  write on their own keyframe timeline with held values (a static
+  `scales` was resampled onto the `rotations` timeline and padded with
+  defaults); authored `bindTransforms` replay verbatim while they still
+  invert onto the typed inverse-bind matrices; `f32` geometry, transforms
+  and factors print their shortest round-trip digits (six-digit
+  rounding was lossy), `f64` values print the §16.2.5 round-trip
+  spelling, and `-0` normalises to `0`.
 - Flattened output no longer re-authors a `subLayers` entry the decoder
   folded in (it dangled in the single-layer package).
 - §10.5 namespace mapping: relationship targets / `.connect` sources
