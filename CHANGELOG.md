@@ -33,6 +33,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0.11.0; composition applies each entry per §10.3.2.6 (audit on
   `Scene3D::extras["usd:composedRelocates"]`), the flattening writer
   prunes applied entries and the preserving writer re-authors them.
+- Cross-package `@pkg.usdz[path/within.usd]@` selectors (and bare
+  `@pkg.usdz@` = the package's default layer) resolve when the sibling
+  package is an entry of the archive being read: inner entries are
+  addressed at their absolute offsets, paths authored inside the package
+  anchor at it, textures pass through, and the preserving writer copies
+  the sibling package through verbatim.
+- A referenced layer's own `subLayers` stack composes before its target
+  prim is selected (§10.3.2: an arc targets a layer stack).
 - Cubic splines (`spline::Spline`): the §16.2.16.5 `<attr>.spline`
   statement parses under the §16.2.13 grammar and re-emits; the Crate
   `Splines` value (§16.3.10.33, 0.12.0) decodes — flag bytes,

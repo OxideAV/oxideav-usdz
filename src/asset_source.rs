@@ -107,6 +107,11 @@ impl AssetSource for ZipStoredAsset {
 /// `None` when nothing is recognised; the consumer can then fall
 /// back to magic-byte sniffing.
 pub fn mime_from_filename(name: &str) -> Option<String> {
+    // `pkg.usdz[inner/tex.png]` — the extension is the inner file's.
+    let name = match name.rsplit_once('[') {
+        Some((_, inner)) => inner.strip_suffix(']').unwrap_or(inner),
+        None => name,
+    };
     let dot = name.rfind('.')?;
     let ext = &name[dot + 1..];
     let lc = ext.to_ascii_lowercase();

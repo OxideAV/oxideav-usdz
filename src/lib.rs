@@ -510,11 +510,10 @@
 //!   gap. (UsdSkel skinning + animation + blend shapes landed in
 //!   r407 from the staged schema tables; §1.4.1 inbetween shapes
 //!   ride the typed `MorphTarget::inbetweens` roster.)
-//! * Cross-package `@foo.usdz[path/within.usd]@` package-relative
-//!   references — round 11 resolves `references` / `payload` targets
-//!   that live as their own entries in the *same* archive; nested
-//!   `[...]` package selectors into a sibling `.usdz` stay as
-//!   side-channel opinions on `scene.extras["usd:layerMetadata"]`.
+//! * Cross-package `@pkg.usdz[path/within.usd]@` selectors — resolved
+//!   (round 455) when the sibling package is an entry of the archive
+//!   being read; only packages *outside* the archive stay as
+//!   side-channel opinions.
 //!
 //! Round 455 — composition-arc preservation on the writer:
 //!

@@ -213,7 +213,10 @@ The read path evaluates USD composition arcs:
 - variantSets and variant selection,
 - anchored sublayer composition (LayerStack),
 - `references` / `payload` arcs (including targets that live as their own
-  entries in the same archive),
+  entries in the same archive, and — through the §16.4 package-relative
+  selector `@pkg.usdz[path/within.usd]@` or a bare `@pkg.usdz@` for the
+  package's default layer — targets inside a sibling `.usdz` entry, whose
+  own sublayers, references and textures anchor at the package),
 - in-layer `inherits` / `specializes`,
 - layer `relocates` (§16.2.18.5 text map / §16.3.10.15 Crate value):
   each `{ </src> : </dst> }` entry moves the composed source prim to
@@ -345,8 +348,6 @@ message.
 
 - `UsdGeomCamera` / `UsdLux` light schemas — unstaged in
   `docs/3d/usd/` (GAP-TRACKER Round F: on demand).
-- Cross-package `@foo.usdz[path/within.usd]@` selectors into a sibling
-  archive — preserved as side-channel opinions rather than resolved.
 
 ## Standalone build
 

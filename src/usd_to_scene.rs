@@ -77,10 +77,40 @@ pub fn translate_with_root(
     entries: &[ZipEntry],
     root_layer_name: Option<&str>,
 ) -> Result<Scene3D> {
-    let entry_map: HashMap<String, ZipEntry> = entries
+    let mut entry_map: HashMap<String, ZipEntry> = entries
         .iter()
         .map(|e| (e.name.clone(), e.clone()))
         .collect();
+    // Cross-package selectors (`@pkg.usdz[path/within.usd]@`): a
+    // sibling `.usdz` entry is itself a §16.4 package whose entries
+    // are STORED, so every inner entry is addressable at an absolute
+    // offset of the outer archive. Expose them as `pkg.usdz[inner]`
+    // entries; the resolver understands the selector spelling.
+    for e in entries {
+        if !e.name.to_ascii_lowercase().ends_with(".usdz") {
+            continue;
+        }
+        let start = e.payload_offset as usize;
+        let Some(bytes) = archive.get(start..start + e.payload_len as usize) else {
+            continue;
+        };
+        let Ok(inner) = crate::zip::walk(bytes) else {
+            // A sibling package that is not a valid USDZ stays an
+            // opaque entry; selectors into it resolve to nothing.
+            continue;
+        };
+        for ie in inner {
+            let name = format!("{}[{}]", e.name, ie.name);
+            entry_map.insert(
+                name.clone(),
+                ZipEntry {
+                    name,
+                    payload_offset: e.payload_offset + ie.payload_offset,
+                    payload_len: ie.payload_len,
+                },
+            );
+        }
+    }
 
     let mut ctx = Ctx {
         scene: Scene3D::new(),
@@ -140,16 +170,9 @@ pub fn translate_with_root(
         &mut visited,
         &mut composed_paths,
     )?;
-    if !composed_paths.is_empty() {
-        let names: Vec<serde_json::Value> = composed_paths
-            .iter()
-            .map(|s| serde_json::Value::String(s.clone()))
-            .collect();
-        ctx.scene.extras.insert(
-            "usd:composedSubLayers".into(),
-            serde_json::Value::Array(names),
-        );
-    }
+    // (The `usd:composedSubLayers` audit is stamped after the
+    // reference pass, which composes the layer stacks of referenced
+    // layers too.)
 
     // Inherits composition (round 13, LIVRPS "I" — stronger than
     // references / payload). `inherits` targets an in-layer prim path
@@ -192,7 +215,7 @@ pub fn translate_with_root(
     // sublayer-flatten-on-write policy). Unresolved / external arcs
     // are left in place so the writer round-trips them verbatim.
     let mut composed_refs: Vec<String> = Vec::new();
-    let mut ref_layer_cache: HashMap<String, Layer> = HashMap::new();
+    let mut ref_layer_cache = RefCache::default();
     let pkg = ArchiveView {
         archive: &archive,
         entries: &entry_map,
@@ -216,6 +239,22 @@ pub fn translate_with_root(
             .collect();
         ctx.scene.extras.insert(
             "usd:composedReferences".into(),
+            serde_json::Value::Array(names),
+        );
+    }
+    // Sublayers folded into referenced layers' stacks join the audit.
+    for p in ref_layer_cache.composed_sublayers {
+        if !composed_paths.contains(&p) {
+            composed_paths.push(p);
+        }
+    }
+    if !composed_paths.is_empty() {
+        let names: Vec<serde_json::Value> = composed_paths
+            .iter()
+            .map(|s| serde_json::Value::String(s.clone()))
+            .collect();
+        ctx.scene.extras.insert(
+            "usd:composedSubLayers".into(),
             serde_json::Value::Array(names),
         );
     }
@@ -289,6 +328,15 @@ pub fn translate_with_root(
             }
         }
         for path in consumed {
+            // A layer consumed from inside a sibling package: the
+            // package entry itself rides through (it is self-contained).
+            let path = match path.split_once('[') {
+                Some((pkg, _)) => pkg.to_owned(),
+                None => path,
+            };
+            if record.layers.iter().any(|l| l.path == path) {
+                continue;
+            }
             let Some(entry) = entry_map.get(&path) else {
                 continue;
             };
@@ -480,32 +528,90 @@ fn compose_sublayers(
 /// * Absolute archive path (`textures/diffuse.png`, no leading `/`)
 ///   — falls back to a lookup against the archive root if anchored
 ///   resolution misses.
-/// * Anything containing `://`, `[`, or starting with `/` is
-///   considered external / cross-package and returns `None`.
+/// * `pkg.usdz[inner/path]` — a §16.4 package-relative selector into
+///   a sibling package present in the archive: the package resolves
+///   like any entry, the inner path inside it (anchored at
+///   `pkg.usdz[dir/]` when the authoring layer itself lives in the
+///   package). A bare `pkg.usdz` targets that package's default
+///   layer (its first entry).
+/// * Anything containing `://` or starting with `/` is considered
+///   external and returns `None`.
 fn resolve_archive_path(
     path: &str,
     anchor_layer: Option<&str>,
     entries: &HashMap<String, ZipEntry>,
 ) -> Option<String> {
-    if path.is_empty() || path.contains("://") || path.starts_with('/') || path.contains('[') {
+    if path.is_empty() || path.contains("://") || path.starts_with('/') {
         return None;
     }
+    // `pkg.usdz[inner/path]` — resolve the package like any entry
+    // (anchored at the authoring layer's *package-level* location),
+    // then the inner path inside it.
+    if let Some((pkg, rest)) = path.split_once('[') {
+        let inner = rest.strip_suffix(']')?;
+        if inner.contains('[') {
+            return None; // Nested selectors are not a package layout.
+        }
+        let pkg_anchor = anchor_layer.map(|a| a.split_once('[').map_or(a, |(p, _)| p));
+        let pkg_entry = resolve_package_entry(pkg, pkg_anchor, entries)?;
+        let inner_norm = normalize_archive_path(inner)?;
+        let candidate = format!("{pkg_entry}[{inner_norm}]");
+        return entries.contains_key(&candidate).then_some(candidate);
+    }
+    let resolved = resolve_package_entry(path, anchor_layer, entries)?;
+    // A bare package reference (`@pkg.usdz@`) targets the package's
+    // default layer — §16.4: the first entry, which is the entry at
+    // the lowest offset inside the package.
+    if resolved.to_ascii_lowercase().ends_with(".usdz") {
+        let prefix = format!("{resolved}[");
+        return entries
+            .values()
+            .filter(|e| e.name.starts_with(&prefix) && is_layer_name(&e.name))
+            .min_by_key(|e| e.payload_offset)
+            .map(|e| e.name.clone());
+    }
+    Some(resolved)
+}
+
+/// The anchored-then-flat lookup of a selector-free path.
+fn resolve_package_entry(
+    path: &str,
+    anchor_layer: Option<&str>,
+    entries: &HashMap<String, ZipEntry>,
+) -> Option<String> {
     let stripped = path.strip_prefix("./").unwrap_or(path);
-    if let Some(anchor) = anchor_layer {
-        let dir = anchor
-            .rfind('/')
-            .map(|slash| &anchor[..slash + 1])
-            .unwrap_or("");
-        let candidate = normalize_archive_path(&format!("{dir}{stripped}"))?;
-        if entries.contains_key(&candidate) {
-            return Some(candidate);
+    match anchor_layer {
+        // An anchor inside a package: `pkg[dir/a.usda]` anchors the
+        // path at `pkg[dir/]`; climbing above the package root
+        // (`../x`) resolves to nothing.
+        Some(anchor) if anchor.contains('[') => {
+            let (pkg, inner) = anchor.split_once('[')?;
+            let inner = inner.strip_suffix(']').unwrap_or(inner);
+            let dir = inner
+                .rfind('/')
+                .map(|slash| &inner[..slash + 1])
+                .unwrap_or("");
+            let joined = normalize_archive_path(&format!("{dir}{stripped}"))?;
+            let candidate = format!("{pkg}[{joined}]");
+            entries.contains_key(&candidate).then_some(candidate)
+        }
+        Some(anchor) => {
+            let dir = anchor
+                .rfind('/')
+                .map(|slash| &anchor[..slash + 1])
+                .unwrap_or("");
+            let candidate = normalize_archive_path(&format!("{dir}{stripped}"))?;
+            if entries.contains_key(&candidate) {
+                return Some(candidate);
+            }
+            let flat = normalize_archive_path(stripped)?;
+            entries.contains_key(&flat).then_some(flat)
+        }
+        None => {
+            let flat = normalize_archive_path(stripped)?;
+            entries.contains_key(&flat).then_some(flat)
         }
     }
-    let flat = normalize_archive_path(stripped)?;
-    if entries.contains_key(&flat) {
-        return Some(flat);
-    }
-    None
 }
 
 /// Collapse `.` and `..` segments of a slash-separated archive path.
@@ -655,7 +761,7 @@ fn compose_references(
     prim_path: &str,
     pkg: &ArchiveView<'_>,
     anchor_layer: Option<&str>,
-    cache: &mut HashMap<String, Layer>,
+    cache: &mut RefCache,
     composed_out: &mut Vec<String>,
     visited: &mut std::collections::HashSet<String>,
 ) -> Result<()> {
@@ -1197,14 +1303,28 @@ fn select_target_prim<'a>(layer: &'a Layer, prim_path: &str) -> Option<&'a Prim>
     Some(cur)
 }
 
-/// Parse + cache an in-archive USDA layer by its archive entry name.
+/// Referenced-layer cache: each arc target parsed once, with its own
+/// layer stack (§10.3.2: a reference targets a *layer stack*, so the
+/// referenced layer's `subLayers` compose before the target prim is
+/// selected) already folded in.
+#[derive(Default)]
+struct RefCache {
+    layers: HashMap<String, Layer>,
+    /// Sublayer entry names folded into referenced layers' stacks,
+    /// for the `usd:composedSubLayers` audit.
+    composed_sublayers: Vec<String>,
+}
+
+/// Parse + cache an in-archive layer (text or Crate) by its archive
+/// entry name, composing its own sublayer stack anchored at its
+/// location.
 fn load_layer_cached(
     path: &str,
     archive: &Arc<Vec<u8>>,
     entries: &HashMap<String, ZipEntry>,
-    cache: &mut HashMap<String, Layer>,
+    cache: &mut RefCache,
 ) -> Result<Layer> {
-    if let Some(layer) = cache.get(path) {
+    if let Some(layer) = cache.layers.get(path) {
         return Ok(layer.clone());
     }
     let entry = entries
@@ -1213,16 +1333,35 @@ fn load_layer_cached(
     let start = entry.payload_offset as usize;
     let end = start + entry.payload_len as usize;
     let bytes = &archive[start..end];
-    let layer = parse_layer_bytes(path, bytes)?;
-    cache.insert(path.to_string(), layer.clone());
+    let mut layer = parse_layer_bytes(path, bytes)?;
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(path.to_owned());
+    compose_sublayers(
+        &mut layer,
+        archive,
+        entries,
+        Some(path),
+        &mut visited,
+        &mut cache.composed_sublayers,
+    )?;
+    cache.layers.insert(path.to_string(), layer.clone());
     Ok(layer)
 }
 
 /// `true` for the three layer extensions a composition arc can
 /// target (`.usd` / `.usda` / `.usdc`, case-insensitive).
 pub(crate) fn is_layer_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
+    let lower = innermost_name(name).to_ascii_lowercase();
     lower.ends_with(".usd") || lower.ends_with(".usda") || lower.ends_with(".usdc")
+}
+
+/// The file name an entry name's extension belongs to: the selector
+/// target for `pkg.usdz[inner/path]`, the name itself otherwise.
+pub(crate) fn innermost_name(name: &str) -> &str {
+    match name.rsplit_once('[') {
+        Some((_, inner)) => inner.strip_suffix(']').unwrap_or(inner),
+        None => name,
+    }
 }
 
 /// Parse an in-archive layer in either serialisation: `.usda` is
@@ -1230,7 +1369,7 @@ pub(crate) fn is_layer_name(name: &str) -> bool {
 /// dispatches on the header bytes (§16.1 — the `PXR-USDC` magic
 /// selects Crate, anything else is text).
 pub(crate) fn parse_layer_bytes(name: &str, bytes: &[u8]) -> Result<Layer> {
-    let lower = name.to_ascii_lowercase();
+    let lower = innermost_name(name).to_ascii_lowercase();
     let is_crate = if lower.ends_with(".usdc") {
         true
     } else if lower.ends_with(".usda") {
