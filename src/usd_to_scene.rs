@@ -2379,7 +2379,7 @@ fn build_node(ctx: &mut Ctx, parent: &str, prim: &Prim) -> Result<Option<oxideav
             let id = ctx.scene.add_node(node);
             Ok(Some(id))
         }
-        "Xform" | "Scope" | "SkelRoot" | "" => {
+        "Xform" | "Scope" | "SkelRoot" | "" | crate::point_instancer::TYPE_NAME => {
             let mut node = Node::new().with_name(prim.name.clone());
             node.transform = read_node_transform(prim);
             // §1.1: SkelRoot marks the skinnable subtree; keep the
@@ -2389,6 +2389,18 @@ fn build_node(ctx: &mut Ctx, parent: &str, prim: &Prim) -> Result<Option<oxideav
                     "usd:type".into(),
                     serde_json::Value::String("SkelRoot".into()),
                 );
+            }
+            // UsdGeomPointInstancer (staged schema Part 2): the
+            // per-instance arrays ride on the carrier as a typed
+            // record; the prototype subtrees are ordinary children.
+            if prim.type_name == crate::point_instancer::TYPE_NAME {
+                let record = crate::point_instancer::PointInstancer::from_prim(prim)?;
+                node.extras.insert(
+                    "usd:type".into(),
+                    serde_json::Value::String(crate::point_instancer::TYPE_NAME.into()),
+                );
+                node.extras
+                    .insert(crate::point_instancer::EXTRAS_KEY.into(), record.to_json());
             }
             // §3.4 rule 1: direct material bindings inherit down
             // namespace — push this container's binding opinions

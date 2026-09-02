@@ -173,6 +173,28 @@ top-level `def Scope "Materials"` no longer decodes into a phantom empty
 root, and a node that directly carries a same-named mesh no longer gains
 a redundant `def Xform` wrapper on each cycle.
 
+### Point instancing (`UsdGeomPointInstancer`)
+
+The staged schema Part 2 surface, both directions: `rel prototypes`
+(target order = prototype index), `protoIndices`, `positions`,
+`orientations` (`quath[]`) / `orientationsf` (`quatf[]`), `scales`,
+`ids`, `invisibleIds`, `velocities` / `angularVelocities` /
+`accelerations` — each as its default value **and** its
+`.timeSamples` — plus the list-edited `inactiveIds` prim metadata,
+ride on the carrier node as a typed `PointInstancer` record
+(`Node::extras["usd:pointInstancer"]`); prototype subtrees are
+ordinary child nodes. The writer re-emits the prim symmetrically
+(one-cycle fixed point; `usdcat` / `usdchecker` accept the output
+where installed). `point_instancer::expand` is the lossy lift onto
+plain nodes: one child per unmasked instance with the §2.3 TRS
+(scale → orientation → position, velocities scaled by
+`1 / timeCodesPerSecond` and suppressing interpolation, the
+prototype's own root transform kept underneath), geometry shared
+by `MeshId`, `inactiveIds` ∪ `invisibleIds` masked by id (or array
+position when no `ids` are authored). `angularVelocities` are
+carried but not applied — the staged digest does not state their
+angular unit.
+
 ### Composition
 
 The read path evaluates USD composition arcs:
@@ -298,8 +320,6 @@ path: `Relocates` (0.11) / `Splines` (0.12) /
 
 ## Not yet supported
 
-- `UsdGeomPointInstancer` (staged schema Part 2) — vectorised
-  instancing is not yet mapped onto the typed model.
 - `UsdGeomCamera` / `UsdLux` light schemas — unstaged in
   `docs/3d/usd/` (GAP-TRACKER Round F: on demand).
 - Cross-package `@foo.usdz[path/within.usd]@` selectors into a sibling

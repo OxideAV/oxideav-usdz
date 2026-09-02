@@ -20,6 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through verbatim. `CompositionMode::Flatten` stays the default.
 - `.usdc` (and generic `.usd`) sublayers, references and payloads
   compose through the Crate reader instead of refusing.
+- `UsdGeomPointInstancer` (staged schema Part 2) both directions: the
+  typed `PointInstancer` record on `Node::extras["usd:pointInstancer"]`
+  (prototypes, protoIndices, positions, orientations / orientationsf,
+  scales, ids, invisibleIds, velocities, angularVelocities,
+  accelerations — defaults and time samples — plus list-edited
+  `inactiveIds`), symmetric writer, and `point_instancer::expand` into
+  instanced nodes in the §2.3 order with the §2.4 mask.
 
 ### Fixed
 

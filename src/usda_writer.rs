@@ -907,6 +907,15 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
     // UsdGeomXformable contract.
     write_node_transform(w, &node.transform);
 
+    // UsdGeomPointInstancer: the typed record re-emits its
+    // relationship + §2.2 arrays (defaults and time samples).
+    if let Some(record) = crate::point_instancer::PointInstancer::from_node(node) {
+        for line in record.to_usda_lines() {
+            w.write_indent();
+            writeln!(w.s, "{line}").unwrap();
+        }
+    }
+
     // §3.4 rule 1: a container prim's authored `material:binding*`
     // relationships (inherited by descendant gprims during decode)
     // and its §15.1 CollectionAPI properties replay verbatim from

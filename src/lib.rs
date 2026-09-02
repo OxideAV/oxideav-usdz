@@ -549,6 +549,7 @@ pub mod composition;
 pub mod decoder;
 pub mod encoder;
 pub mod error;
+pub mod point_instancer;
 pub mod usd_to_scene;
 pub mod usda;
 pub mod usda_writer;
@@ -565,6 +566,7 @@ pub use composition::{CompositionMode, CompositionRecord};
 pub use decoder::UsdzDecoder;
 pub use encoder::{EncodeReport, UsdzEncoder};
 pub use error::{Error, Result};
+pub use point_instancer::PointInstancer;
 
 /// Register both the USDZ decoder and encoder against `registry` so
 /// callers can dispatch by extension (`.usdz`).
