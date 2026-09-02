@@ -687,17 +687,26 @@ def Xform "Root" (
 
 // ---------------------------------------------------------------- crate layers
 
-fn crate_fixture() -> Vec<u8> {
+/// The staged Crate fixture lives in the private `docs/` sibling
+/// checkout — skip (never fail, never `#[ignore]`) when it is absent,
+/// mirroring the other Crate fixture tests.
+fn crate_fixture() -> Option<Vec<u8>> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../docs/3d/usd/fixtures/crate-variant-specs.usdc");
-    std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    if !path.exists() {
+        eprintln!("staged fixture {} absent; skipping", path.display());
+        return None;
+    }
+    Some(std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display())))
 }
 
 #[test]
 fn usdc_reference_composes_and_is_preserved() {
     // The staged Crate fixture is referenced by its prim path; the
     // selected variants inside it (`sizeVariant = small`) compose.
-    let fixture = crate_fixture();
+    let Some(fixture) = crate_fixture() else {
+        return;
+    };
     let root = r#"#usda 1.0
 (
     defaultPrim = "Root"
@@ -752,7 +761,9 @@ def Xform "Root"
 
 #[test]
 fn usdc_sublayer_composes() {
-    let fixture = crate_fixture();
+    let Some(fixture) = crate_fixture() else {
+        return;
+    };
     let root = r#"#usda 1.0
 (
     subLayers = [@./crate-variant-specs.usdc@]
