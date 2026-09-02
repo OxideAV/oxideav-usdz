@@ -5436,6 +5436,7 @@ fn value_to_json(v: &Value) -> Option<serde_json::Value> {
             }
             J::Object(obj)
         }
+        Value::Spline(spline) => spline.to_json(),
         Value::Relocates(pairs) => J::Object(
             pairs
                 .iter()

@@ -15,7 +15,8 @@
 //!
 //! Version posture: everything needed for Crate 0.8.0 files plus the
 //! 0.9.0 `TimeCode` and 0.10.0 `PathExpression` value types is
-//! implemented. `Relocates` (0.11.0) decodes; `Splines` (0.12.0) refuse
+//! implemented, including `Relocates` (0.11.0) and `Splines` (0.12.0);
+//! `UnregisteredValueListOp` payloads refuse
 //! with a precise `Unsupported` — the reader's version gate keeps
 //! such files out before a rep of those types can be met.
 
@@ -405,9 +406,28 @@ impl<'a> ValueDecoder<'a> {
                 }
                 Value::Relocates(pairs)
             }
-            VT::Splines => return Err(unsupported(
-                "USDC value: VT::Splines (Crate >= 0.12.0) is beyond this reader's version ceiling",
-            )),
+            VT::Splines => {
+                // §16.3.10.33: `[u64 byteCount][byteCount bytes of
+                // spline data][u64 customCount][customCount × (f64
+                // timeCode, dictionary)]`.
+                let byte_count = self.count_at(off, "VT::Splines data")?;
+                let data = self.get(off + 8, byte_count)?;
+                let mut cursor = off + 8 + byte_count;
+                let custom_count = self.count_at(cursor, "VT::Splines custom data")?;
+                cursor += 8;
+                let mut custom = Vec::with_capacity(custom_count);
+                for _ in 0..custom_count {
+                    let time = f64::from_le_bytes(self.get(cursor, 8)?.try_into().unwrap());
+                    cursor += 8;
+                    let entries = self.count_at(cursor, "VT::Splines custom dictionary")?;
+                    let dict = self.decode_dictionary(cursor, depth + 1)?;
+                    cursor += 8 + entries * 12;
+                    custom.push((time, dict));
+                }
+                Value::Spline(Box::new(crate::spline::Spline::from_crate_bytes(
+                    data, custom,
+                )?))
+            }
             VT::ValueBlock => Value::None,
             // §16.3.9.1 lists these as always inlined; a non-inline
             // non-array rep of these types is malformed.

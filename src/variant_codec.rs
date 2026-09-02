@@ -310,6 +310,7 @@ fn encode_value(v: &Value) -> JValue {
             JValue::Object(o)
         }
         Value::Raw(s) => tagged("Raw", JValue::String(s.clone())),
+        Value::Spline(spline) => tagged("Spline", spline.to_json()),
         Value::Relocates(pairs) => tagged(
             "Relocates",
             JValue::Array(
@@ -383,6 +384,11 @@ fn decode_value(v: &JValue) -> Value {
             prim_path: read_str(obj, "prim_path"),
         },
         "Raw" => Value::Raw(read_str(obj, "v")),
+        "Spline" => Value::Spline(Box::new(
+            obj.get("v")
+                .map(crate::spline::Spline::from_json)
+                .unwrap_or_default(),
+        )),
         "Relocates" => Value::Relocates(
             obj.get("v")
                 .and_then(|v| v.as_array())

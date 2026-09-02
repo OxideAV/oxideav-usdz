@@ -1308,6 +1308,7 @@ fn render_value(v: &crate::usda::Value) -> Option<String> {
             return render_value(sub);
         }
         V::Relocates(pairs) => format_relocates(pairs),
+        V::Spline(spline) => spline.to_usda(),
         V::None => return None,
     })
 }
@@ -4236,6 +4237,7 @@ pub(crate) fn format_metadata_value(value: &Value) -> String {
             .unwrap_or_default(),
         Value::Raw(s) => s.clone(),
         Value::Relocates(pairs) => format_relocates(pairs),
+        Value::Spline(spline) => spline.to_usda(),
         Value::None => String::new(),
     }
 }
@@ -4288,6 +4290,7 @@ fn guess_usda_type(v: &Value) -> &'static str {
             .map(|(_, v)| guess_usda_type(v))
             .unwrap_or("token"),
         Value::Relocates(_) => "dictionary",
+        Value::Spline(_) => "double",
         Value::Raw(_) | Value::None => "token",
     }
 }

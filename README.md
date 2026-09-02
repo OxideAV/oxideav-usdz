@@ -62,6 +62,17 @@ Full reader and symmetric writer for the `#usda 1.0` text format:
   are fan-triangulated; vertex normals and the first UV set are picked
   up. Multi-primitive meshes serialise as sibling `def Mesh` prims and
   fold back on decode.
+- **Cubic splines** — the §16.2.16.5 `<attr>.spline = { … }`
+  statement parses under the §16.2.13 grammar (curve type, `pre:` /
+  `post:` extrapolation incl. `sloped(s)` and `loop repeat|reset|
+  oscillate`, `loop: (…)`, knots with `pre & post` dual values, pre /
+  post tangents, per-segment interpolation, custom-data
+  dictionaries; last-authored-wins per §16.2.16.5) into a typed
+  `spline::Spline` and re-emits as a one-cycle fixed point. Two
+  spellings the staged specification leaves open are inferred and
+  flagged: the text tangent pair is read as `(width, slope)` (the
+  §16.3.10.33.1 knot-table order) and the Crate 2-bit interpolation
+  code follows the §7.4.2.4.2 enumeration order.
 - **Per-face material subsets (`UsdGeomSubset`)** — face-element
   subsets with material bindings split a mesh into one typed
   `Primitive` per bound material (shared vertex arrays, the subset's
@@ -266,8 +277,8 @@ generic `.usd` layer dispatches on its header byte run (§16.1:
 `PXR-USDC` magic = Crate, `#usda` banner = text).
 
 - **Preamble + sections** — bootstrap, version gate (reader ceiling
-  Crate 0.11.0 per the §16.3.8.2 version table; 0.12 Splines refuse
-  up front), the tail TOC, and all six standard
+  Crate 0.12.0 — the last row of the §16.3.8.2 version table), the
+  tail TOC, and all six standard
   sections (TOKENS, STRINGS, FIELDS, FIELDSETS, PATHS, SPECS) with
   the §16.3.7 compression stack: chunked LZ4 buffers and the
   compressed-integer coding (2-bit control stream + common-delta
@@ -292,10 +303,14 @@ generic `.usd` layer dispatches on its header byte run (§16.1:
   and `t` lookup-table), index vectors, dictionaries, the
   six-sublist list operations, variant-selection maps, time samples,
   references/payloads, recursion-guarded indirect values, the
-  specifier / permission / variability enums, and the 0.11.0
+  specifier / permission / variability enums, the 0.11.0
   `Relocates` map (§16.3.10.15 path-index pairs; the
   `layerRelocates` layer field surfaces under the text form's
-  `relocates` key). On the committed
+  `relocates` key), and the 0.12.0 `Splines` value (§16.3.10.33:
+  the flag bytes, sloped / loop parameters, the typed knot run in
+  double / float / half, and the per-time custom-data
+  dictionaries) — an attribute's `spline` field becomes the text
+  form's `<attr>.spline` companion statement. On the committed
   fixture **all 157 field values decode**, pinned down to exact
   layer metadata, mesh arrays, and 3023-sample animation tracks.
 - **Scene bridge** — `usdc_layer::layer_from_usdc` materialises the
@@ -323,8 +338,8 @@ child prims) into `variant_sets`, `variantSelection` maps become
 composition pipeline (pinned against the staged
 `crate-variant-specs.usdc` fixture: 7 Variant + 3 VariantSet specs
 across two namespace levels). Not yet implemented on the Crate
-path: `Splines` (0.12) / `UnregisteredValueListOp` payloads refuse
-with precise messages.
+path: `UnregisteredValueListOp` payloads refuse with a precise
+message.
 
 ## Not yet supported
 

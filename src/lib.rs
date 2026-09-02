@@ -550,6 +550,7 @@ pub mod decoder;
 pub mod encoder;
 pub mod error;
 pub mod point_instancer;
+pub mod spline;
 pub mod usd_to_scene;
 pub mod usda;
 pub mod usda_writer;

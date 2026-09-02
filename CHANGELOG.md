@@ -33,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0.11.0; composition applies each entry per §10.3.2.6 (audit on
   `Scene3D::extras["usd:composedRelocates"]`), the flattening writer
   prunes applied entries and the preserving writer re-authors them.
+- Cubic splines (`spline::Spline`): the §16.2.16.5 `<attr>.spline`
+  statement parses under the §16.2.13 grammar and re-emits; the Crate
+  `Splines` value (§16.3.10.33, 0.12.0) decodes — flag bytes,
+  extrapolation / loop parameters, typed knot runs in double / float /
+  half, custom-data dictionaries — and surfaces as the `.spline`
+  companion; the reader ceiling moves to 0.12.0, the last row of the
+  §16.3.8.2 version table.
 
 ### Fixed
 

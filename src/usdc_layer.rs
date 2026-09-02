@@ -12,7 +12,8 @@
 //! * **Layer** (7, the pseudo-root at `/`) → [`Layer::metadata`],
 //! * **Prim** (6) → a [`Prim`] (specifier / typeName / metadata),
 //! * **Attribute** (1) → an [`Attr`] on its parent prim, including
-//!   `<name>.timeSamples` and `<name>.connect` companion statements,
+//!   `<name>.timeSamples`, `<name>.connect` and `<name>.spline`
+//!   companion statements,
 //! * **Relationship** (8) → a `rel` [`Attr`] with its target paths,
 //! * **VariantSet** (11, at the `{set=}` path element) → declares the
 //!   set on its parent prim's `variant_sets` (its `variantChildren`
@@ -369,6 +370,7 @@ fn attach_attribute(
     let mut metadata: BTreeMap<String, Value> = BTreeMap::new();
     let mut time_samples: Option<Value> = None;
     let mut connect: Option<Value> = None;
+    let mut spline: Option<Value> = None;
 
     for (fname, rep) in &spec.fields {
         let rep = ValueRep::from_raw(*rep);
@@ -388,6 +390,8 @@ fn attach_attribute(
             }
             "default" => default = decoder.decode(rep)?,
             "timeSamples" => time_samples = Some(decoder.decode(rep)?),
+            // §16.2.16.5 `.spline` companion.
+            "spline" => spline = Some(decoder.decode(rep)?),
             "connectionPaths" => connect = Some(flatten_path_listop(decoder.decode(rep)?)),
             other => {
                 metadata.insert(other.to_owned(), decoder.decode(rep)?);
@@ -440,8 +444,25 @@ fn attach_attribute(
         prim.attrs.insert(
             format!("{attr_name}.connect"),
             Attr {
-                type_token: spelled,
+                type_token: spelled.clone(),
                 value: c,
+                metadata: BTreeMap::new(),
+            },
+        );
+    }
+    if let Some(mut sp) = spline {
+        // The value data type is the attribute's own when the Crate
+        // run left it unspecified.
+        if let Value::Spline(s) = &mut sp {
+            if s.data_type == crate::spline::DataType::Unspecified {
+                s.data_type = crate::spline::DataType::from_type_token(&type_token);
+            }
+        }
+        prim.attrs.insert(
+            format!("{attr_name}.spline"),
+            Attr {
+                type_token: spelled,
+                value: sp,
                 metadata: BTreeMap::new(),
             },
         );

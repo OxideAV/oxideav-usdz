@@ -342,6 +342,10 @@ pub enum Value {
     /// (§16.3.10.15, `Relocates`, ≥ 0.11.0) decodes to the same
     /// variant.
     Relocates(Vec<(String, String)>),
+    /// §16.2.16.5 `<attr>.spline = { … }` cubic-spline value
+    /// ([`crate::spline::Spline`]); the Crate `Splines` type
+    /// (§16.3.10.33, ≥ 0.12.0) decodes to the same variant.
+    Spline(Box<crate::spline::Spline>),
     /// Anything we didn't recognise; preserved verbatim.
     Raw(String),
     /// Empty value — attribute declared but not assigned (`token
@@ -1335,6 +1339,263 @@ fn read_relocates(t: &mut Tokenizer<'_>) -> Result<Vec<(String, String)>> {
     }
 }
 
+/// Read a §16.2.13 `SplineMap` — `{ SplineItem, SplineItem, … }` with
+/// curve-type, extrapolation, loop and knot items. Duplicate items
+/// keep the last authored (§16.2.16.5: "the last one the parser
+/// encounters is the one for which the values of the spline are
+/// stored").
+fn read_spline(t: &mut Tokenizer<'_>) -> Result<crate::spline::Spline> {
+    use crate::spline::{
+        CurveType, ExtrapolationMode, InterpolationMode, Knot, LoopParams, Spline, Tangent,
+    };
+    /// A bare keyword (`bezier`, `pre`, `held`, …) — unlike
+    /// [`read_ident`], stops at `:` so `pre:` splits into the word
+    /// and its separator.
+    fn keyword(t: &mut Tokenizer<'_>) -> Result<String> {
+        t.skip_trivia();
+        let mut out = String::new();
+        while let Some(c) = t.peek_char() {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                out.push(c);
+                t.advance();
+            } else {
+                break;
+            }
+        }
+        if out.is_empty() {
+            return Err(invalid(format!(
+                "spline: expected a keyword at {}",
+                t.pos_display()
+            )));
+        }
+        Ok(out)
+    }
+    fn number(t: &mut Tokenizer<'_>) -> Result<f64> {
+        t.skip_trivia();
+        match t.peek_char() {
+            Some(c) if c.is_ascii_digit() || c == '+' || c == '-' || c == '.' => {
+                match read_number(t)? {
+                    Value::Float(f) => Ok(f),
+                    other => Err(invalid(format!("spline: expected a number, got {other:?}"))),
+                }
+            }
+            Some(c) if is_ident_start(c) => match keyword(t)?.as_str() {
+                "inf" => Ok(f64::INFINITY),
+                "nan" => Ok(f64::NAN),
+                other => Err(invalid(format!("spline: expected a number, got `{other}`"))),
+            },
+            _ => Err(invalid(format!(
+                "spline: expected a number at {}",
+                t.pos_display()
+            ))),
+        }
+    }
+    fn expect(t: &mut Tokenizer<'_>, c: char) -> Result<()> {
+        t.skip_trivia();
+        if t.eat(c) {
+            Ok(())
+        } else {
+            Err(invalid(format!(
+                "spline: expected `{c}` at {}",
+                t.pos_display()
+            )))
+        }
+    }
+    /// `SplineTangent <- '(' Number [',' Number] ')'` — two numbers
+    /// are `(width, slope)`, one is a bare slope.
+    fn tangent(t: &mut Tokenizer<'_>) -> Result<Tangent> {
+        expect(t, '(')?;
+        let a = number(t)?;
+        t.skip_trivia();
+        let out = if t.eat(',') {
+            let b = number(t)?;
+            Tangent {
+                width: Some(a),
+                slope: b,
+            }
+        } else {
+            Tangent {
+                width: None,
+                slope: a,
+            }
+        };
+        expect(t, ')')?;
+        Ok(out)
+    }
+    fn extrapolation(t: &mut Tokenizer<'_>) -> Result<ExtrapolationMode> {
+        t.skip_trivia();
+        let word = keyword(t)?;
+        let mode = match word.as_str() {
+            "none" => ExtrapolationMode::None,
+            "held" => ExtrapolationMode::Held,
+            "linear" => ExtrapolationMode::Linear,
+            "sloped" => {
+                expect(t, '(')?;
+                let slope = number(t)?;
+                expect(t, ')')?;
+                return Ok(ExtrapolationMode::Sloped(slope));
+            }
+            "loop" => {
+                t.skip_trivia();
+                return match keyword(t)?.as_str() {
+                    "repeat" => Ok(ExtrapolationMode::LoopRepeat),
+                    "reset" => Ok(ExtrapolationMode::LoopReset),
+                    "oscillate" => Ok(ExtrapolationMode::LoopOscillate),
+                    other => Err(invalid(format!("spline: unknown loop option `{other}`"))),
+                };
+            }
+            other => return Err(invalid(format!("spline: unknown extrapolation `{other}`"))),
+        };
+        // Tolerate the `held(0)` spelling the specification's own
+        // §12.5 example uses for the parameterless modes.
+        t.skip_trivia();
+        if t.eat('(') {
+            let _ = number(t)?;
+            expect(t, ')')?;
+        }
+        Ok(mode)
+    }
+
+    if !t.eat('{') {
+        return Err(invalid("expected `{` to start spline map"));
+    }
+    let mut spline = Spline::default();
+    loop {
+        t.skip_trivia();
+        if t.eat('}') {
+            return Ok(spline);
+        }
+        if t.eof() {
+            return Err(invalid("EOF inside spline map"));
+        }
+        if t.eat(',') {
+            continue;
+        }
+        match t.peek_char() {
+            Some(c) if is_ident_start(c) => {
+                let word = keyword(t)?;
+                match word.as_str() {
+                    "bezier" => spline.curve_type = CurveType::Bezier,
+                    "hermite" => spline.curve_type = CurveType::Hermite,
+                    "pre" => {
+                        expect(t, ':')?;
+                        spline.pre = extrapolation(t)?;
+                    }
+                    "post" => {
+                        expect(t, ':')?;
+                        spline.post = extrapolation(t)?;
+                    }
+                    "loop" => {
+                        expect(t, ':')?;
+                        expect(t, '(')?;
+                        let proto_start = number(t)?;
+                        expect(t, ',')?;
+                        let proto_end = number(t)?;
+                        expect(t, ',')?;
+                        let pre_loops = number(t)? as u32;
+                        expect(t, ',')?;
+                        let post_loops = number(t)? as u32;
+                        expect(t, ',')?;
+                        let value_offset = number(t)?;
+                        expect(t, ')')?;
+                        spline.loop_params = Some(LoopParams {
+                            proto_start,
+                            proto_end,
+                            pre_loops,
+                            post_loops,
+                            value_offset,
+                        });
+                    }
+                    other => {
+                        return Err(invalid(format!(
+                            "spline: unknown item `{other}` at {}",
+                            t.pos_display()
+                        )))
+                    }
+                }
+            }
+            Some(c) if c.is_ascii_digit() || c == '+' || c == '-' || c == '.' => {
+                // SplineKnotItem <- Number ':' SplineKnotValues (';' param)*
+                let time = number(t)?;
+                expect(t, ':')?;
+                let first = number(t)?;
+                t.skip_trivia();
+                let (pre_value, value) = if t.eat('&') {
+                    (Some(first), number(t)?)
+                } else {
+                    (None, first)
+                };
+                let mut knot = Knot {
+                    time,
+                    value,
+                    pre_value,
+                    ..Knot::default()
+                };
+                loop {
+                    t.skip_trivia();
+                    if !t.eat(';') {
+                        break;
+                    }
+                    t.skip_trivia();
+                    match t.peek_char() {
+                        Some('{') => knot.custom_data = read_dict(t)?,
+                        Some(c) if is_ident_start(c) => {
+                            let word = keyword(t)?;
+                            match word.as_str() {
+                                "pre" => knot.pre_tangent = Some(tangent(t)?),
+                                "post" => {
+                                    t.skip_trivia();
+                                    let mode = keyword(t)?;
+                                    knot.post_interpolation = match mode.as_str() {
+                                        "none" => InterpolationMode::None,
+                                        "held" => InterpolationMode::Held,
+                                        "linear" => InterpolationMode::Linear,
+                                        "curve" => InterpolationMode::Curve,
+                                        other => {
+                                            return Err(invalid(format!(
+                                                "spline: unknown interpolation `{other}`"
+                                            )))
+                                        }
+                                    };
+                                    t.skip_trivia();
+                                    knot.post_tangent = if t.peek_char() == Some('(') {
+                                        Some(tangent(t)?)
+                                    } else {
+                                        None
+                                    };
+                                }
+                                other => {
+                                    return Err(invalid(format!(
+                                        "spline: unknown knot parameter `{other}`"
+                                    )))
+                                }
+                            }
+                        }
+                        _ => {
+                            return Err(invalid(format!(
+                                "spline: expected a knot parameter at {}",
+                                t.pos_display()
+                            )))
+                        }
+                    }
+                }
+                // Same-time knots: last authored wins.
+                if let Some(existing) = spline.knots.iter_mut().find(|k| k.time == time) {
+                    *existing = knot;
+                } else {
+                    spline.knots.push(knot);
+                }
+            }
+            _ => {
+                return Err(invalid(format!(
+                    "spline: unexpected character at {}",
+                    t.pos_display()
+                )))
+            }
+        }
+    }
+}
+
 /// Read a `{ TIME: VALUE, TIME: VALUE, ... }` time-sample map — the
 /// right-hand side of a `.timeSamples` attribute statement.
 ///
@@ -1578,7 +1839,17 @@ fn parse_prim_body(t: &mut Tokenizer<'_>) -> Result<PrimBody> {
         t.skip_trivia();
         let value = if t.eat('=') {
             t.skip_trivia();
-            parse_value(t)?
+            if attr_name.ends_with(".spline") && t.peek_char() == Some('{') {
+                // §16.2.16.5: the `.spline` companion statement's value
+                // is a §16.2.13 SplineMap, not a dictionary. The value
+                // data type is the attribute's own (`double` / `float`
+                // / `half`).
+                let mut spline = read_spline(t)?;
+                spline.data_type = crate::spline::DataType::from_type_token(&type_token);
+                Value::Spline(Box::new(spline))
+            } else {
+                parse_value(t)?
+            }
         } else {
             // Attribute declared without a value (`token outputs:surface`).
             Value::None
@@ -1829,6 +2100,75 @@ def "layerdefaultprim" {
             "an empty `{{ }}` is a typed dictionary, not a relocates map"
         );
         assert!(parse(b"#usda 1.0\n(\n relocates = { </a> </b> }\n)\n").is_err());
+    }
+
+    #[test]
+    fn parse_spline_attribute_statement() {
+        use crate::spline::{CurveType, DataType, ExtrapolationMode, InterpolationMode};
+        // §12.5 example (bezier, sloped pre, held post, three knots).
+        let src = br#"#usda 1.0
+def Sphere "sphere"
+{
+    double radius.spline = {
+        bezier,
+        pre: sloped(0),
+        post: held(0),
+        1: 0; pre (1, 1); post curve (1, 1),
+        5: 3.25; pre (1, 1); post curve (1, 1),
+        10: 6.28; pre (1, 1); post curve (1, 1),
+    }
+    float other.spline = {
+        hermite,
+        loop: (0, 10, 1, 2, 0.5),
+        6: 6532.62342; post curve (3.6); post none,
+        7: 1 & 2; { string note = "x" },
+    }
+}
+"#;
+        let layer = parse(src).unwrap();
+        let prim = &layer.prims[0];
+        let Value::Spline(radius) = &prim.attrs["radius.spline"].value else {
+            panic!("radius.spline is a spline");
+        };
+        assert_eq!(radius.curve_type, CurveType::Bezier);
+        assert_eq!(radius.data_type, DataType::Double);
+        assert_eq!(radius.pre, ExtrapolationMode::Sloped(0.0));
+        assert_eq!(radius.post, ExtrapolationMode::Held);
+        assert_eq!(radius.knots.len(), 3);
+        assert_eq!(radius.knots[1].value, 3.25);
+        assert_eq!(radius.knots[1].post_interpolation, InterpolationMode::Curve);
+        assert_eq!(radius.knots[1].pre_tangent.unwrap().width, Some(1.0));
+        let Value::Spline(other) = &prim.attrs["other.spline"].value else {
+            panic!("other.spline is a spline");
+        };
+        assert_eq!(other.curve_type, CurveType::Hermite);
+        assert_eq!(other.data_type, DataType::Float);
+        assert_eq!(other.loop_params.unwrap().pre_loops, 1);
+        // §16.2.16.5: duplicated knot parameter — the last wins, with
+        // no slope.
+        assert_eq!(other.knots[0].post_interpolation, InterpolationMode::None);
+        assert_eq!(other.knots[0].post_tangent, None);
+        assert_eq!(other.knots[1].pre_value, Some(1.0));
+        assert_eq!(other.knots[1].value, 2.0);
+        assert_eq!(
+            other.knots[1].custom_data.get("note"),
+            Some(&Value::String("x".into()))
+        );
+        // Render → parse is the identity on the model.
+        let text = format!(
+            "#usda 1.0\ndef \"p\" {{\n    double radius.spline = {}\n    float other.spline = {}\n}}\n",
+            radius.to_usda(),
+            other.to_usda()
+        );
+        let again = parse(text.as_bytes()).unwrap();
+        assert_eq!(
+            again.prims[0].attrs["radius.spline"].value,
+            prim.attrs["radius.spline"].value
+        );
+        assert_eq!(
+            again.prims[0].attrs["other.spline"].value,
+            prim.attrs["other.spline"].value
+        );
     }
 
     #[test]
