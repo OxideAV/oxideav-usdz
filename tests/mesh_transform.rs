@@ -110,10 +110,9 @@ fn matrix_mesh_transform_round_trips_via_extras() {
     let body = carrier(&scene2, "Body");
     assert_eq!(translation_of(&body.transform), [10.0, 20.0, 30.0]);
     assert!(
-        scene2.meshes[0].primitives[0]
+        !scene2.meshes[0].primitives[0]
             .extras
-            .get("usd:mesh_transform")
-            .is_none(),
+            .contains_key("usd:mesh_transform"),
         "no second copy of the transform on the primitive"
     );
     // Second encode: the carrier collapses back onto the def Mesh
@@ -199,10 +198,9 @@ def Xform "Root" {
     let scene = UsdzDecoder::new().decode_bytes(&usdz).expect("decode");
     let body = carrier(&scene, "Body");
     assert_eq!(translation_of(&body.transform), [4.0, 5.0, 6.0]);
-    assert!(scene.meshes[0].primitives[0]
+    assert!(!scene.meshes[0].primitives[0]
         .extras
-        .get("usd:mesh_transform")
-        .is_none());
+        .contains_key("usd:mesh_transform"));
     // And the shape is a fixed point: def Xform "Root" > def Mesh
     // "Body" with the transform inside, cycle after cycle.
     let r1 = UsdzEncoder::new().encode_with_report(&scene).unwrap();
