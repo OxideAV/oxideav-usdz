@@ -1962,11 +1962,10 @@ fn collect_unconsumed_gprim_attrs(prim: &Prim) -> BTreeMap<String, Attr> {
             }
             // A primvar is topology-indexed unless constant.
             if name.starts_with("primvars:") {
-                let constant = attr
-                    .metadata
-                    .get("interpolation")
-                    .and_then(|v| v.as_text())
-                    .is_none_or(|i| i == "constant");
+                let constant = match attr.metadata.get("interpolation").and_then(|v| v.as_text()) {
+                    None => true,
+                    Some(i) => i == "constant",
+                };
                 let is_array = attr.type_token.contains("[]");
                 return constant && !is_array || !is_array;
             }
