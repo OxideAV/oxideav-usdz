@@ -30,8 +30,9 @@
 //! * External / cross-package paths (anything not in the archive's
 //!   entries) are silently dropped from composition and stay as
 //!   round-trip opinions on `Scene3D::extras`.
-//! * `.usdc` sublayer raises `Error::Unsupported` — the binary
-//!   parser is still gated behind a docs-collaborator trace doc.
+//! * A `.usdc` sublayer composes through the Crate reader (see
+//!   `composition_preserve.rs`); a malformed one errors at the
+//!   boundary.
 
 mod common;
 
@@ -411,11 +412,10 @@ def Xform "Root" {
 }
 
 #[test]
-fn usdc_sublayer_surfaces_as_unsupported() {
-    // A .usdc sublayer entry should error rather than silently
-    // miss — round 10 stays consistent with the round-1
-    // `.usdc default layer` policy (binary parser is gated on
-    // a docs-collaborator trace doc).
+fn malformed_usdc_sublayer_is_invalid_data() {
+    // A `.usdc` sublayer entry now parses through the Crate reader;
+    // a stub that is not a Crate file surfaces as a boundary error
+    // (rather than silently composing nothing).
     let root = r#"#usda 1.0
 (
     subLayers = [
@@ -426,8 +426,6 @@ fn usdc_sublayer_surfaces_as_unsupported() {
 def Xform "Root" {
 }
 "#;
-    // The .usdc entry can be empty bytes — the composer only
-    // touches its extension before it would parse it.
     let archive = build_usdz(&[
         UsdzEntry {
             name: "scene.usda",
@@ -441,11 +439,11 @@ def Xform "Root" {
     let mut decoder = UsdzDecoder::new();
     let err = decoder
         .decode(&archive)
-        .expect_err("usdc sublayer must error");
-    let msg = format!("{err}");
+        .expect_err("malformed usdc sublayer must error");
+    let msg = format!("{err}").to_ascii_lowercase();
     assert!(
-        msg.contains("usdc"),
-        "error should mention `.usdc`, got: {msg}"
+        msg.contains("usdc") || msg.contains("bootstrap") || msg.contains("crate"),
+        "error should name the Crate boundary, got: {msg}"
     );
 }
 

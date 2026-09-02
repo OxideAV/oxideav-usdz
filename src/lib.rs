@@ -515,11 +515,18 @@
 //!   that live as their own entries in the *same* archive; nested
 //!   `[...]` package selectors into a sibling `.usdz` stay as
 //!   side-channel opinions on `scene.extras["usd:layerMetadata"]`.
-//! * SubLayer / reference / class-arc round-trip on the writer —
-//!   rounds 10 / 11 / 13 evaluate sublayers + references + class
-//!   arcs on the read path; the encoder flattens the composed tree
-//!   into a single layer rather than preserving the multi-file or
-//!   class-hierarchy authoring on output.
+//!
+//! Round 455 — composition-arc preservation on the writer:
+//!
+//! * [`composition`] — the typed opinion model. The decoder stashes
+//!   a [`CompositionRecord`] (`Scene3D::extras["usd:composition"]`);
+//!   [`UsdzEncoder::with_composition`] selects
+//!   [`CompositionMode::Flatten`] (default, historical output) or
+//!   [`CompositionMode::Preserve`] (arcs re-authored, contributed
+//!   prims left to their arcs, `class` / `over` prims verbatim,
+//!   consumed layer entries + assets copied through).
+//! * `.usdc` arc targets compose through the Crate reader; §10.5
+//!   namespace mapping + asset-path rebasing on composed subtrees.
 //!
 //! ## Standalone build
 //!
@@ -538,6 +545,7 @@
 #![warn(missing_debug_implementations)]
 
 pub mod asset_source;
+pub mod composition;
 pub mod decoder;
 pub mod encoder;
 pub mod error;
@@ -553,6 +561,7 @@ pub mod zip;
 pub mod zip_writer;
 
 pub use asset_source::ZipStoredAsset;
+pub use composition::{CompositionMode, CompositionRecord};
 pub use decoder::UsdzDecoder;
 pub use encoder::{EncodeReport, UsdzEncoder};
 pub use error::{Error, Result};

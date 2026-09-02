@@ -29,23 +29,42 @@
 
 use oxideav_mesh3d::{Mesh3DEncoder, Result, Scene3D};
 
-use crate::usda_writer;
+use crate::composition::{CompositionMode, CompositionRecord};
+use crate::usda_writer::{self, WriteOptions};
 use crate::zip_writer::Writer;
 
 /// USDZ encoder.
 ///
-/// Stateless wrapper — `&mut self` is required by the
+/// Configuration-only wrapper — `&mut self` is required by the
 /// [`Mesh3DEncoder`] trait but the encoder holds no scratch state
 /// between calls.
 #[derive(Debug, Default)]
 pub struct UsdzEncoder {
-    _private: (),
+    composition: CompositionMode,
 }
 
 impl UsdzEncoder {
-    /// Construct a fresh encoder.
+    /// Construct a fresh encoder (flattening composition — the
+    /// historical default).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Choose how composed structure is written. Under
+    /// [`CompositionMode::Preserve`] a scene decoded from a package
+    /// with sublayers / references / payloads / class arcs re-emits
+    /// that structure — arcs re-authored, the consumed layer entries
+    /// (and the assets they reference) copied verbatim into the
+    /// package, the root layer keeping its entry name — instead of
+    /// one flattened layer. See [`crate::composition`].
+    pub fn with_composition(mut self, mode: CompositionMode) -> Self {
+        self.composition = mode;
+        self
+    }
+
+    /// The configured [`CompositionMode`].
+    pub fn composition(&self) -> CompositionMode {
+        self.composition
     }
 
     /// Encode and return the assembled USDZ archive bytes.
@@ -61,9 +80,20 @@ impl UsdzEncoder {
     /// Tests use this surface to assert that USDZ → USDZ flows
     /// preserve texture bytes verbatim.
     pub fn encode_with_report(&self, scene: &Scene3D) -> Result<EncodeReport> {
-        let usda = usda_writer::write_layer(scene);
+        let opts = WriteOptions {
+            composition: self.composition,
+        };
+        let usda = usda_writer::write_layer_with(scene, &opts);
+        let emitted = usda_writer::emitted_texture_ids(scene, &opts);
         let assets = usda_writer::collect_texture_assets(scene);
         let audio_assets = usda_writer::collect_audio_assets(scene);
+        // The typed opinion model, when preserving composition.
+        let record = match self.composition {
+            CompositionMode::Preserve => {
+                CompositionRecord::from_extras(&scene.extras).filter(|r| !r.is_trivial())
+            }
+            CompositionMode::Flatten => None,
+        };
 
         let mut writer = Writer::new();
         // Default Layer must be the first archive entry per the
@@ -72,12 +102,26 @@ impl UsdzEncoder {
         // used throughout so an oversized scene (a payload or archive
         // crossing the ZIP64 boundary USDZ forbids) surfaces as an
         // `Error::Unsupported` rather than panicking.
-        writer.try_add_stored("scene.usda", usda.as_bytes())?;
+        //
+        // Preserving composition keeps the source root's entry name
+        // so the anchored (`./x.usda`) paths inside the copied layers
+        // resolve exactly as they did; a Crate-serialised root is
+        // renamed onto the text extension we emit.
+        let root_name = record
+            .as_ref()
+            .map(|r| root_layer_entry_name(&r.root_layer))
+            .unwrap_or_else(|| usda_writer::DEFAULT_ROOT_LAYER_NAME.to_owned());
+        writer.try_add_stored(&root_name, usda.as_bytes())?;
+        let mut names_taken: Vec<String> = vec![root_name.clone()];
 
         let mut pass_through_textures = 0usize;
         let mut reencoded_textures = 0usize;
         let mut texture_names = Vec::with_capacity(assets.len());
-        for asset in &assets {
+        for (idx, asset) in assets.iter().enumerate() {
+            if !emitted.get(idx).copied().unwrap_or(true) {
+                continue;
+            }
+            names_taken.push(asset.name.clone());
             writer.try_add_stored(&asset.name, &asset.bytes)?;
             if asset.from_pass_through {
                 pass_through_textures += 1;
@@ -91,6 +135,7 @@ impl UsdzEncoder {
         let mut reencoded_audio = 0usize;
         let mut audio_names = Vec::with_capacity(audio_assets.len());
         for asset in &audio_assets {
+            names_taken.push(asset.name.clone());
             writer.try_add_stored(&asset.name, &asset.bytes)?;
             if asset.from_pass_through {
                 pass_through_audio += 1;
@@ -100,16 +145,55 @@ impl UsdzEncoder {
             audio_names.push(asset.name.clone());
         }
 
+        // Composition-preserving: every layer entry the decoder
+        // consumed, and the non-layer assets those layers reference,
+        // ride through verbatim. A name the typed pipeline already
+        // claimed (a texture re-emitted under its source name) is
+        // not written twice.
+        let mut layer_names = Vec::new();
+        if let Some(record) = &record {
+            for layer in &record.layers {
+                if names_taken.contains(&layer.path) {
+                    continue;
+                }
+                names_taken.push(layer.path.clone());
+                writer.try_add_stored(&layer.path, &layer.bytes)?;
+                layer_names.push(layer.path.clone());
+                for asset in &layer.assets {
+                    if names_taken.contains(&asset.path) {
+                        continue;
+                    }
+                    names_taken.push(asset.path.clone());
+                    writer.try_add_stored(&asset.path, &asset.bytes)?;
+                }
+            }
+        }
+
         Ok(EncodeReport {
             bytes: writer.try_finish()?,
             usda,
+            root_layer_name: root_name,
             texture_names,
             pass_through_textures,
             reencoded_textures,
             audio_names,
             pass_through_audio,
             reencoded_audio,
+            layer_names,
         })
+    }
+}
+
+/// Entry name for the emitted (text) root layer given the source
+/// root's name: `.usdc` becomes `.usda`; `.usd` / `.usda` stay (the
+/// generic extension dispatches on the header bytes).
+fn root_layer_entry_name(source: &str) -> String {
+    if source.is_empty() {
+        return usda_writer::DEFAULT_ROOT_LAYER_NAME.to_owned();
+    }
+    match source.rsplit_once('.') {
+        Some((stem, ext)) if ext.eq_ignore_ascii_case("usdc") => format!("{stem}.usda"),
+        _ => source.to_owned(),
     }
 }
 
@@ -128,6 +212,10 @@ pub struct EncodeReport {
     /// assertions over the encoded representation without re-parsing
     /// the archive.
     pub usda: String,
+    /// Archive entry name the root layer was written under
+    /// (`scene.usda` unless a preserved composition record named the
+    /// source root).
+    pub root_layer_name: String,
     /// Inner-file names emitted into the archive for textures, in
     /// the order they were embedded.
     pub texture_names: Vec<String>,
@@ -150,6 +238,9 @@ pub struct EncodeReport {
     /// Count of audio sources whose bytes were materialised via
     /// the streaming `open()` fallback.
     pub reencoded_audio: usize,
+    /// Layer entries copied verbatim from the composition record
+    /// (composition-preserving encodes only; empty when flattening).
+    pub layer_names: Vec<String>,
 }
 
 #[cfg(test)]

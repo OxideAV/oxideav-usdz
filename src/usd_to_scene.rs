@@ -63,6 +63,20 @@ use crate::Result;
 /// `usd:variantReferences:<set>:<var>:references` so the extras
 /// stash surfaces the unresolved arc to the caller.
 pub fn translate(layer: &Layer, archive: Arc<Vec<u8>>, entries: &[ZipEntry]) -> Result<Scene3D> {
+    translate_with_root(layer, archive, entries, None)
+}
+
+/// [`translate`] with the root layer's archive entry name, which the
+/// [`CompositionRecord`](crate::composition::CompositionRecord)
+/// stashed on `Scene3D::extras["usd:composition"]` carries so a
+/// composition-preserving encode can keep anchored (`./x.usda`)
+/// paths resolvable. `None` records the writer's default root name.
+pub fn translate_with_root(
+    layer: &Layer,
+    archive: Arc<Vec<u8>>,
+    entries: &[ZipEntry],
+    root_layer_name: Option<&str>,
+) -> Result<Scene3D> {
     let entry_map: HashMap<String, ZipEntry> = entries
         .iter()
         .map(|e| (e.name.clone(), e.clone()))
@@ -72,6 +86,7 @@ pub fn translate(layer: &Layer, archive: Arc<Vec<u8>>, entries: &[ZipEntry]) -> 
         scene: Scene3D::new(),
         archive: archive.clone(),
         entries: entry_map.clone(),
+        root_layer: root_layer_name.map(str::to_owned),
         materials_by_path: HashMap::new(),
         textures_by_path: HashMap::new(),
         skeletons_by_path: HashMap::new(),
@@ -121,7 +136,7 @@ pub fn translate(layer: &Layer, archive: Arc<Vec<u8>>, entries: &[ZipEntry]) -> 
         &mut merged_layer,
         &archive,
         &entry_map,
-        /* anchor_layer */ None,
+        root_layer_name,
         &mut visited,
         &mut composed_paths,
     )?;
@@ -144,8 +159,10 @@ pub fn translate(layer: &Layer, archive: Arc<Vec<u8>>, entries: &[ZipEntry]) -> 
     let inherits_snapshot = merged_layer.prims.clone();
     let mut composed_inherits: Vec<String> = Vec::new();
     for prim in &mut merged_layer.prims {
+        let prim_path = format!("/{}", prim.name);
         compose_class_arcs(
             prim,
+            &prim_path,
             "inherits",
             &inherits_snapshot,
             &mut composed_inherits,
@@ -176,12 +193,17 @@ pub fn translate(layer: &Layer, archive: Arc<Vec<u8>>, entries: &[ZipEntry]) -> 
     // are left in place so the writer round-trips them verbatim.
     let mut composed_refs: Vec<String> = Vec::new();
     let mut ref_layer_cache: HashMap<String, Layer> = HashMap::new();
+    let pkg = ArchiveView {
+        archive: &archive,
+        entries: &entry_map,
+    };
     for prim in &mut merged_layer.prims {
+        let prim_path = format!("/{}", prim.name);
         compose_references(
             prim,
-            &archive,
-            &entry_map,
-            /* anchor_layer */ None,
+            &prim_path,
+            &pkg,
+            root_layer_name,
             &mut ref_layer_cache,
             &mut composed_refs,
             &mut std::collections::HashSet::new(),
@@ -207,8 +229,10 @@ pub fn translate(layer: &Layer, archive: Arc<Vec<u8>>, entries: &[ZipEntry]) -> 
     let specializes_snapshot = merged_layer.prims.clone();
     let mut composed_specializes: Vec<String> = Vec::new();
     for prim in &mut merged_layer.prims {
+        let prim_path = format!("/{}", prim.name);
         compose_class_arcs(
             prim,
+            &prim_path,
             "specializes",
             &specializes_snapshot,
             &mut composed_specializes,
@@ -224,6 +248,62 @@ pub fn translate(layer: &Layer, archive: Arc<Vec<u8>>, entries: &[ZipEntry]) -> 
             "usd:composedSpecializes".into(),
             serde_json::Value::Array(names),
         );
+    }
+
+    // Typed opinion model: the local layer as authored plus every
+    // in-archive layer the arcs above consumed, so the encoder can
+    // re-author the composition instead of flattening it. Stashed
+    // only when it would change the writer's output.
+    {
+        let mut record = crate::composition::CompositionRecord::from_local_layer(
+            root_layer_name.unwrap_or(crate::usda_writer::DEFAULT_ROOT_LAYER_NAME),
+            layer,
+        );
+        let mut consumed: Vec<String> = Vec::new();
+        // Sublayers are recorded as bare paths, references as the
+        // `path|kind` audit shape.
+        let ref_paths = composed_refs
+            .iter()
+            .map(|s| s[..s.rfind('|').unwrap_or(s.len())].to_owned());
+        for p in composed_paths.iter().cloned().chain(ref_paths) {
+            if !consumed.contains(&p) {
+                consumed.push(p);
+            }
+        }
+        for path in consumed {
+            let Some(entry) = entry_map.get(&path) else {
+                continue;
+            };
+            let start = entry.payload_offset as usize;
+            let bytes = archive[start..start + entry.payload_len as usize].to_vec();
+            let mut assets = Vec::new();
+            if let Ok(parsed) = parse_layer_bytes(&path, &bytes) {
+                let resolve = |asset: &str, anchor: Option<&str>| -> Option<String> {
+                    resolve_archive_path(asset, anchor, &entry_map)
+                };
+                for asset_path in
+                    crate::composition::referenced_asset_paths(&parsed, &path, &resolve)
+                {
+                    if let Some(e) = entry_map.get(&asset_path) {
+                        let s = e.payload_offset as usize;
+                        assets.push(crate::composition::SourceAsset {
+                            path: asset_path,
+                            bytes: archive[s..s + e.payload_len as usize].to_vec(),
+                        });
+                    }
+                }
+            }
+            record.layers.push(crate::composition::SourceLayer {
+                path,
+                bytes,
+                assets,
+            });
+        }
+        if !record.is_trivial() {
+            ctx.scene
+                .extras
+                .insert(crate::composition::EXTRAS_KEY.into(), record.to_json());
+        }
     }
 
     // Recursively compose variant selections so the rest of the
@@ -338,22 +418,13 @@ fn compose_sublayers(
             Some(e) => e,
             None => continue,
         };
-        let lower = resolved.to_ascii_lowercase();
-        let ext = lower.rsplit('.').next().unwrap_or("");
-        if ext == "usdc" {
-            return Err(unsupported(format!(
-                "USDZ subLayer `{resolved}` is in `.usdc` (binary crate) format; \
-                 binary USDC parsing is still gated on a docs-collaborator trace \
-                 doc. Re-package the sublayer with `usdcat -o foo.usda`."
-            )));
-        }
-        if ext != "usd" && ext != "usda" {
+        if !is_layer_name(&resolved) {
             continue;
         }
         let start = entry.payload_offset as usize;
         let end = start + entry.payload_len as usize;
         let bytes = &archive[start..end];
-        let mut sub = crate::usda::parse(bytes)?;
+        let mut sub = parse_layer_bytes(&resolved, bytes)?;
         // Depth-first: a sublayer's own sublayers compose first, so
         // by the time we merge `sub` it is itself the LayerStack
         // rooted at that sublayer.
@@ -366,6 +437,15 @@ fn compose_sublayers(
             composed_out,
         )?;
         composed_out.push(resolved.clone());
+        // Asset paths the sublayer authored were anchored at *its*
+        // directory; rewrite the resolvable ones to entry names so
+        // they still resolve once merged under the root layer.
+        {
+            let rebase = |asset: &str| resolve_archive_path(asset, Some(&resolved), entries);
+            for prim in &mut sub.prims {
+                crate::composition::rebase_assets(prim, &rebase);
+            }
+        }
         merge_layer_under(target, &sub);
     }
     Ok(())
@@ -394,18 +474,36 @@ fn resolve_archive_path(
     }
     let stripped = path.strip_prefix("./").unwrap_or(path);
     if let Some(anchor) = anchor_layer {
-        if let Some(slash) = anchor.rfind('/') {
-            let dir = &anchor[..slash + 1];
-            let candidate = format!("{dir}{stripped}");
-            if entries.contains_key(&candidate) {
-                return Some(candidate);
-            }
+        let dir = anchor
+            .rfind('/')
+            .map(|slash| &anchor[..slash + 1])
+            .unwrap_or("");
+        let candidate = normalize_archive_path(&format!("{dir}{stripped}"))?;
+        if entries.contains_key(&candidate) {
+            return Some(candidate);
         }
     }
-    if entries.contains_key(stripped) {
-        return Some(stripped.to_string());
+    let flat = normalize_archive_path(stripped)?;
+    if entries.contains_key(&flat) {
+        return Some(flat);
     }
     None
+}
+
+/// Collapse `.` and `..` segments of a slash-separated archive path.
+/// `None` when `..` would climb above the archive root.
+fn normalize_archive_path(path: &str) -> Option<String> {
+    let mut out: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                out.pop()?;
+            }
+            other => out.push(other),
+        }
+    }
+    Some(out.join("/"))
 }
 
 /// Merge `weak` underneath `strong` per LayerStack strength order:
@@ -536,19 +634,21 @@ fn merge_prim_under(strong: &mut Prim, weak: &Prim) {
 /// `b.usd</B>` which references `a.usd</A>` again).
 fn compose_references(
     prim: &mut Prim,
-    archive: &Arc<Vec<u8>>,
-    entries: &HashMap<String, ZipEntry>,
+    prim_path: &str,
+    pkg: &ArchiveView<'_>,
     anchor_layer: Option<&str>,
     cache: &mut HashMap<String, Layer>,
     composed_out: &mut Vec<String>,
     visited: &mut std::collections::HashSet<String>,
 ) -> Result<()> {
+    let ArchiveView { archive, entries } = *pkg;
     // Compose children's own arcs first (depth-first).
     for child in &mut prim.children {
+        let child_path = format!("{prim_path}/{}", child.name);
         compose_references(
             child,
-            archive,
-            entries,
+            &child_path,
+            pkg,
             anchor_layer,
             cache,
             composed_out,
@@ -600,16 +700,7 @@ fn compose_references(
                 continue;
             }
         };
-        let lower = resolved_layer_path.to_ascii_lowercase();
-        let ext = lower.rsplit('.').next().unwrap_or("");
-        if ext == "usdc" {
-            return Err(unsupported(format!(
-                "USDZ {kind} `{resolved_layer_path}` is in `.usdc` (binary crate) \
-                 format; binary USDC parsing is still gated on a docs-collaborator \
-                 trace doc. Re-package the referenced layer with `usdcat -o foo.usda`."
-            )));
-        }
-        if ext != "usd" && ext != "usda" {
+        if !is_layer_name(&resolved_layer_path) {
             if kind == "references" {
                 consumed_all_references = false;
             } else {
@@ -645,18 +736,36 @@ fn compose_references(
             continue;
         };
 
+        // The target's own path inside the referenced layer — the
+        // source side of the §10.5 namespace mapping.
+        let target_path = if target.prim_path.trim_start_matches('/').is_empty() {
+            format!("/{}", target_prim.name)
+        } else {
+            format!("/{}", target.prim_path.trim_start_matches('/'))
+        };
         // The target may itself carry references/payloads — compose
         // them against the referenced layer's own location (so its
         // anchored sub-references resolve correctly).
         compose_references(
             &mut target_prim,
-            archive,
-            entries,
+            &target_path,
+            pkg,
             Some(&resolved_layer_path),
             cache,
             composed_out,
             visited,
         )?;
+        // §10.5: paths authored inside the target subtree that name
+        // the target's own namespace follow it to its new location.
+        crate::composition::remap_paths(&mut target_prim, &target_path, prim_path);
+        // Asset paths inside the target were anchored at the
+        // referenced layer's directory — rewrite the resolvable ones
+        // to entry names so they still resolve under the root.
+        {
+            let rebase =
+                |asset: &str| resolve_archive_path(asset, Some(&resolved_layer_path), entries);
+            crate::composition::rebase_assets(&mut target_prim, &rebase);
+        }
 
         merge_prim_under(prim, &target_prim);
         composed_out.push(format!("{resolved_layer_path}|{kind}"));
@@ -725,6 +834,7 @@ fn compose_references(
 /// shape.
 fn compose_class_arcs(
     prim: &mut Prim,
+    prim_path: &str,
     kind: &str,
     layer_snapshot: &[Prim],
     composed_out: &mut Vec<String>,
@@ -759,13 +869,18 @@ fn compose_class_arcs(
                 // shape under `prim` is already the fully-composed
                 // target tree.
                 let mut composed_target = target.clone();
+                let target_abs = format!("/{}", target_path.trim_start_matches('/'));
                 compose_class_arcs(
                     &mut composed_target,
+                    &target_abs,
                     kind,
                     layer_snapshot,
                     composed_out,
                     visited,
                 );
+                // §10.5: the class's own namespace follows it under
+                // the inheriting / specialising prim.
+                crate::composition::remap_paths(&mut composed_target, &target_abs, prim_path);
                 merge_prim_under(prim, &composed_target);
                 composed_out.push(format!("{target_path}|{kind}"));
                 any_consumed = true;
@@ -788,7 +903,15 @@ fn compose_class_arcs(
     // are merged in so a freshly-composed child (one that rode up
     // from the inherited target) can be reached.
     for child in &mut prim.children {
-        compose_class_arcs(child, kind, layer_snapshot, composed_out, visited);
+        let child_path = format!("{prim_path}/{}", child.name);
+        compose_class_arcs(
+            child,
+            &child_path,
+            kind,
+            layer_snapshot,
+            composed_out,
+            visited,
+        );
     }
 }
 
@@ -877,6 +1000,14 @@ fn listedited_items(v: Option<&Value>) -> Option<Vec<Value>> {
         }
         _ => None,
     }
+}
+
+/// The package a composition pass reads layers from: the archive
+/// bytes plus its entry table.
+#[derive(Clone, Copy)]
+struct ArchiveView<'a> {
+    archive: &'a Arc<Vec<u8>>,
+    entries: &'a HashMap<String, ZipEntry>,
 }
 
 /// A single resolved composition-arc target.
@@ -980,9 +1111,36 @@ fn load_layer_cached(
     let start = entry.payload_offset as usize;
     let end = start + entry.payload_len as usize;
     let bytes = &archive[start..end];
-    let layer = crate::usda::parse(bytes)?;
+    let layer = parse_layer_bytes(path, bytes)?;
     cache.insert(path.to_string(), layer.clone());
     Ok(layer)
+}
+
+/// `true` for the three layer extensions a composition arc can
+/// target (`.usd` / `.usda` / `.usdc`, case-insensitive).
+pub(crate) fn is_layer_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".usd") || lower.ends_with(".usda") || lower.ends_with(".usdc")
+}
+
+/// Parse an in-archive layer in either serialisation: `.usda` is
+/// the text form, `.usdc` the Crate binary, and the generic `.usd`
+/// dispatches on the header bytes (§16.1 — the `PXR-USDC` magic
+/// selects Crate, anything else is text).
+pub(crate) fn parse_layer_bytes(name: &str, bytes: &[u8]) -> Result<Layer> {
+    let lower = name.to_ascii_lowercase();
+    let is_crate = if lower.ends_with(".usdc") {
+        true
+    } else if lower.ends_with(".usda") {
+        false
+    } else {
+        crate::usdc_layer::is_usdc_magic(bytes)
+    };
+    if is_crate {
+        crate::usdc_layer::layer_from_usdc(bytes)
+    } else {
+        crate::usda::parse(bytes)
+    }
 }
 
 /// Apply [`Prim::resolved_variants`](crate::usda::Prim::resolved_variants)
@@ -1002,6 +1160,9 @@ struct Ctx {
     scene: Scene3D,
     archive: Arc<Vec<u8>>,
     entries: HashMap<String, ZipEntry>,
+    /// Entry name of the root layer — the anchor for asset paths
+    /// authored in it (`./tex.png` resolves against its directory).
+    root_layer: Option<String>,
     materials_by_path: HashMap<String, oxideav_mesh3d::MaterialId>,
     /// Cache so two materials referencing the same shader's texture
     /// share one `TextureId` instead of duplicating the asset.
@@ -1691,7 +1852,14 @@ fn index_materials(ctx: &mut Ctx, parent: &str, prims: &[Prim]) -> Result<()> {
     for prim in prims {
         let path = join_path(parent, &prim.name);
         if prim.spec == "def" && prim.type_name == "Material" {
-            let mat = build_material(ctx, &path, prim)?;
+            let mut mat = build_material(ctx, &path, prim)?;
+            // Source prim path — the composition-preserving writer
+            // uses it to tell a locally-authored material from one an
+            // arc contributed.
+            mat.extras.insert(
+                "usd:primPath".into(),
+                serde_json::Value::String(path.clone()),
+            );
             let id = ctx.scene.add_material(mat);
             ctx.materials_by_path.insert(path.clone(), id);
         }
@@ -2488,7 +2656,9 @@ fn build_audio_emitter(ctx: &Ctx, path: &str, prim: &Prim) -> Result<(AudioSourc
         }
     };
 
-    let mut source = if let Some(entry) = lookup_zip_entry(&ctx.entries, asset_path) {
+    let mut source = if let Some(entry) =
+        lookup_zip_entry(&ctx.entries, ctx.root_layer.as_deref(), asset_path)
+    {
         // In-archive — wrap in ZipStoredAsset so the writer's
         // pass-through optimisation fires.
         let mime = mime_from_filename(&entry.name);
@@ -4926,7 +5096,7 @@ fn resolve_shader_connect(
             asset_path,
         )
     } else {
-        let entry = lookup_zip_entry(&ctx.entries, asset_path).ok_or_else(|| {
+        let entry = lookup_zip_entry(&ctx.entries, ctx.root_layer.as_deref(), asset_path).ok_or_else(|| {
             invalid(format!(
                 "UsdUVTexture `{prim_path}` references `{asset_path}` which is not present in the USDZ archive"
             ))
@@ -5085,11 +5255,11 @@ fn find_child_by_name<'a>(parent: &'a Prim, name: &str) -> Option<&'a Prim> {
 /// strips a leading `./`.
 fn lookup_zip_entry<'a>(
     entries: &'a HashMap<String, ZipEntry>,
+    root_layer: Option<&str>,
     asset_path: &str,
 ) -> Option<&'a ZipEntry> {
-    let trimmed = asset_path.trim_start_matches("./");
-    if let Some(e) = entries.get(trimmed) {
-        return Some(e);
+    if let Some(resolved) = resolve_archive_path(asset_path, root_layer, entries) {
+        return entries.get(&resolved);
     }
     entries.get(asset_path)
 }

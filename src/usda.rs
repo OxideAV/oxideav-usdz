@@ -39,7 +39,7 @@ pub const USDA_MAGIC: &[u8] = b"#usda";
 ///
 /// Children appear in declaration order; metadata + attrs are
 /// stored in `BTreeMap` for deterministic iteration in tests.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Prim {
     /// `def`, `over`, or `class`. Round 1 only acts on `def`; the
     /// other two are preserved for round-trip but ignored by
@@ -103,7 +103,7 @@ pub struct Prim {
 /// the variant name is the outer-map key on
 /// [`Prim::variant_sets`] and the type/spec are inherited from the
 /// enclosing prim when the variant is selected.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Variant {
     /// Optional `( ... )` metadata block — `prepend references = ...`,
     /// `kind = "..."`, etc. Same shape as [`Prim::metadata`].
@@ -248,7 +248,7 @@ impl Prim {
 }
 
 /// One attribute or relationship statement inside a prim body.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Attr {
     /// Type token as written, e.g. `point3f[]`, `color3f`,
     /// `uniform token`, `rel`. Preserved verbatim so a writer
@@ -534,7 +534,7 @@ impl Value {
 }
 
 /// Top-level parsed USDA layer.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Layer {
     /// Layer-level `( ... )` metadata block — `defaultPrim`,
     /// `upAxis`, `metersPerUnit`, custom keys.

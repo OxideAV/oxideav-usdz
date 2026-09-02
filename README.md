@@ -183,9 +183,36 @@ The read path evaluates USD composition arcs:
   entries in the same archive),
 - in-layer `inherits` / `specializes`,
 
-resolved in the documented strength order. The writer flattens the
-composed tree into a single output layer rather than preserving the
-multi-file or class-hierarchy authoring.
+resolved in the documented strength order, with the §10.5 namespace
+mapping applied to each arc's target subtree (relationship targets
+and `.connect` sources authored inside a referenced asset follow it
+to its new prim path) and every in-archive asset path rebased from
+the authoring layer's directory. Arc targets may be `.usda`,
+`.usdc` or generic `.usd` layers.
+
+#### Writer: flatten or preserve
+
+The decoder also records a **typed opinion model** — a
+`CompositionRecord` on `Scene3D::extras["usd:composition"]`: the
+root layer's prim-tree skeleton as authored (arcs, `class` /
+`over` prims), every in-archive layer the composition consumed
+(with the assets those layers reference), and the root's entry
+name. The encoder chooses what to do with it:
+
+- `CompositionMode::Flatten` (default) emits one self-contained
+  layer with every composed opinion flattened in; consumed arcs
+  are not re-authored and folded-in `subLayers` entries are
+  pruned rather than left dangling.
+- `UsdzEncoder::new().with_composition(CompositionMode::Preserve)`
+  re-authors the source structure: sublayer / reference / payload
+  / inherits / specializes opinions return on their prims exactly
+  as written (list-edit operators included), prims an arc or a
+  variant selection contributed are left to that arc, `class` /
+  `over` prims replay verbatim, the consumed layer entries and
+  their assets are copied byte-for-byte into the package, and the
+  root layer keeps its entry name so anchored paths still resolve.
+  Both modes are one-cycle round-trip fixed points; preserved
+  packages pass `usdchecker` where it is installed.
 
 #### List-edit operators
 
@@ -277,8 +304,6 @@ path: `Relocates` (0.11) / `Splines` (0.12) /
   `docs/3d/usd/` (GAP-TRACKER Round F: on demand).
 - Cross-package `@foo.usdz[path/within.usd]@` selectors into a sibling
   archive — preserved as side-channel opinions rather than resolved.
-- SubLayer / reference / class-arc structure preservation on the writer
-  (the encoder flattens; see Composition above).
 
 ## Standalone build
 

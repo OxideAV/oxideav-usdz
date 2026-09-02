@@ -22,7 +22,7 @@
 //! * `references` is stronger than `payload` on the same prim.
 //! * `references = [@a@, @b@]` — earlier entry is stronger.
 //! * External / cross-package targets stay authored (round-trip), no
-//!   composition; `.usdc` targets raise `Error::Unsupported`.
+//!   composition; `.usdc` targets compose through the Crate reader.
 //! * Reference cycles don't hang the decoder.
 //! * USDZ → Scene3D → USDZ flattens the composed reference into the
 //!   output layer (consumed arc not re-authored).
@@ -445,7 +445,10 @@ def Xform "Ext" (
 }
 
 #[test]
-fn usdc_reference_is_unsupported() {
+fn malformed_usdc_reference_is_invalid_data() {
+    // `.usdc` targets compose through the Crate reader now (see
+    // `composition_preserve.rs`); a stub that is not a Crate file is
+    // a boundary error.
     let scene_src = r#"#usda 1.0
 
 def "X" (
@@ -467,11 +470,11 @@ def "X" (
     let mut decoder = UsdzDecoder::new();
     let err = decoder
         .decode(&archive)
-        .expect_err("usdc reference rejected");
-    let msg = err.to_string();
+        .expect_err("malformed usdc reference rejected");
+    let msg = err.to_string().to_ascii_lowercase();
     assert!(
-        msg.contains("usdc") || msg.to_ascii_lowercase().contains("binary"),
-        "error mentions the binary-crate gap: {msg}"
+        msg.contains("usdc") || msg.contains("bootstrap") || msg.contains("crate"),
+        "error names the Crate boundary: {msg}"
     );
 }
 

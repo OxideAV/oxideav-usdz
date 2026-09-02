@@ -23,7 +23,20 @@ use oxideav_mesh3d::{
     Unit,
 };
 
+use crate::composition::{CompositionMode, CompositionRecord};
 use crate::usda::Value;
+
+/// Archive entry name of the root layer the encoder emits when the
+/// scene carries no composition record naming another one.
+pub const DEFAULT_ROOT_LAYER_NAME: &str = "scene.usda";
+
+/// Writer options — see [`write_layer_with`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WriteOptions {
+    /// Flatten (default) or preserve the composed structure recorded
+    /// on `Scene3D::extras["usd:composition"]`.
+    pub composition: CompositionMode,
+}
 
 /// `Scene3D::extras` key holding the lossless layer-metadata blob
 /// produced by [`crate::usd_to_scene::translate`].  The blob is a
@@ -74,6 +87,22 @@ const PREPEND_LIST_EDIT_KEYS: &[&str] = &[
 /// [`collect_texture_assets`] returns the inner-file list the USDZ
 /// writer needs to embed alongside the USDA.
 pub fn write_layer(scene: &Scene3D) -> String {
+    write_layer_with(scene, &WriteOptions::default())
+}
+
+/// [`write_layer`] with explicit [`WriteOptions`].
+///
+/// Under [`CompositionMode::Preserve`] and a scene carrying a
+/// [`CompositionRecord`] (`Scene3D::extras["usd:composition"]`, the
+/// decoder's typed opinion model), the emitted root layer re-authors
+/// the source's composition instead of the flattened result: prims
+/// an arc or a variant selection contributed are left to that arc,
+/// the arc opinions come back from the local skeleton, and `class` /
+/// `over` prims the typed model has no slot for are replayed
+/// verbatim. The consumed layer entries themselves are the
+/// encoder's job ([`crate::UsdzEncoder`] copies them into the
+/// package) — see [`crate::composition`].
+pub fn write_layer_with(scene: &Scene3D, opts: &WriteOptions) -> String {
     // Typed per-reference UV transforms (`TextureRef::transform`)
     // have no staged USD encoding — bake them into UV channels
     // first (no-op on the common transform-free scene).
@@ -86,12 +115,23 @@ pub fn write_layer(scene: &Scene3D) -> String {
         None => scene,
     };
     let mut w = Out::default();
+    if opts.composition == CompositionMode::Preserve {
+        w.record = CompositionRecord::from_extras(&scene.extras).filter(|r| !r.is_trivial());
+    }
     writeln!(w.s, "#usda 1.0").unwrap();
     write_layer_metadata(&mut w, scene);
     writeln!(w.s).unwrap();
 
     for &root in &scene.roots {
         write_node(&mut w, scene, root, /*parent_path=*/ "");
+    }
+    // Composition-preserving: the local layer's non-`def` root prims
+    // (`class` hierarchies, dangling `over`s) have no typed-model
+    // slot — replay them verbatim from the record.
+    if let Some(record) = w.record.clone() {
+        for prim in record.local_non_def_children("") {
+            write_prim(&mut w, prim);
+        }
     }
     // Typed-model static morph states (`Node::weights`) with no
     // SkelAnimation carrier get a synthesized root-level
@@ -105,16 +145,73 @@ pub fn write_layer(scene: &Scene3D) -> String {
     // path, but the synthetic scope keeps our output self-consistent
     // and decodable: every `material:binding = </Materials/<name>>`
     // resolves through our reader.
-    if !scene.materials.is_empty() {
+    let emitted_materials: Vec<(usize, &Material)> = scene
+        .materials
+        .iter()
+        .enumerate()
+        .filter(|(_, mat)| !w.material_is_contributed(mat))
+        .collect();
+    if !emitted_materials.is_empty() {
         writeln!(w.s, "def Scope \"Materials\" {{").unwrap();
         w.indent += 1;
-        for (i, mat) in scene.materials.iter().enumerate() {
+        for (i, mat) in emitted_materials {
             write_material(&mut w, scene, mat, i);
         }
         w.indent -= 1;
         writeln!(w.s, "}}").unwrap();
     }
     w.s
+}
+
+/// Texture ids the emitted layer references — every texture unless
+/// a composition-preserving write left some materials to the arcs
+/// that contributed them (their textures then ride in the consumed
+/// layer's own assets).
+pub fn emitted_texture_ids(scene: &Scene3D, opts: &WriteOptions) -> Vec<bool> {
+    let record = match opts.composition {
+        CompositionMode::Preserve => {
+            CompositionRecord::from_extras(&scene.extras).filter(|r| !r.is_trivial())
+        }
+        CompositionMode::Flatten => None,
+    };
+    let Some(record) = record else {
+        return vec![true; scene.textures.len()];
+    };
+    let mut used = vec![false; scene.textures.len()];
+    for mat in &scene.materials {
+        if material_contributed(&record, mat) {
+            continue;
+        }
+        for (_, tref) in mat.texture_refs() {
+            if let Some(slot) = used.get_mut(tref.texture.0 as usize) {
+                *slot = true;
+            }
+        }
+        for key in EXTRAS_TEX_INPUTS
+            .iter()
+            .map(|(k, _)| *k)
+            .chain(["usd:tex:opacity"])
+        {
+            if let Some(idx) = mat
+                .extras
+                .get(key)
+                .and_then(|v| v.get("texture"))
+                .and_then(|v| v.as_u64())
+            {
+                if let Some(slot) = used.get_mut(idx as usize) {
+                    *slot = true;
+                }
+            }
+        }
+    }
+    used
+}
+
+fn material_contributed(record: &CompositionRecord, mat: &Material) -> bool {
+    mat.extras
+        .get("usd:primPath")
+        .and_then(|v| v.as_str())
+        .is_some_and(|path| !record.is_local(path))
 }
 
 /// Bake every typed per-reference UV transform
@@ -455,6 +552,9 @@ fn sanitize_filename(s: &str) -> String {
 struct Out {
     s: String,
     indent: usize,
+    /// Composition-preserving write: the decoder's typed opinion
+    /// model. `None` flattens.
+    record: Option<CompositionRecord>,
 }
 
 impl Out {
@@ -462,6 +562,19 @@ impl Out {
         for _ in 0..self.indent {
             self.s.push_str("    ");
         }
+    }
+
+    /// Preserve mode only: `true` when the prim at `path` was not
+    /// authored by the local layer — an arc or a variant selection
+    /// contributed it, so the re-authored arc brings it back.
+    fn contributed(&self, path: &str) -> bool {
+        self.record.as_ref().is_some_and(|r| !r.is_local(path))
+    }
+
+    fn material_is_contributed(&self, mat: &Material) -> bool {
+        self.record
+            .as_ref()
+            .is_some_and(|r| material_contributed(r, mat))
     }
 }
 
@@ -521,6 +634,24 @@ fn write_layer_metadata(w: &mut Out, scene: &Scene3D) {
         .get("defaultPrim")
         .and_then(|v| v.as_text())
         .and_then(|token| resolve_default_prim_token(token, &root_names));
+    // Flattening: a sublayer the decoder folded into this layer must
+    // not be re-authored — the entry is not in the emitted package
+    // and its opinions are already here. Preserving keeps the list
+    // verbatim; the encoder copies the entries alongside.
+    let composed_sublayers: Vec<String> = if w.record.is_some() {
+        Vec::new()
+    } else {
+        scene
+            .extras
+            .get("usd:composedSubLayers")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     for (k, v) in &layer_meta {
         // Don't double-emit the canonical keys we already wrote.
         if matches!(k.as_str(), "upAxis" | "metersPerUnit") {
@@ -532,6 +663,15 @@ fn write_layer_metadata(w: &mut Out, scene: &Scene3D) {
             // line below when a resolution survived.
             continue;
         }
+        if k == "subLayers" && !composed_sublayers.is_empty() {
+            let Some(pruned) = prune_sublayers(v, &composed_sublayers) else {
+                continue;
+            };
+            for formatted in format_metadata_lines(k, &pruned) {
+                writeln!(w.s, "    {formatted}").unwrap();
+            }
+            continue;
+        }
         for formatted in format_metadata_lines(k, v) {
             writeln!(w.s, "    {formatted}").unwrap();
         }
@@ -541,6 +681,55 @@ fn write_layer_metadata(w: &mut Out, scene: &Scene3D) {
         writeln!(w.s, "    defaultPrim = \"{name}\"").unwrap();
     }
     writeln!(w.s, ")").unwrap();
+}
+
+/// Drop the entries of a `subLayers` value that name one of the
+/// decoder-composed (now flattened) sublayers. Returns `None` when
+/// nothing survives. Entry paths are matched on their anchored
+/// spelling (`./geom.usda` ↔ `geom.usda`, or a deeper
+/// `dir/geom.usda` entry name).
+fn prune_sublayers(v: &Value, composed: &[String]) -> Option<Value> {
+    fn is_composed(item: &Value, composed: &[String]) -> bool {
+        let Some(text) = item.as_text() else {
+            return false;
+        };
+        let stripped = text.strip_prefix("./").unwrap_or(text);
+        composed
+            .iter()
+            .any(|c| c == stripped || c.ends_with(&format!("/{stripped}")))
+    }
+    fn prune_seq(v: &Value, composed: &[String]) -> Option<Value> {
+        match v {
+            Value::Array(items) => {
+                let kept: Vec<Value> = items
+                    .iter()
+                    .filter(|i| !is_composed(i, composed))
+                    .cloned()
+                    .collect();
+                if kept.is_empty() {
+                    None
+                } else {
+                    Some(Value::Array(kept))
+                }
+            }
+            other if is_composed(other, composed) => None,
+            other => Some(other.clone()),
+        }
+    }
+    match v {
+        Value::ListOp(list) => {
+            let mut out = crate::usda::ListOp::default();
+            let mut any = false;
+            for (op, sub) in list.entries() {
+                if let Some(kept) = prune_seq(sub, composed) {
+                    out.set(op, kept);
+                    any = true;
+                }
+            }
+            any.then(|| Value::ListOp(Box::new(out)))
+        }
+        other => prune_seq(other, composed),
+    }
 }
 
 /// Collect the sanitised prim names the writer will emit for every
@@ -592,6 +781,11 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
     } else {
         format!("{parent_path}/{safe_name}")
     };
+    // Composition-preserving: a prim an arc / variant selection
+    // contributed comes back through the re-authored arc.
+    if w.contributed(&path) {
+        return;
+    }
 
     // UsdSkel: a skeleton-carrier node (decoder marker
     // `usd:skeleton` = SkeletonId) re-emits as a `def Skeleton` prim
@@ -624,7 +818,7 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
         .map(crate::variant_codec::decode_variant_sets)
         .unwrap_or_default();
     let selection = extract_variant_selection(&node.extras);
-    let composition_lines = extract_composition_arc_lines(&node.extras);
+    let composition_lines = extract_composition_arc_lines(&node.extras, w.record.as_ref(), &path);
     let prim_metadata_lines =
         build_prim_metadata_lines(&variant_sets, &selection, &composition_lines);
 
@@ -748,6 +942,13 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
     for &child in &node.children {
         write_node(w, scene, child, &path);
     }
+    // Composition-preserving: nested `class` / `over` prims the
+    // local layer authored under this prim replay verbatim.
+    if let Some(record) = w.record.clone() {
+        for prim in record.local_non_def_children(&path) {
+            write_prim(w, prim);
+        }
+    }
 
     w.indent -= 1;
     w.write_indent();
@@ -810,11 +1011,24 @@ fn build_prim_metadata_lines(
 /// round-8 variant writer paths handle those.
 fn extract_composition_arc_lines(
     extras: &std::collections::HashMap<String, serde_json::Value>,
+    record: Option<&CompositionRecord>,
+    path: &str,
 ) -> Vec<String> {
-    let Some(blob) = extras.get(PRIM_METADATA_EXTRAS_KEY) else {
+    let mut meta = extras
+        .get(PRIM_METADATA_EXTRAS_KEY)
+        .map(crate::variant_codec::decode_btree_value)
+        .unwrap_or_default();
+    // Composition-preserving: the arcs the decoder consumed (and
+    // stripped from the stash) come back exactly as the local layer
+    // authored them, list-edit operators included.
+    if let Some(record) = record {
+        for (k, v) in record.local_arcs(path) {
+            meta.insert(k, v);
+        }
+    }
+    if meta.is_empty() {
         return Vec::new();
-    };
-    let meta = crate::variant_codec::decode_btree_value(blob);
+    }
     let mut out = Vec::new();
     for (k, v) in &meta {
         // `variants` selection + `variantSets` declaration are emitted
@@ -1275,7 +1489,9 @@ fn write_mesh(
         .iter()
         .any(|p| p.topology == Topology::Triangles && p.extras.contains_key("usd:subset"))
     {
-        write_subset_mesh(w, scene, mesh, &mesh_name, parent_path, skel);
+        if !w.contributed(&format!("{parent_path}/{mesh_name}")) {
+            write_subset_mesh(w, scene, mesh, &mesh_name, parent_path, skel);
+        }
         return;
     }
     for (i, prim) in mesh.primitives.iter().enumerate() {
@@ -1284,6 +1500,9 @@ fn write_mesh(
         } else {
             format!("{mesh_name}_{i}")
         };
+        if w.contributed(&format!("{parent_path}/{prim_name}")) {
+            continue;
+        }
         match prim.topology {
             Topology::Triangles => {
                 let prim_path = format!("{parent_path}/{prim_name}");

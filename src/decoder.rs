@@ -72,7 +72,7 @@ impl UsdzDecoder {
         } else {
             usda::parse(payload)?
         };
-        usd_to_scene::translate(&layer, archive.clone(), &entries)
+        usd_to_scene::translate_with_root(&layer, archive.clone(), &entries, Some(&layer_name))
     }
 }
 

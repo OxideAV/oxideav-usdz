@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Composition-arc preservation on the writer: the decoder stashes a
+  typed `CompositionRecord` (`Scene3D::extras["usd:composition"]`) —
+  the local layer's prim skeleton with its arcs and `class` / `over`
+  prims, every consumed in-archive layer with the assets it
+  references, the root entry name — and
+  `UsdzEncoder::with_composition(CompositionMode::Preserve)` re-authors
+  sublayer / reference / payload / inherits / specializes arcs and
+  variant selections instead of flattening, copying the layer entries
+  through verbatim. `CompositionMode::Flatten` stays the default.
+- `.usdc` (and generic `.usd`) sublayers, references and payloads
+  compose through the Crate reader instead of refusing.
+
+### Fixed
+
+- Flattened output no longer re-authors a `subLayers` entry the decoder
+  folded in (it dangled in the single-layer package).
+- §10.5 namespace mapping: relationship targets / `.connect` sources
+  authored inside a referenced or inherited subtree follow the target
+  to the referencing prim's path; asset paths inside composed layers
+  are rebased from the authoring layer's directory (`../tex/x.png`
+  resolves).
+- Sublayer / reference paths authored in a root layer that lives in a
+  package sub-directory resolve against that directory.
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-usdz/compare/v0.0.3...v0.0.4) - 2026-08-30
 
 ### Other
