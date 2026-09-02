@@ -327,14 +327,23 @@ impl Version {
         })
     }
 
-    /// Crate 0.10.0 — the newest version whose §16.3.8.2 feature set
-    /// this reader fully implements: 0.9.0 added the TimeCode value
-    /// types and 0.10.0 the PathExpression value type, both decoded
-    /// by `usdc_values`. (0.11.0 Relocates and 0.12.0 Splines are not
-    /// yet implemented, so the ceiling stays below them.)
+    /// Crate 0.10.0 — 0.9.0 added the TimeCode value types and
+    /// 0.10.0 the PathExpression value type, both decoded by
+    /// `usdc_values`.
     pub const V0_10_0: Version = Version {
         major: 0,
         minor: 10,
+        patch: 0,
+    };
+
+    /// Crate 0.11.0 — added the `Relocates` value type (§16.3.10.15,
+    /// layer `layerRelocates` metadata), decoded by `usdc_values`.
+    /// The newest version whose §16.3.8.2 feature set this reader
+    /// fully implements; 0.12.0 Splines are not yet implemented, so
+    /// the ceiling stays below them.
+    pub const V0_11_0: Version = Version {
+        major: 0,
+        minor: 11,
         patch: 0,
     };
 
@@ -343,7 +352,7 @@ impl Version {
     /// against. (Patch is *not* part of the gate — §16.3.8.2 keys
     /// dispatch on `(major, minor)`, so a higher patch within a known
     /// `(major, minor)` is read on a best-effort basis.)
-    pub const READER_MAX: Version = Version::V0_10_0;
+    pub const READER_MAX: Version = Version::V0_11_0;
 
     /// `(major, minor)` — the trace doc names this the dispatch key
     /// a reader compares against to decide it understands the file.
@@ -4471,12 +4480,12 @@ mod tests {
     }
 
     #[test]
-    fn version_reader_ceiling_is_0_10_0() {
-        // §16.3.8.2: 0.9.0 adds TimeCode, 0.10.0 adds PathExpression —
-        // both implemented — while 0.11.0 Relocates / 0.12.0 Splines
-        // are not, so the ceiling sits at 0.10.0.
-        assert_eq!(Version::READER_MAX, Version::V0_10_0);
-        assert_eq!(Version::READER_MAX.dispatch_key(), (0, 10));
+    fn version_reader_ceiling_is_0_11_0() {
+        // §16.3.8.2: 0.9.0 adds TimeCode, 0.10.0 adds PathExpression,
+        // 0.11.0 adds Relocates — all implemented — while 0.12.0
+        // Splines is not, so the ceiling sits at 0.11.0.
+        assert_eq!(Version::READER_MAX, Version::V0_11_0);
+        assert_eq!(Version::READER_MAX.dispatch_key(), (0, 11));
     }
 
     #[test]
@@ -4507,10 +4516,11 @@ mod tests {
         }
         .is_readable());
         assert!(Version::V0_10_0.is_readable());
+        assert!(Version::V0_11_0.is_readable());
         // Past the ceiling: refused.
         assert!(!Version {
             major: 0,
-            minor: 11,
+            minor: 12,
             patch: 0,
         }
         .is_readable());
@@ -4600,11 +4610,11 @@ mod tests {
     #[test]
     fn usdc_parse_refuses_forward_incompatible_version() {
         // A file claiming a (major, minor) newer than the reader
-        // understands (past the 0.10.0 ceiling) is refused at the
+        // understands (past the 0.11.0 ceiling) is refused at the
         // bootstrap gate before the TOC is even read.
         let newer = Version {
             major: 0,
-            minor: 11,
+            minor: 12,
             patch: 0,
         };
         let bytes = synthetic_usdc(newer, &[(b"TOKENS", &[0; 16])]);

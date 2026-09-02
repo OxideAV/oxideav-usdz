@@ -79,7 +79,14 @@ pub fn layer_from_usdc(bytes: &[u8]) -> Result<Layer> {
                         continue;
                     }
                     let value = decoder.decode(ValueRep::from_raw(*rep))?;
-                    layer_metadata.insert(name.clone(), value);
+                    // §7.6.1.2.4 names the layer field `layerRelocates`;
+                    // the text form (§16.2.18.5) spells it `relocates`.
+                    let key = if name == "layerRelocates" {
+                        "relocates".to_owned()
+                    } else {
+                        name.clone()
+                    };
+                    layer_metadata.insert(key, value);
                 }
             }
             FORM_PRIM => {

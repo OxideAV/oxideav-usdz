@@ -250,6 +250,24 @@ pub fn translate_with_root(
         );
     }
 
+    // Relocates (Core Specification §10.3.2.6): each layer-stack
+    // `relocates` entry moves the composed prim at its source path to
+    // its target path — opinions arrive from the source, ancestral
+    // opinions at the target are the local ones. Applied once the
+    // arcs have delivered the source prims.
+    let mut composed_relocates: Vec<String> = Vec::new();
+    apply_relocates(&mut merged_layer, &mut composed_relocates);
+    if !composed_relocates.is_empty() {
+        let names: Vec<serde_json::Value> = composed_relocates
+            .iter()
+            .map(|s| serde_json::Value::String(s.clone()))
+            .collect();
+        ctx.scene.extras.insert(
+            "usd:composedRelocates".into(),
+            serde_json::Value::Array(names),
+        );
+    }
+
     // Typed opinion model: the local layer as authored plus every
     // in-archive layer the arcs above consumed, so the encoder can
     // re-author the composition instead of flattening it. Stashed
@@ -782,6 +800,90 @@ fn compose_references(
         }
     }
     Ok(())
+}
+
+/// Layer-stack relocates (Core Specification §10.3.2.6 / §16.2.18.5).
+///
+/// For every `(source, target)` entry of the layer's `relocates`
+/// metadata the prim spec composed at `source` is moved to `target`:
+/// removed from its parent, renamed to the target's last element and
+/// merged under the target's parent (a locally-authored `over` at the
+/// target keeps its own opinions, as the §10.3.2.6.2 example shows).
+/// Entries violating the §10.3.2.6 restrictions are ignored, as
+/// composition errors are: source or target at the pseudo-root /
+/// root level, a target below its source, a source below its target
+/// (placing a prim at an ancestor), duplicate sources or targets, a
+/// target equal to its source, an unresolvable source or an absent
+/// target parent. Applied entries land in `composed_out` as
+/// `"<source>|<target>"`.
+fn apply_relocates(layer: &mut Layer, composed_out: &mut Vec<String>) {
+    let Some(Value::Relocates(pairs)) = layer.metadata.get("relocates").cloned() else {
+        return;
+    };
+    let mut seen_sources: Vec<&str> = Vec::new();
+    let mut seen_targets: Vec<&str> = Vec::new();
+    for (source, target) in &pairs {
+        let src = source.trim_end_matches('/');
+        let dst = target.trim_end_matches('/');
+        let src_segs: Vec<&str> = src.trim_start_matches('/').split('/').collect();
+        let dst_segs: Vec<&str> = dst.trim_start_matches('/').split('/').collect();
+        let valid = src != dst
+            && src_segs.len() >= 2
+            && dst_segs.len() >= 2
+            && !src_segs.iter().any(|s| s.is_empty())
+            && !dst_segs.iter().any(|s| s.is_empty())
+            && !dst.starts_with(&format!("{src}/"))
+            && !src.starts_with(&format!("{dst}/"))
+            && !seen_sources.contains(&src)
+            && !seen_targets.contains(&dst);
+        if !valid {
+            continue;
+        }
+        seen_sources.push(src);
+        seen_targets.push(dst);
+        // Detach the source prim.
+        let Some(moved) = take_prim_at(&mut layer.prims, &src_segs) else {
+            continue;
+        };
+        // Locate the target parent.
+        let (parent_segs, new_name) = dst_segs.split_at(dst_segs.len() - 1);
+        let Some(parent) = find_prim_mut(&mut layer.prims, parent_segs) else {
+            // Put the source back — an unresolvable target is a
+            // composition error that leaves the prim where it was.
+            if let Some(src_parent) =
+                find_prim_mut(&mut layer.prims, &src_segs[..src_segs.len() - 1])
+            {
+                src_parent.children.push(moved);
+            }
+            continue;
+        };
+        let mut moved = moved;
+        moved.name = new_name[0].to_owned();
+        if let Some(existing) = parent.children.iter_mut().find(|c| c.name == moved.name) {
+            merge_prim_under(existing, &moved);
+        } else {
+            parent.children.push(moved);
+        }
+        composed_out.push(format!("{src}|{dst}"));
+    }
+}
+
+/// Remove and return the prim at `segs` (a root-relative path split
+/// on `/`, at least two elements).
+fn take_prim_at(roots: &mut [Prim], segs: &[&str]) -> Option<Prim> {
+    let (parent_segs, last) = segs.split_at(segs.len() - 1);
+    let parent = find_prim_mut(roots, parent_segs)?;
+    let idx = parent.children.iter().position(|c| c.name == last[0])?;
+    Some(parent.children.remove(idx))
+}
+
+fn find_prim_mut<'a>(roots: &'a mut [Prim], segs: &[&str]) -> Option<&'a mut Prim> {
+    let (first, rest) = segs.split_first()?;
+    let mut cur = roots.iter_mut().find(|p| p.name == *first)?;
+    for seg in rest {
+        cur = cur.children.iter_mut().find(|c| c.name == *seg)?;
+    }
+    Some(cur)
 }
 
 /// Class-hierarchy composition (round 13).
@@ -5334,6 +5436,12 @@ fn value_to_json(v: &Value) -> Option<serde_json::Value> {
             }
             J::Object(obj)
         }
+        Value::Relocates(pairs) => J::Object(
+            pairs
+                .iter()
+                .map(|(a, b)| (a.clone(), J::String(b.clone())))
+                .collect(),
+        ),
         Value::None => J::Null,
     })
 }

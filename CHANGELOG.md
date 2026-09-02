@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accelerations — defaults and time samples — plus list-edited
   `inactiveIds`), symmetric writer, and `point_instancer::expand` into
   instanced nodes in the §2.3 order with the §2.4 mask.
+- Layer `relocates`: the §16.2.18.5 text map parses to
+  `Value::Relocates` and re-emits; the Crate `Relocates` value
+  (§16.3.10.15, 0.11.0) decodes and the reader ceiling moves to
+  0.11.0; composition applies each entry per §10.3.2.6 (audit on
+  `Scene3D::extras["usd:composedRelocates"]`), the flattening writer
+  prunes applied entries and the preserving writer re-authors them.
 
 ### Fixed
 

@@ -663,6 +663,33 @@ fn write_layer_metadata(w: &mut Out, scene: &Scene3D) {
             // line below when a resolution survived.
             continue;
         }
+        if k == "relocates" && w.record.is_none() {
+            // Flattening: an applied relocate has already moved the
+            // prim; re-authoring the entry would name a source that
+            // no longer exists.
+            let applied: Vec<String> = scene
+                .extras
+                .get("usd:composedRelocates")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Value::Relocates(pairs) = v {
+                let kept: Vec<(String, String)> = pairs
+                    .iter()
+                    .filter(|(a, b)| !applied.contains(&format!("{a}|{b}")))
+                    .cloned()
+                    .collect();
+                if kept.is_empty() {
+                    continue;
+                }
+                writeln!(w.s, "    relocates = {}", format_relocates(&kept)).unwrap();
+                continue;
+            }
+        }
         if k == "subLayers" && !composed_sublayers.is_empty() {
             let Some(pruned) = prune_sublayers(v, &composed_sublayers) else {
                 continue;
@@ -1280,8 +1307,18 @@ fn render_value(v: &crate::usda::Value) -> Option<String> {
                 .or(list.reordered.as_ref())?;
             return render_value(sub);
         }
+        V::Relocates(pairs) => format_relocates(pairs),
         V::None => return None,
     })
+}
+
+/// §16.2.18.5 `{ </src> : </dst>, … }`.
+fn format_relocates(pairs: &[(String, String)]) -> String {
+    let items: Vec<String> = pairs
+        .iter()
+        .map(|(a, b)| format!("<{a}> : <{b}>"))
+        .collect();
+    format!("{{ {} }}", items.join(", "))
 }
 
 /// Serialise a timeSamples map back into its `{ T: V, T: V }` USDA
@@ -4198,6 +4235,7 @@ pub(crate) fn format_metadata_value(value: &Value) -> String {
             .map(|(_, v)| format_metadata_value(v))
             .unwrap_or_default(),
         Value::Raw(s) => s.clone(),
+        Value::Relocates(pairs) => format_relocates(pairs),
         Value::None => String::new(),
     }
 }
@@ -4249,6 +4287,7 @@ fn guess_usda_type(v: &Value) -> &'static str {
             .next()
             .map(|(_, v)| guess_usda_type(v))
             .unwrap_or("token"),
+        Value::Relocates(_) => "dictionary",
         Value::Raw(_) | Value::None => "token",
     }
 }

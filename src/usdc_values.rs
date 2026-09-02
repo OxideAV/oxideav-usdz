@@ -15,7 +15,7 @@
 //!
 //! Version posture: everything needed for Crate 0.8.0 files plus the
 //! 0.9.0 `TimeCode` and 0.10.0 `PathExpression` value types is
-//! implemented. `Relocates` (0.11.0) and `Splines` (0.12.0) refuse
+//! implemented. `Relocates` (0.11.0) decodes; `Splines` (0.12.0) refuse
 //! with a precise `Unsupported` — the reader's version gate keeps
 //! such files out before a rep of those types can be met.
 
@@ -276,17 +276,27 @@ impl<'a> ValueDecoder<'a> {
             // offset). VT::PathExpression shares the representation.
             VT::Asset => Value::Asset(self.string(rep.payload)?.to_owned()),
             VT::PathExpression => Value::String(self.string(rep.payload)?.to_owned()),
-            VT::Specifier => {
-                Value::Token(specifier_name(self.i32_scalar_at(off)?)?.to_owned())
-            }
-            VT::Permission => {
-                Value::Token(permission_name(self.i32_scalar_at(off)?)?.to_owned())
-            }
-            VT::Variability => {
-                Value::Token(variability_name(self.i32_scalar_at(off)?)?.to_owned())
-            }
-            VT::Matrix2d | VT::Matrix3d | VT::Matrix4d | VT::Quatd | VT::Quatf | VT::Quath | VT::Double2 | VT::Float2 | VT::Half2
-            | VT::Int2 | VT::Double3 | VT::Float3 | VT::Half3 | VT::Int3 | VT::Double4 | VT::Float4 | VT::Half4 | VT::Int4 => {
+            VT::Specifier => Value::Token(specifier_name(self.i32_scalar_at(off)?)?.to_owned()),
+            VT::Permission => Value::Token(permission_name(self.i32_scalar_at(off)?)?.to_owned()),
+            VT::Variability => Value::Token(variability_name(self.i32_scalar_at(off)?)?.to_owned()),
+            VT::Matrix2d
+            | VT::Matrix3d
+            | VT::Matrix4d
+            | VT::Quatd
+            | VT::Quatf
+            | VT::Quath
+            | VT::Double2
+            | VT::Float2
+            | VT::Half2
+            | VT::Int2
+            | VT::Double3
+            | VT::Float3
+            | VT::Half3
+            | VT::Int3
+            | VT::Double4
+            | VT::Float4
+            | VT::Half4
+            | VT::Int4 => {
                 let width = scalar_width(vt).expect("dimensioned types have widths");
                 decode_element(vt, self.get(off, width)?)?
             }
@@ -323,10 +333,15 @@ impl<'a> ValueDecoder<'a> {
                         .collect(),
                 )
             }
-            VT::TokenListOp | VT::StringListOp | VT::PathListOp | VT::IntListOp | VT::Int64ListOp | VT::UIntListOp
-            | VT::UInt64ListOp | VT::ReferenceListOp | VT::PayloadListOp => {
-                self.decode_list_op(vt, off, depth)?
-            }
+            VT::TokenListOp
+            | VT::StringListOp
+            | VT::PathListOp
+            | VT::IntListOp
+            | VT::Int64ListOp
+            | VT::UIntListOp
+            | VT::UInt64ListOp
+            | VT::ReferenceListOp
+            | VT::PayloadListOp => self.decode_list_op(vt, off, depth)?,
             VT::VariantSelectionMap => {
                 let count = self.count_at(off, "VT::VariantSelectionMap")?;
                 let data = self.get(off + 8, count * 8)?;
@@ -375,19 +390,35 @@ impl<'a> ValueDecoder<'a> {
                 ))
             }
             VT::Relocates => {
-                return Err(unsupported(
-                    "USDC value: VT::Relocates (Crate >= 0.11.0) is beyond this reader's version ceiling",
-                ))
+                // §16.3.10.15: `[u64 count][count × (u32 source path
+                // index, u32 target path index)]`.
+                let count = self.count_at(off, "VT::Relocates")?;
+                let data = self.get(off + 8, count * 8)?;
+                let mut pairs = Vec::with_capacity(count);
+                for pair in data.chunks_exact(8) {
+                    let src = u32::from_le_bytes(pair[0..4].try_into().unwrap());
+                    let dst = u32::from_le_bytes(pair[4..8].try_into().unwrap());
+                    pairs.push((
+                        self.path(u64::from(src))?.to_owned(),
+                        self.path(u64::from(dst))?.to_owned(),
+                    ));
+                }
+                Value::Relocates(pairs)
             }
-            VT::Splines => {
-                return Err(unsupported(
-                    "USDC value: VT::Splines (Crate >= 0.12.0) is beyond this reader's version ceiling",
-                ))
-            }
+            VT::Splines => return Err(unsupported(
+                "USDC value: VT::Splines (Crate >= 0.12.0) is beyond this reader's version ceiling",
+            )),
             VT::ValueBlock => Value::None,
             // §16.3.9.1 lists these as always inlined; a non-inline
             // non-array rep of these types is malformed.
-            VT::Bool | VT::Uchar | VT::Int | VT::Uint | VT::Half | VT::Float | VT::String | VT::Token => {
+            VT::Bool
+            | VT::Uchar
+            | VT::Int
+            | VT::Uint
+            | VT::Half
+            | VT::Float
+            | VT::String
+            | VT::Token => {
                 return Err(invalid(format!(
                     "USDC value: type {} must be inlined when not an array (§16.3.9.1)",
                     vt.name()

@@ -204,6 +204,11 @@ The read path evaluates USD composition arcs:
 - `references` / `payload` arcs (including targets that live as their own
   entries in the same archive),
 - in-layer `inherits` / `specializes`,
+- layer `relocates` (§16.2.18.5 text map / §16.3.10.15 Crate value):
+  each `{ </src> : </dst> }` entry moves the composed source prim to
+  its target path under the §10.3.2.6 restrictions (root-level,
+  nested, duplicate and self entries are ignored as composition
+  errors); a local `over` at the target keeps its opinions,
 
 resolved in the documented strength order, with the §10.5 namespace
 mapping applied to each arc's target subtree (relationship targets
@@ -261,8 +266,8 @@ generic `.usd` layer dispatches on its header byte run (§16.1:
 `PXR-USDC` magic = Crate, `#usda` banner = text).
 
 - **Preamble + sections** — bootstrap, version gate (reader ceiling
-  Crate 0.10.0 per the §16.3.8.2 version table; 0.11 Relocates /
-  0.12 Splines refuse up front), the tail TOC, and all six standard
+  Crate 0.11.0 per the §16.3.8.2 version table; 0.12 Splines refuse
+  up front), the tail TOC, and all six standard
   sections (TOKENS, STRINGS, FIELDS, FIELDSETS, PATHS, SPECS) with
   the §16.3.7 compression stack: chunked LZ4 buffers and the
   compressed-integer coding (2-bit control stream + common-delta
@@ -286,8 +291,11 @@ generic `.usd` layer dispatches on its header byte run (§16.1:
   §16.3.9.3.2 compressed floating-point codings (`i` all-integral
   and `t` lookup-table), index vectors, dictionaries, the
   six-sublist list operations, variant-selection maps, time samples,
-  references/payloads, recursion-guarded indirect values, and the
-  specifier / permission / variability enums. On the committed
+  references/payloads, recursion-guarded indirect values, the
+  specifier / permission / variability enums, and the 0.11.0
+  `Relocates` map (§16.3.10.15 path-index pairs; the
+  `layerRelocates` layer field surfaces under the text form's
+  `relocates` key). On the committed
   fixture **all 157 field values decode**, pinned down to exact
   layer metadata, mesh arrays, and 3023-sample animation tracks.
 - **Scene bridge** — `usdc_layer::layer_from_usdc` materialises the
@@ -315,8 +323,8 @@ child prims) into `variant_sets`, `variantSelection` maps become
 composition pipeline (pinned against the staged
 `crate-variant-specs.usdc` fixture: 7 Variant + 3 VariantSet specs
 across two namespace levels). Not yet implemented on the Crate
-path: `Relocates` (0.11) / `Splines` (0.12) /
-`UnregisteredValueListOp` payloads refuse with precise messages.
+path: `Splines` (0.12) / `UnregisteredValueListOp` payloads refuse
+with precise messages.
 
 ## Not yet supported
 

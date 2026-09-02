@@ -310,6 +310,17 @@ fn encode_value(v: &Value) -> JValue {
             JValue::Object(o)
         }
         Value::Raw(s) => tagged("Raw", JValue::String(s.clone())),
+        Value::Relocates(pairs) => tagged(
+            "Relocates",
+            JValue::Array(
+                pairs
+                    .iter()
+                    .map(|(a, b)| {
+                        JValue::Array(vec![JValue::String(a.clone()), JValue::String(b.clone())])
+                    })
+                    .collect(),
+            ),
+        ),
         Value::TimeSamples(samples) => tagged(
             "TimeSamples",
             JValue::Array(
@@ -372,6 +383,22 @@ fn decode_value(v: &JValue) -> Value {
             prim_path: read_str(obj, "prim_path"),
         },
         "Raw" => Value::Raw(read_str(obj, "v")),
+        "Relocates" => Value::Relocates(
+            obj.get("v")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|pair| {
+                            let p = pair.as_array()?;
+                            Some((
+                                p.first()?.as_str()?.to_owned(),
+                                p.get(1)?.as_str()?.to_owned(),
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ),
         "TimeSamples" => {
             let samples = match obj.get("v") {
                 Some(JValue::Array(arr)) => arr

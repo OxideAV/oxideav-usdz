@@ -337,6 +337,11 @@ pub enum Value {
     /// The wrapped [`ListOp`] keeps each sublist separate so multiple
     /// authored operators on the same field merge losslessly.
     ListOp(Box<ListOp>),
+    /// §16.2.18.5 layer `relocates` map — `{ </src> : </dst>, … }`,
+    /// ordered `(source, target)` prim-path pairs. The Crate form
+    /// (§16.3.10.15, `Relocates`, ≥ 0.11.0) decodes to the same
+    /// variant.
+    Relocates(Vec<(String, String)>),
     /// Anything we didn't recognise; preserved verbatim.
     Raw(String),
     /// Empty value — attribute declared but not assigned (`token
@@ -1182,17 +1187,21 @@ fn parse_value(t: &mut Tokenizer<'_>) -> Result<Value> {
         '[' => Ok(Value::Array(read_array(t)?)),
         '{' => {
             // Disambiguate `{ TYPE NAME = VALUE }` typed dictionaries
-            // from `{ 0: VALUE, 10: VALUE }` timeSamples maps: peek
-            // past the `{` — a leading digit or sign can only start a
-            // timeCode key.
+            // from `{ 0: VALUE, 10: VALUE }` timeSamples maps and the
+            // §16.2.18.5 `{ </a> : </b> }` relocates map: peek past
+            // the `{` — a leading digit or sign can only start a
+            // timeCode key, a `<` only a relocates source path.
             let saved = t.pos;
             t.advance(); // consume `{`
             t.skip_trivia();
+            let lead = t.peek_char();
             let leads_numeric =
-                matches!(t.peek_char(), Some(c) if c.is_ascii_digit() || c == '+' || c == '-');
+                matches!(lead, Some(c) if c.is_ascii_digit() || c == '+' || c == '-');
             t.pos = saved;
             if leads_numeric {
                 Ok(Value::TimeSamples(read_time_samples(t)?))
+            } else if lead == Some('<') {
+                Ok(Value::Relocates(read_relocates(t)?))
             } else {
                 Ok(Value::Dict(read_dict(t)?))
             }
@@ -1278,6 +1287,51 @@ fn read_dict(t: &mut Tokenizer<'_>) -> Result<BTreeMap<String, Value>> {
             // the key still round-trips.
             out.insert(name, Value::None);
         }
+    }
+}
+
+/// Read a §16.2.18.5 `{ </src> : </dst>, ... }` relocates map
+/// (`RelocatesMetadata` — `RelocatesItem <- PathRef ':' PathRef`,
+/// comma-separated, trailing comma tolerated).
+fn read_relocates(t: &mut Tokenizer<'_>) -> Result<Vec<(String, String)>> {
+    if !t.eat('{') {
+        return Err(invalid("expected `{` to start relocates map"));
+    }
+    let mut out = Vec::new();
+    loop {
+        t.skip_trivia();
+        if t.eat('}') {
+            return Ok(out);
+        }
+        if t.eof() {
+            return Err(invalid("EOF inside relocates map"));
+        }
+        if t.eat(',') {
+            continue;
+        }
+        if t.peek_char() != Some('<') {
+            return Err(invalid(format!(
+                "expected `<path>` relocates source at {}",
+                t.pos_display()
+            )));
+        }
+        let source = read_path(t)?;
+        t.skip_trivia();
+        if !t.eat(':') {
+            return Err(invalid(format!(
+                "expected `:` between relocates source and target at {}",
+                t.pos_display()
+            )));
+        }
+        t.skip_trivia();
+        if t.peek_char() != Some('<') {
+            return Err(invalid(format!(
+                "expected `<path>` relocates target at {}",
+                t.pos_display()
+            )));
+        }
+        let target = read_path(t)?;
+        out.push((source, target));
     }
 }
 
@@ -1739,6 +1793,42 @@ def Xform "Root" {
         };
         assert_eq!(samples[0].0, -1.5);
         assert_eq!(samples[1].1.as_f32(), Some(4.0));
+    }
+
+    #[test]
+    fn parse_layer_relocates_map() {
+        // §16.2.18.5 worked example.
+        let src = br#"#usda 1.0
+(
+    relocates = {
+        </layerdefaultprim/bar/baz> : </layerdefaultprim/barbaz>,
+        </A/B>: </A/C>
+    }
+)
+def "layerdefaultprim" {
+}
+"#;
+        let layer = parse(src).unwrap();
+        assert_eq!(
+            layer.metadata.get("relocates"),
+            Some(&Value::Relocates(vec![
+                (
+                    "/layerdefaultprim/bar/baz".into(),
+                    "/layerdefaultprim/barbaz".into()
+                ),
+                ("/A/B".into(), "/A/C".into()),
+            ]))
+        );
+        // Empty map and a missing colon.
+        assert_eq!(
+            parse(b"#usda 1.0\n(\n relocates = { }\n)\n")
+                .unwrap()
+                .metadata
+                .get("relocates"),
+            Some(&Value::Dict(BTreeMap::new())),
+            "an empty `{{ }}` is a typed dictionary, not a relocates map"
+        );
+        assert!(parse(b"#usda 1.0\n(\n relocates = { </a> </b> }\n)\n").is_err());
     }
 
     #[test]
