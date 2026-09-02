@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-usdz/compare/v0.0.4...v0.0.5) - 2026-09-02
+
+### Other
+
+- MSRV 1.80 — no Option::is_none_or in the constant-primvar check
+- unmodelled gprim properties replay verbatim (topology-safe)
+- unmodelled properties and unknown-schema prim bodies replay verbatim
+- typed Crate writer — encode_layer + LayerFormat::Usdc packaging
+- contains_key over get().is_none() in mesh_transform (clippy unnecessary_get_then_check)
+- decode→encode→decode fixed point on every staged fixture
+- cross-package @pkg.usdz[path/within.usd]@ selectors + referenced layer stacks
+- Crate 0.12 Splines (§16.3.10.33) + §16.2.13 text form — reader ceiling reaches the table's last row
+- Crate 0.11 Relocates (§16.3.10.15) + §16.2.18.5 text map + §10.3.2.6 composition
+- UsdGeomPointInstancer on the typed model, both directions + expansion
+- skip the staged-Crate composition cases when docs/ is absent
+- typed opinion model + CompositionMode::Preserve on the writer
+
 ### Added
 
 - Composition-arc preservation on the writer: the decoder stashes a
