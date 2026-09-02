@@ -419,9 +419,8 @@ impl<'a> ValueDecoder<'a> {
                 for _ in 0..custom_count {
                     let time = f64::from_le_bytes(self.get(cursor, 8)?.try_into().unwrap());
                     cursor += 8;
-                    let entries = self.count_at(cursor, "VT::Splines custom dictionary")?;
-                    let dict = self.decode_dictionary(cursor, depth + 1)?;
-                    cursor += 8 + entries * 12;
+                    let (dict, end) = self.decode_dictionary_span(cursor, depth + 1)?;
+                    cursor = end;
                     custom.push((time, dict));
                 }
                 Value::Spline(Box::new(crate::spline::Spline::from_crate_bytes(
@@ -454,7 +453,24 @@ impl<'a> ValueDecoder<'a> {
     /// §16.3.10.19 dictionary: `[u64 count]` then per entry a 4-byte
     /// token-index key and an 8-byte signed offset (relative to the
     /// offset field's own position) to the member's rep word.
+    /// §16.3.10.19 dictionary: `[u64 count]`, then per member a
+    /// `u32` key token and an `i64` forward offset (from the `i64`'s
+    /// own position) to the member's rep word. Members are
+    /// **chained**: the member's payload bytes sit between its `i64`
+    /// and its rep word, and the next member's key follows that rep
+    /// word — pinned on a production file (a black-box-produced
+    /// dictionary crate; §16.3.10.19 states the offset but not the
+    /// interleaving). Returns the map and the position just past the
+    /// last member's rep word.
     fn decode_dictionary(&self, off: usize, depth: u32) -> Result<BTreeMap<String, Value>> {
+        Ok(self.decode_dictionary_span(off, depth)?.0)
+    }
+
+    fn decode_dictionary_span(
+        &self,
+        off: usize,
+        depth: u32,
+    ) -> Result<(BTreeMap<String, Value>, usize)> {
         let count = self.count_at(off, "dictionary")?;
         let mut map = BTreeMap::new();
         let mut cursor = off + 8;
@@ -465,9 +481,9 @@ impl<'a> ValueDecoder<'a> {
             let target = checked_rel(cursor + 4, rel)?;
             let inner = ValueRep::from_raw(self.u64_at(target)?);
             map.insert(key, self.decode_at_depth(inner, depth + 1)?);
-            cursor += 12;
+            cursor = target + 8;
         }
-        Ok(map)
+        Ok((map, cursor))
     }
 
     /// §16.3.10.26 index-element vectors: `[u64 count][count × u32]`.
@@ -607,10 +623,9 @@ impl<'a> ValueDecoder<'a> {
         // arc form; they are decoded for framing correctness.
         let mut cursor = off + 24;
         if with_custom_data {
-            let count = self.count_at(cursor, "reference custom data")?;
             // Walk the dictionary to find its end (and validate it).
-            let _ = self.decode_dictionary(cursor, depth)?;
-            cursor += 8 + count * 12;
+            let (_, end) = self.decode_dictionary_span(cursor, depth)?;
+            cursor = end;
         }
         let prim_path = if prim_path == "/" {
             std::string::String::new()

@@ -554,6 +554,7 @@ pub mod usd_to_scene;
 pub mod usda;
 pub mod usda_writer;
 pub mod usdc;
+pub mod usdc_encode;
 pub mod usdc_layer;
 pub mod usdc_values;
 pub mod usdc_writer;
@@ -564,7 +565,7 @@ pub mod zip_writer;
 pub use asset_source::ZipStoredAsset;
 pub use composition::{CompositionMode, CompositionRecord};
 pub use decoder::UsdzDecoder;
-pub use encoder::{EncodeReport, UsdzEncoder};
+pub use encoder::{EncodeReport, LayerFormat, UsdzEncoder};
 pub use error::{Error, Result};
 pub use point_instancer::PointInstancer;
 

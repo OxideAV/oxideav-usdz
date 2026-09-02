@@ -33,6 +33,18 @@ use crate::composition::{CompositionMode, CompositionRecord};
 use crate::usda_writer::{self, WriteOptions};
 use crate::zip_writer::Writer;
 
+/// Serialisation of the emitted root layer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LayerFormat {
+    /// `#usda 1.0` text (`scene.usda`) — the default.
+    #[default]
+    Usda,
+    /// Crate binary (`scene.usdc`) via [`crate::usdc_encode`]: the
+    /// same layer content the text writer produces, encoded per
+    /// §16.3.
+    Usdc,
+}
+
 /// USDZ encoder.
 ///
 /// Configuration-only wrapper — `&mut self` is required by the
@@ -41,6 +53,7 @@ use crate::zip_writer::Writer;
 #[derive(Debug, Default)]
 pub struct UsdzEncoder {
     composition: CompositionMode,
+    layer_format: LayerFormat,
 }
 
 impl UsdzEncoder {
@@ -65,6 +78,18 @@ impl UsdzEncoder {
     /// The configured [`CompositionMode`].
     pub fn composition(&self) -> CompositionMode {
         self.composition
+    }
+
+    /// Choose the root layer's serialisation: text (default) or the
+    /// Crate binary form.
+    pub fn with_layer_format(mut self, format: LayerFormat) -> Self {
+        self.layer_format = format;
+        self
+    }
+
+    /// The configured [`LayerFormat`].
+    pub fn layer_format(&self) -> LayerFormat {
+        self.layer_format
     }
 
     /// Encode and return the assembled USDZ archive bytes.
@@ -109,9 +134,21 @@ impl UsdzEncoder {
         // renamed onto the text extension we emit.
         let root_name = record
             .as_ref()
-            .map(|r| root_layer_entry_name(&r.root_layer))
-            .unwrap_or_else(|| usda_writer::DEFAULT_ROOT_LAYER_NAME.to_owned());
-        writer.try_add_stored(&root_name, usda.as_bytes())?;
+            .map(|r| root_layer_entry_name(&r.root_layer, self.layer_format))
+            .unwrap_or_else(|| match self.layer_format {
+                LayerFormat::Usda => usda_writer::DEFAULT_ROOT_LAYER_NAME.to_owned(),
+                LayerFormat::Usdc => "scene.usdc".to_owned(),
+            });
+        let root_bytes: Vec<u8> = match self.layer_format {
+            LayerFormat::Usda => usda.clone().into_bytes(),
+            LayerFormat::Usdc => {
+                // The text writer is the one typed-model → layer
+                // mapping; the Crate encoder serialises that layer.
+                let layer = crate::usda::parse(usda.as_bytes())?;
+                crate::usdc_encode::encode_layer(&layer)?
+            }
+        };
+        writer.try_add_stored(&root_name, &root_bytes)?;
         let mut names_taken: Vec<String> = vec![root_name.clone()];
 
         let mut pass_through_textures = 0usize;
@@ -173,6 +210,7 @@ impl UsdzEncoder {
             bytes: writer.try_finish()?,
             usda,
             root_layer_name: root_name,
+            layer_format: self.layer_format,
             texture_names,
             pass_through_textures,
             reencoded_textures,
@@ -184,15 +222,24 @@ impl UsdzEncoder {
     }
 }
 
-/// Entry name for the emitted (text) root layer given the source
-/// root's name: `.usdc` becomes `.usda`; `.usd` / `.usda` stay (the
-/// generic extension dispatches on the header bytes).
-fn root_layer_entry_name(source: &str) -> String {
+/// Entry name for the emitted root layer given the source root's
+/// name and the output format: the extension follows the format
+/// (`.usda` / `.usdc`), a generic `.usd` stays (it dispatches on the
+/// header bytes).
+fn root_layer_entry_name(source: &str, format: LayerFormat) -> String {
     if source.is_empty() {
-        return usda_writer::DEFAULT_ROOT_LAYER_NAME.to_owned();
+        return match format {
+            LayerFormat::Usda => usda_writer::DEFAULT_ROOT_LAYER_NAME.to_owned(),
+            LayerFormat::Usdc => "scene.usdc".to_owned(),
+        };
     }
     match source.rsplit_once('.') {
-        Some((stem, ext)) if ext.eq_ignore_ascii_case("usdc") => format!("{stem}.usda"),
+        Some((stem, ext)) if ext.eq_ignore_ascii_case("usdc") && format == LayerFormat::Usda => {
+            format!("{stem}.usda")
+        }
+        Some((stem, ext)) if ext.eq_ignore_ascii_case("usda") && format == LayerFormat::Usdc => {
+            format!("{stem}.usdc")
+        }
         _ => source.to_owned(),
     }
 }
@@ -213,9 +260,11 @@ pub struct EncodeReport {
     /// the archive.
     pub usda: String,
     /// Archive entry name the root layer was written under
-    /// (`scene.usda` unless a preserved composition record named the
-    /// source root).
+    /// (`scene.usda` / `scene.usdc` unless a preserved composition
+    /// record named the source root).
     pub root_layer_name: String,
+    /// The root layer's serialisation.
+    pub layer_format: LayerFormat,
     /// Inner-file names emitted into the archive for textures, in
     /// the order they were embedded.
     pub texture_names: Vec<String>,

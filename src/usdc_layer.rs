@@ -53,6 +53,8 @@ pub fn layer_from_usdc(bytes: &[u8]) -> Result<Layer> {
     let paths = decoder.paths();
 
     let mut layer_metadata: BTreeMap<String, Value> = BTreeMap::new();
+    // The pseudo-root's `primChildren` orders the root prims.
+    let mut root_order: Vec<String> = Vec::new();
     // Prim builds keyed by full path, in spec order.
     let mut prims: BTreeMap<String, PrimBuild> = BTreeMap::new();
     let mut prim_order: Vec<String> = Vec::new();
@@ -74,18 +76,41 @@ pub fn layer_from_usdc(bytes: &[u8]) -> Result<Layer> {
             FORM_LAYER => {
                 for (name, rep) in &spec.fields {
                     if name == "primChildren" {
-                        // Ordering info — the root prims already appear
-                        // in walk order; the token vector adds nothing
-                        // the text form would carry.
+                        if let Value::Array(items) = decoder.decode(ValueRep::from_raw(*rep))? {
+                            root_order = items
+                                .into_iter()
+                                .filter_map(|v| v.as_text().map(str::to_owned))
+                                .collect();
+                        }
                         continue;
                     }
                     let value = decoder.decode(ValueRep::from_raw(*rep))?;
+                    // §16.3.10.27 `subLayerOffsets`: identity offsets
+                    // (0, 1) add nothing to the text form's `subLayers`
+                    // list; only non-identity offsets are kept.
+                    if name == "subLayerOffsets" {
+                        let identity = match &value {
+                            Value::Array(items) => items.iter().all(|t| {
+                                t.as_seq().is_some_and(|p| {
+                                    p.len() == 2
+                                        && p[0].as_f32() == Some(0.0)
+                                        && p[1].as_f32() == Some(1.0)
+                                })
+                            }),
+                            _ => false,
+                        };
+                        if identity {
+                            continue;
+                        }
+                    }
                     // §7.6.1.2.4 names the layer field `layerRelocates`;
                     // the text form (§16.2.18.5) spells it `relocates`.
-                    let key = if name == "layerRelocates" {
-                        "relocates".to_owned()
-                    } else {
-                        name.clone()
+                    let key = match name.as_str() {
+                        "layerRelocates" => "relocates".to_owned(),
+                        // §7.6: the `doc` text keyword is the
+                        // `documentation` field.
+                        "documentation" => "doc".to_owned(),
+                        _ => name.clone(),
                     };
                     layer_metadata.insert(key, value);
                 }
@@ -213,6 +238,7 @@ pub fn layer_from_usdc(bytes: &[u8]) -> Result<Layer> {
             }
         }
     }
+    let roots = finish_children(roots, &root_order);
 
     Ok(Layer {
         metadata: layer_metadata,
@@ -316,6 +342,11 @@ fn build_prim(path: &str, spec: &NamedSpec, decoder: &ValueDecoder<'_>) -> Resul
                 build
                     .metadata
                     .insert("variantSets".to_owned(), decoder.decode(rep)?);
+            }
+            "documentation" => {
+                build
+                    .metadata
+                    .insert("doc".to_owned(), decoder.decode(rep)?);
             }
             other => {
                 build
@@ -483,7 +514,14 @@ fn attach_relationship(
     for (fname, rep) in &spec.fields {
         let rep = ValueRep::from_raw(*rep);
         match fname.as_str() {
-            "targetPaths" => targets = flatten_path_listop(decoder.decode(rep)?),
+            "targetPaths" => {
+                targets = match flatten_path_listop(decoder.decode(rep)?) {
+                    // An explicit empty target list is the text form's
+                    // bare `rel name` declaration.
+                    Value::Array(items) if items.is_empty() => Value::None,
+                    other => other,
+                }
+            }
             // Relationships are uniform by definition (§16.2.16.7);
             // the authored variability adds nothing to the text form.
             "variability" => {}

@@ -33,6 +33,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0.11.0; composition applies each entry per §10.3.2.6 (audit on
   `Scene3D::extras["usd:composedRelocates"]`), the flattening writer
   prunes applied entries and the preserving writer re-authors them.
+- Typed Crate writer (`usdc_encode::encode_layer`) — the §16.3 binary
+  form of the text model (path tree, every spec form, every value
+  encoding incl. relocates and splines, lowest-needed version stamp),
+  and `UsdzEncoder::with_layer_format(LayerFormat::Usdc)` to package a
+  `.usdc` root layer; `CrateImage` now carries the value region and
+  the version, so the structural round trip is byte-exact including
+  values.
+- Crate reader: dictionary members are read as production files chain
+  them (payload between the `i64` link and the rep word, next member
+  after the rep); `documentation` surfaces as the text `doc` keyword;
+  identity `subLayerOffsets` are dropped; root prims follow the
+  pseudo-root's `primChildren`; an empty relationship target list is
+  the bare `rel` declaration.
 - Cross-package `@pkg.usdz[path/within.usd]@` selectors (and bare
   `@pkg.usdz@` = the package's default layer) resolve when the sibling
   package is an entry of the archive being read: inner entries are

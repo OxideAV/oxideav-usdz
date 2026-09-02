@@ -157,6 +157,8 @@ fn crate_with_spline() -> Vec<u8> {
         spec_path_indices: vec![0, 1, 2],
         spec_fieldset_indices: vec![3, 3, 0],
         spec_types: vec![7, 6, 1],
+        version: Version::V0_12_0,
+        values: Vec::new(),
     };
     let base = image.to_bytes().expect("serialise");
     let shift = blob.len() as u64;

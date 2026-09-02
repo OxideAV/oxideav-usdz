@@ -392,6 +392,13 @@ impl Version {
     }
 }
 
+impl Default for Version {
+    /// `0.8.0` — the version a freshly built image is stamped with.
+    fn default() -> Self {
+        Version::V0_8_0
+    }
+}
+
 impl fmt::Display for Version {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}.{}.{}", self.major, self.minor, self.patch)

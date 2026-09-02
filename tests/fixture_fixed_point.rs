@@ -13,7 +13,7 @@ mod common;
 
 use common::{build_usdz, UsdzEntry};
 use oxideav_mesh3d::{Mesh3DDecoder, Scene3D};
-use oxideav_usdz::{CompositionMode, UsdzDecoder, UsdzEncoder};
+use oxideav_usdz::{CompositionMode, LayerFormat, UsdzDecoder, UsdzEncoder};
 
 fn fixture(name: &str) -> Option<Vec<u8>> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -234,23 +234,32 @@ fn digest_fields(a: &Digest, b: &Digest) -> Vec<(&'static str, String, String)> 
 
 fn cycle(archive: &[u8], label: &str) -> (Scene3D, Scene3D) {
     let s1 = UsdzDecoder::new().decode(archive).expect("first decode");
-    for mode in [CompositionMode::Flatten, CompositionMode::Preserve] {
-        let enc = UsdzEncoder::new().with_composition(mode);
+    for (mode, format) in [
+        (CompositionMode::Flatten, LayerFormat::Usda),
+        (CompositionMode::Preserve, LayerFormat::Usda),
+        (CompositionMode::Flatten, LayerFormat::Usdc),
+    ] {
+        let enc = UsdzEncoder::new()
+            .with_composition(mode)
+            .with_layer_format(format);
         let out1 = enc.encode_bytes(&s1).expect("first encode");
         let s2 = UsdzDecoder::new().decode(&out1).expect("second decode");
         let out2 = enc.encode_bytes(&s2).expect("second encode");
         assert_eq!(
             out1.len(),
             out2.len(),
-            "{label} ({mode:?}): second package size differs"
+            "{label} ({mode:?}, {format:?}): second package size differs"
         );
-        assert!(out1 == out2, "{label} ({mode:?}): second encode diverged");
+        assert!(
+            out1 == out2,
+            "{label} ({mode:?}, {format:?}): second encode diverged"
+        );
         let d1 = digest(&s1);
         let d2 = digest(&s2);
         for (name, a, b) in digest_fields(&d1, &d2) {
             assert_eq!(
                 a, b,
-                "{label} ({mode:?}): `{name}` degraded across the cycle"
+                "{label} ({mode:?}, {format:?}): `{name}` degraded across the cycle"
             );
         }
         // Positions survive exactly.

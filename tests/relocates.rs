@@ -214,6 +214,8 @@ fn crate_with_relocates() -> Vec<u8> {
         spec_path_indices: vec![0, 1, 2, 3],
         spec_fieldset_indices: vec![0, 2, 2, 2],
         spec_types: vec![7, 6, 6, 6],
+        version: Version::V0_11_0,
+        values: Vec::new(),
     };
     let base = image.to_bytes().expect("serialise");
 

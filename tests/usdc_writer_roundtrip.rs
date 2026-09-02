@@ -144,6 +144,7 @@ fn synthetic_image_round_trips() {
         spec_path_indices: vec![0, 1, 2],
         spec_fieldset_indices: vec![0, 2, 2],
         spec_types: vec![1, 6, 7],
+        ..Default::default()
     };
 
     let written = image.to_bytes().expect("serialise synthetic image");

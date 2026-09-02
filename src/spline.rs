@@ -382,6 +382,103 @@ impl Spline {
         })
     }
 
+    /// Encode the §16.3.10.33 spline-data run (the bytes after the
+    /// leading byte count; the custom-data list is the caller's).
+    /// Inverse of [`Self::from_crate_bytes`]; a text-parsed spline
+    /// with knots but no data type is written as double.
+    pub fn to_crate_data(&self) -> Vec<u8> {
+        let data_type = match self.data_type {
+            DataType::Unspecified if !self.knots.is_empty() => DataType::Double,
+            other => other,
+        };
+        let dt_code: u8 = match data_type {
+            DataType::Unspecified => 0,
+            DataType::Double => 1,
+            DataType::Float => 2,
+            DataType::Half => 3,
+        };
+        let mut out = Vec::new();
+        out.push(
+            0x01 | (dt_code << 4)
+                | if self.timed_value { 0x40 } else { 0 }
+                | if self.curve_type == CurveType::Hermite {
+                    0x80
+                } else {
+                    0
+                },
+        );
+        let code_of = |e: ExtrapolationMode| -> u8 {
+            match e {
+                ExtrapolationMode::None => 0,
+                ExtrapolationMode::Held => 1,
+                ExtrapolationMode::Linear => 2,
+                ExtrapolationMode::Sloped(_) => 3,
+                ExtrapolationMode::LoopRepeat => 4,
+                ExtrapolationMode::LoopReset => 5,
+                ExtrapolationMode::LoopOscillate => 6,
+            }
+        };
+        out.push(
+            code_of(self.pre)
+                | (code_of(self.post) << 3)
+                | if self.loop_params.is_some() { 0x40 } else { 0 },
+        );
+        if let ExtrapolationMode::Sloped(sl) = self.pre {
+            out.extend_from_slice(&sl.to_le_bytes());
+        }
+        if let ExtrapolationMode::Sloped(sl) = self.post {
+            out.extend_from_slice(&sl.to_le_bytes());
+        }
+        if let Some(l) = &self.loop_params {
+            out.extend_from_slice(&l.proto_start.to_le_bytes());
+            out.extend_from_slice(&l.proto_end.to_le_bytes());
+            out.extend_from_slice(&l.pre_loops.to_le_bytes());
+            out.extend_from_slice(&l.post_loops.to_le_bytes());
+            out.extend_from_slice(&l.value_offset.to_le_bytes());
+        }
+        if data_type == DataType::Unspecified {
+            return out;
+        }
+        let put_value = |out: &mut Vec<u8>, v: f64| match data_type {
+            DataType::Unspecified | DataType::Double => out.extend_from_slice(&v.to_le_bytes()),
+            DataType::Float => out.extend_from_slice(&(v as f32).to_le_bytes()),
+            DataType::Half => {
+                out.extend_from_slice(&crate::usdc_encode::f32_to_half(v as f32).to_le_bytes())
+            }
+        };
+        out.extend_from_slice(&(self.knots.len() as u32).to_le_bytes());
+        for k in &self.knots {
+            let hermite = k.hermite || self.curve_type == CurveType::Hermite;
+            let interp = k.interpolation_code.unwrap_or(match k.post_interpolation {
+                InterpolationMode::None => 0,
+                InterpolationMode::Held => 1,
+                InterpolationMode::Linear => 2,
+                InterpolationMode::Curve => 3,
+            });
+            out.push(
+                u8::from(k.pre_value.is_some())
+                    | ((interp & 3) << 1)
+                    | if hermite { 0x08 } else { 0 }
+                    | if k.pre_tangent_maya_form { 0x10 } else { 0 }
+                    | if k.post_tangent_maya_form { 0x20 } else { 0 },
+            );
+            out.extend_from_slice(&k.time.to_le_bytes());
+            put_value(&mut out, k.value);
+            if let Some(pre) = k.pre_value {
+                put_value(&mut out, pre);
+            }
+            if !hermite {
+                let pre_w = k.pre_tangent.and_then(|t| t.width).unwrap_or(0.0);
+                let post_w = k.post_tangent.and_then(|t| t.width).unwrap_or(0.0);
+                out.extend_from_slice(&pre_w.to_le_bytes());
+                out.extend_from_slice(&post_w.to_le_bytes());
+            }
+            put_value(&mut out, k.pre_tangent.map_or(0.0, |t| t.slope));
+            put_value(&mut out, k.post_tangent.map_or(0.0, |t| t.slope));
+        }
+        out
+    }
+
     /// Render the §16.2.13 `SplineMap` literal.
     pub fn to_usda(&self) -> String {
         let mut items: Vec<String> = Vec::new();
@@ -776,6 +873,35 @@ mod tests {
         // Text rendering re-parses to the same knots.
         let text = s.to_usda();
         assert!(text.starts_with("{ bezier, pre: sloped(0.5), post: held, loop: (1, 10, 2, 3, 0.25), 1: -1 & 0; pre (1, 2); post curve (1.5, 2.5), 5: 3.25; pre (0); post held (0); { string note = \"hi\" } }"), "{text}");
+    }
+
+    #[test]
+    fn crate_data_round_trips_through_the_decoder() {
+        let s = Spline::from_crate_bytes(&bezier_double_bytes(), Vec::new()).unwrap();
+        assert_eq!(s.to_crate_data(), bezier_double_bytes());
+        let back = Spline::from_crate_bytes(&s.to_crate_data(), Vec::new()).unwrap();
+        assert_eq!(back, s);
+        // A text-parsed spline (no codes, unspecified type) encodes as
+        // double with the §7.4.2.4.2-order interpolation codes.
+        let mut text = Spline {
+            curve_type: CurveType::Hermite,
+            ..Default::default()
+        };
+        text.knots.push(Knot {
+            time: 2.0,
+            value: 1.5,
+            post_interpolation: InterpolationMode::Linear,
+            pre_tangent: Some(Tangent {
+                width: None,
+                slope: 0.25,
+            }),
+            ..Default::default()
+        });
+        let back = Spline::from_crate_bytes(&text.to_crate_data(), Vec::new()).unwrap();
+        assert_eq!(back.data_type, DataType::Double);
+        assert_eq!(back.knots[0].post_interpolation, InterpolationMode::Linear);
+        assert_eq!(back.knots[0].pre_tangent.unwrap().slope, 0.25);
+        assert!(back.knots[0].hermite);
     }
 
     #[test]

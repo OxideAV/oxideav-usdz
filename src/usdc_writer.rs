@@ -56,6 +56,14 @@ use crate::usdc::{
 /// the matching `decode_*` reader method returns.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CrateImage {
+    /// Bootstrap version stamp (`0.8.0` for a fresh image; the typed
+    /// encoder raises it to the lowest §16.3.8.2 row its values need).
+    pub version: Version,
+    /// The value region: every byte between the bootstrap and the
+    /// first section — where offset-valued reps point. Serialised
+    /// right after the bootstrap, so offsets are preserved as long
+    /// as the region is carried verbatim.
+    pub values: Vec<u8>,
     /// §4.1 TOKENS — the string-atom pool. Every index in the other
     /// sections refers into this list.
     pub tokens: Vec<String>,
@@ -139,7 +147,23 @@ impl CrateImage {
         let spec_fieldset_indices = specs_sec.decode_fieldset_indices()?;
         let spec_types = specs_sec.decode_spec_types()?;
 
+        // The value region is whatever precedes the first section.
+        let first_section = file
+            .toc
+            .entries
+            .iter()
+            .map(|e| e.offset as usize)
+            .min()
+            .unwrap_or(file_bytes.len())
+            .min(file_bytes.len());
+        let values = file_bytes
+            .get(BOOTSTRAP_SIZE..first_section)
+            .unwrap_or_default()
+            .to_vec();
+
         Ok(Self {
+            version: file.bootstrap.version,
+            values,
             tokens,
             strings,
             fields,
@@ -219,10 +243,13 @@ impl CrateImage {
         // slot + 64 reserved) stay zero for now and tocOffset is
         // back-patched once the section payloads are placed.
         out[0..8].copy_from_slice(b"PXR-USDC");
-        let v = Version::V0_8_0;
+        let v = self.version;
         out[8] = v.major;
         out[9] = v.minor;
         out[10] = v.patch;
+        // The value region sits between the bootstrap and the
+        // sections, exactly where the reps' offsets expect it.
+        out.extend_from_slice(&self.values);
 
         // Append section payloads, recording each (offset, size).
         let mut placed: Vec<(SectionName, u64, u64)> = Vec::with_capacity(6);

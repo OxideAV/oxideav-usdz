@@ -292,7 +292,7 @@ typed matrices; `f32` data prints the shortest round-trip digits and
 `f64` values (timeCodes included) the §16.2.5 double-precision
 spelling, `-0` normalised.
 
-## USDC (binary crate file) — full reader + structural writer
+## USDC (binary crate file) — full reader + typed writer
 
 A clean-room Crate reader implemented from the AOUSD *USD Core
 Specification* 1.0.1 §16.3 (staged in `docs/3d/usd/`), cross-checked
@@ -349,11 +349,37 @@ generic `.usd` layer dispatches on its header byte run (§16.1:
   UsdPreviewSurface networks, skinned meshes, 27-joint skeleton,
   sampled animation, and spatial audio, `Scene3D::validate()`-clean.
 - **Structural writer** — `usdc_writer::CrateImage` re-emits a
-  parsed `.usdc` (bootstrap, six section payloads in canonical
-  order, tail TOC) byte-exactly on the committed fixture, and
-  supports read-modify-write (token interning + field authoring).
-  Value reps ride through the writer losslessly as raw words — a
-  typed value *writer* is not implemented yet.
+  parsed `.usdc` (bootstrap, value region, six section payloads in
+  canonical order, tail TOC) byte-exactly on the committed fixture,
+  and supports read-modify-write (token interning + field
+  authoring).
+- **Typed writer** — `usdc_encode::encode_layer` serialises the
+  text model (`usda::Layer`) into the §16.3 binary form: the
+  §16.3.8.4.5 path tree (prims, properties, `{set=}` /
+  `{set=sel}` variant elements, every path a value points at)
+  walked with the §16.3.8.4.5.4 jump codes; one spec per authored
+  path (Layer / Prim / Attribute / Relationship / VariantSet /
+  Variant forms with `specifier`, `typeName`, `primChildren`,
+  `properties`, `variantSetNames` / `variantSetChildren` /
+  `variantSelection` / `variantChildren`, `default`,
+  `timeSamples`, `connectionPaths`, `targetPaths`, `spline`,
+  `custom`, `variability`, metadata, `subLayers` +
+  `subLayerOffsets`, `documentation`, `layerRelocates`); and every
+  §16.3.9 / §16.3.10 value encoding — the inlining rules (4-byte
+  scalars, pool indices, int8 vectors, matrix diagonals, empty
+  dictionaries), offset scalars, arrays, dictionaries (members
+  chained after their `i64` link, as production files lay them
+  out), the six-sublist list operations, reference / payload
+  records, variant-selection maps, time samples, token / string /
+  path vectors, relocates (0.11) and splines (0.12). The attribute
+  type token selects the wire type (`point3f[]` → `Vec3f[]`,
+  `half3[]` → `Vec3h[]`, …), untyped metadata encodes from its
+  shape, and the file is stamped with the lowest §16.3.8.2 row its
+  content needs. `UsdzEncoder::new().with_layer_format
+  (LayerFormat::Usdc)` packages a `.usdc` root layer; `usdcat`
+  reads our output and `usdchecker` passes the package where the
+  tools are installed, and the staged fixtures are one-cycle fixed
+  points through the Crate form.
 
 Variant / VariantSet spec forms (10/11) bridge into the text
 model's `variantSet` blocks — the `{set=sel}` selector paths fold
