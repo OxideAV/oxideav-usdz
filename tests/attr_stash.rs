@@ -41,6 +41,15 @@ def Xform "Root" (
         int[] faceVertexCounts = [3]
         int[] faceVertexIndices = [0, 1, 2]
         point3f[] points = [(0,0,0), (1,0,0), (0,1,0)]
+        float3[] extent = [(0, 0, 0), (1, 1, 0)]
+        custom string userProperties:origin = "modeller"
+        float primvars:roughnessScale = 0.75 (
+            interpolation = "constant"
+        )
+        float[] primvars:perFace = [1] (
+            interpolation = "uniform"
+        )
+        int[] holeIndices = []
     }
 }
 "#;
@@ -96,8 +105,22 @@ fn unconsumed_properties_survive_the_round_trip() {
     assert!(cube_attrs.contains_key("size"));
     assert!(cube_attrs.contains_key("primvars:displayColor"));
 
+    // Gprim properties: unmodelled scalars stay, topology-indexed
+    // arrays and `extent` do not.
+    let tri = s1.meshes[0].primitives[0].extras["usd:attrs"]["attrs"]
+        .as_object()
+        .unwrap();
+    assert!(tri.contains_key("userProperties:origin"));
+    assert!(tri.contains_key("primvars:roughnessScale"));
+    for dropped in ["extent", "primvars:perFace", "holeIndices", "points"] {
+        assert!(!tri.contains_key(dropped), "{dropped} must not be stashed");
+    }
+
     let r1 = UsdzEncoder::new().encode_with_report(&s1).unwrap();
+    assert!(!r1.usda.contains("primvars:perFace"), "{}", r1.usda);
     for needle in [
+        "custom string userProperties:origin = \"modeller\"",
+        "float primvars:roughnessScale = 0.75 (interpolation = \"constant\")",
         "token visibility = \"invisible\"",
         "uniform token purpose = \"render\"",
         "custom float myTool:weight = 0.5",

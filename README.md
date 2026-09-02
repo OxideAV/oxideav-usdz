@@ -277,8 +277,12 @@ attributes, `visibility` / `purpose`, tool namespaces, time-sampled
 scalars on containers — rides on `Node::extras["usd:attrs"]` (the
 tagged `Attr` codec) and replays verbatim; an unknown-schema prim
 (`Cube`, `Camera`, a light) keeps its type token, transform, whole
-body and children the same way, so nothing authored is dropped by a
-USDZ → `Scene3D` → USDZ pass.
+body and children the same way. On gprims the same stash sits on
+`Primitive::extras["usd:attrs"]` for what is not topology-indexed
+(custom scalars, constant primvars); per-face / per-vertex primvars,
+hole / crease / corner tables and `extent` are left out because the
+writer emits re-triangulated topology those arrays would no longer
+describe.
 
 ### Round-trip fidelity
 

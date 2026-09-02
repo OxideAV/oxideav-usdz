@@ -238,6 +238,7 @@ fn cycle(archive: &[u8], label: &str) -> (Scene3D, Scene3D) {
         (CompositionMode::Flatten, LayerFormat::Usda),
         (CompositionMode::Preserve, LayerFormat::Usda),
         (CompositionMode::Flatten, LayerFormat::Usdc),
+        (CompositionMode::Preserve, LayerFormat::Usdc),
     ] {
         let enc = UsdzEncoder::new()
             .with_composition(mode)

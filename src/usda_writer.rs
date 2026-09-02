@@ -1737,6 +1737,8 @@ fn write_one_mesh_prim(
         w.write_indent();
         writeln!(w.s, "uniform bool doubleSided = 1").unwrap();
     }
+    // Unmodelled gprim properties replay verbatim.
+    replay_attr_stash(w, &prim.extras, "usd:attrs");
     write_material_binding(w, scene, prim.material, &prim.extras);
     // UsdSkel BindingAPI (§1.5 / §1.6): the skeleton relationship
     // plus the per-vertex joint influences in the canonical layout

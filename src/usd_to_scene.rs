@@ -1915,6 +1915,67 @@ fn collect_unconsumed_attrs(prim: &Prim, type_name: &str) -> BTreeMap<String, At
         .collect()
 }
 
+/// See [`apply_mesh_metadata_to_primitive`].
+fn collect_unconsumed_gprim_attrs(prim: &Prim) -> BTreeMap<String, Attr> {
+    const CONSUMED: [&str; 22] = [
+        "points",
+        "normals",
+        "faceVertexCounts",
+        "faceVertexIndices",
+        "subdivisionScheme",
+        "doubleSided",
+        "extent",
+        "holeIndices",
+        "cornerIndices",
+        "cornerSharpnesses",
+        "creaseIndices",
+        "creaseLengths",
+        "creaseSharpnesses",
+        "curveVertexCounts",
+        "widths",
+        "type",
+        "wrap",
+        "basis",
+        "velocities",
+        "accelerations",
+        "orientation",
+        "ids",
+    ];
+    prim.attrs
+        .iter()
+        .filter(|(name, attr)| {
+            let base = name.split('.').next().unwrap_or(name);
+            if CONSUMED.contains(&base)
+                || name.starts_with("xformOp:")
+                || base == "xformOpOrder"
+                || base == "material:binding"
+                || name.starts_with("material:binding:")
+                || name.starts_with("collection:")
+                || name.starts_with("skel:")
+                || name.starts_with("primvars:skel:")
+                || name.starts_with("primvars:st")
+                || name.starts_with("primvars:normals")
+                || name.starts_with("primvars:displayColor")
+                || name.starts_with("primvars:displayOpacity")
+            {
+                return false;
+            }
+            // A primvar is topology-indexed unless constant.
+            if name.starts_with("primvars:") {
+                let constant = attr
+                    .metadata
+                    .get("interpolation")
+                    .and_then(|v| v.as_text())
+                    .is_none_or(|i| i == "constant");
+                let is_array = attr.type_token.contains("[]");
+                return constant && !is_array || !is_array;
+            }
+            true
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
 fn collect_binding_attrs(prim: &Prim) -> BTreeMap<String, Attr> {
     prim.attrs
         .iter()
@@ -4789,6 +4850,18 @@ fn apply_material_binding(
 /// per-Mesh transform path) into a JSON-shaped
 /// `usd:mesh_transform = {"matrix": [[...], …]}` extras entry.
 fn apply_mesh_metadata_to_primitive(prim: &Prim, out: &mut Primitive) {
+    // Authored gprim properties the typed pipeline does not consume
+    // and the writer does not synthesise (custom scalars, tool
+    // namespaces, constant primvars) ride on `usd:attrs`; anything
+    // indexed by the authored topology (per-face / per-vertex
+    // primvars, hole / crease / corner tables, `extent`) is left out
+    // — the writer emits re-triangulated topology those arrays would
+    // no longer describe.
+    let unconsumed = collect_unconsumed_gprim_attrs(prim);
+    if !unconsumed.is_empty() {
+        out.extras
+            .insert("usd:attrs".into(), binding_stash_json(&unconsumed));
+    }
     if prim_no_fold(prim) {
         out.extras
             .insert("usd:no_fold".into(), serde_json::Value::Bool(true));

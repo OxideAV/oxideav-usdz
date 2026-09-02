@@ -37,7 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tool namespaces) and unknown-schema prim bodies (`Cube`, `Camera`,
   lights — transform, attributes, children) ride on
   `Node::extras["usd:attrs"]` and replay verbatim instead of being
-  dropped.
+  dropped; gprims keep their non-topology-indexed extras on
+  `Primitive::extras["usd:attrs"]` the same way.
 - Typed Crate writer (`usdc_encode::encode_layer`) — the §16.3 binary
   form of the text model (path tree, every spec form, every value
   encoding incl. relocates and splines, lowest-needed version stamp),
