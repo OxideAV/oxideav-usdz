@@ -19,6 +19,7 @@ and encoder for `.usdz` extension dispatch, or use `UsdzDecoder::new()` /
 use oxideav_usdz::{UsdzDecoder, UsdzEncoder};
 use oxideav_mesh3d::{Mesh3DDecoder, Mesh3DEncoder};
 
+let usdz_bytes = std::fs::read("model.usdz")?;
 let scene = UsdzDecoder::new().decode(&usdz_bytes)?;
 let out   = UsdzEncoder::new().encode(&scene)?;
 # Ok::<(), Box<dyn std::error::Error>>(())
