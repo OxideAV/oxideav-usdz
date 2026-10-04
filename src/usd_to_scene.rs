@@ -5139,7 +5139,8 @@ fn apply_preview_surface(
 
     // Displacement — scalar input preserved per-input so only the
     // authored opinion re-emits (no typed slot in the model).
-    for input in ["displacement"] {
+    {
+        let input = "displacement";
         if let Some(f) = scalar(&format!("inputs:{input}")) {
             if let Some(n) = serde_json::Number::from_f64(f as f64) {
                 mat.extras

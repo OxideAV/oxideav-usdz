@@ -3870,7 +3870,8 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
             .unwrap();
         }
     }
-    for input in ["displacement"] {
+    {
+        let input = "displacement";
         if let Some(f) = mat
             .extras
             .get(&format!("usd:inputs:{input}"))
