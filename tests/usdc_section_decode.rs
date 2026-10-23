@@ -98,7 +98,9 @@ fn fields_section_decodes_157_pairs_with_pinned_name_prefix() {
     // §4.3 publishes the first 21 decoded field-name token indices.
     assert_eq!(
         &names[..21],
-        &[1, 3, 4, 5, 6, 7, 8, 10, 12, 13, 10, 18, 13, 18, 13, 10, 13, 10, 18, 13, 18],
+        &[
+            1, 3, 4, 5, 6, 7, 8, 10, 12, 13, 10, 18, 13, 18, 13, 10, 13, 10, 18, 13, 18
+        ],
         "trace doc §4.3 name-index prefix (commonDelta preamble applied)"
     );
 }
@@ -390,11 +392,7 @@ fn path_construction_algorithm_rebuilds_all_fixture_paths() {
         let parent = if let Some(dot) = p.rfind('.') {
             &p[..dot]
         } else if let Some(slash) = p.rfind('/') {
-            if slash == 0 {
-                "/"
-            } else {
-                &p[..slash]
-            }
+            if slash == 0 { "/" } else { &p[..slash] }
         } else {
             unreachable!("absolute path {p} has a separator");
         };

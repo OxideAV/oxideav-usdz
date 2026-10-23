@@ -15,9 +15,9 @@
 mod common;
 
 use oxideav_usdz::usdc::{
-    Bootstrap, SectionName, TocEntry, BOOTSTRAP_SIZE, MAGIC, TOC_RECORD_SIZE,
+    BOOTSTRAP_SIZE, Bootstrap, MAGIC, SectionName, TOC_RECORD_SIZE, TocEntry,
 };
-use oxideav_usdz::{error::Error, UsdzDecoder};
+use oxideav_usdz::{UsdzDecoder, error::Error};
 
 /// Build a minimal valid USDC byte image with the requested section
 /// catalogue (each entry: `(name, payload_size_bytes)`).
@@ -31,7 +31,7 @@ fn synthetic_usdc(sections: &[(&[u8], usize)]) -> Vec<u8> {
     let mut recs: Vec<(Vec<u8>, u64, u64)> = Vec::new();
     for (name, size) in sections {
         let offset = buf.len() as u64;
-        buf.extend(std::iter::repeat(0xAB).take(*size));
+        buf.extend(std::iter::repeat_n(0xAB, *size));
         let mut padded = vec![0u8; 16];
         let n = (*name).len().min(16);
         padded[..n].copy_from_slice(&name[..n]);

@@ -20,7 +20,7 @@
 //! captured metadata. A future round can plug the extracted values
 //! back into `Scene3D::user_extras`.
 
-use oxideav_usdz::usda::{parse, Value};
+use oxideav_usdz::usda::{Value, parse};
 
 #[test]
 fn layer_metadata_typed_dict_literal() {

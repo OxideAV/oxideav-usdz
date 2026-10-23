@@ -204,9 +204,11 @@ fn prim_and_property_field_values_decode() {
                     let Some(Value::Array(items)) = &op.prepended else {
                         panic!("fixture apiSchemas are prepend-authored");
                     };
-                    assert!(items
-                        .iter()
-                        .all(|v| matches!(v, Value::Token(t) if !t.is_empty())));
+                    assert!(
+                        items
+                            .iter()
+                            .all(|v| matches!(v, Value::Token(t) if !t.is_empty()))
+                    );
                     saw_api_schemas = true;
                 }
                 "connectionPaths" | "targetPaths" => {

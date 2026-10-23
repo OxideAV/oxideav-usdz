@@ -29,7 +29,7 @@
 
 mod common;
 
-use common::{build_usdz, UsdzEntry};
+use common::{UsdzEntry, build_usdz};
 
 use oxideav_mesh3d::{Mesh3DDecoder, Mesh3DEncoder, Transform};
 use oxideav_usdz::{UsdzDecoder, UsdzEncoder};
@@ -134,9 +134,10 @@ def Xform "MarbleCollection" (
         .expect("composedReferences stamp");
     let arr = composed.as_array().expect("array");
     assert_eq!(arr.len(), 2, "two references composed");
-    assert!(arr
-        .iter()
-        .all(|v| v.as_str() == Some("Marble.usd|references")));
+    assert!(
+        arr.iter()
+            .all(|v| v.as_str() == Some("Marble.usd|references"))
+    );
 }
 
 #[test]

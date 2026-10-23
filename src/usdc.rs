@@ -238,8 +238,8 @@
 
 use core::fmt;
 
-use crate::error::{invalid, unsupported};
 use crate::Result;
+use crate::error::{invalid, unsupported};
 
 /// The 8-byte file signature observed at offset `0x00` of every
 /// `.usdc` sample.
@@ -2002,7 +2002,12 @@ impl<'a> FieldsSection<'a> {
             ))
         })?;
         let blob = self.reps_buffer()?.decompress_exact(want)?;
-        Ok(blob.chunks_exact(8).map(read_u64_le).collect())
+        Ok(blob
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
+            .collect())
     }
 
     /// Like [`decode_reps`](Self::decode_reps), but each raw `uint64`
@@ -4507,44 +4512,54 @@ mod tests {
         // not part of the dispatch key — a newer patch within a known
         // (major, minor) is read best-effort).
         assert!(Version::V0_8_0.is_readable());
-        assert!(Version {
-            major: 0,
-            minor: 8,
-            patch: 9,
-        }
-        .is_readable());
+        assert!(
+            Version {
+                major: 0,
+                minor: 8,
+                patch: 9,
+            }
+            .is_readable()
+        );
         // Older (major, minor): always readable.
-        assert!(Version {
-            major: 0,
-            minor: 7,
-            patch: 0,
-        }
-        .is_readable());
+        assert!(
+            Version {
+                major: 0,
+                minor: 7,
+                patch: 0,
+            }
+            .is_readable()
+        );
         // Newer minor within same major (9 and 10 are within the
         // ceiling now): readable.
-        assert!(Version {
-            major: 0,
-            minor: 9,
-            patch: 0,
-        }
-        .is_readable());
+        assert!(
+            Version {
+                major: 0,
+                minor: 9,
+                patch: 0,
+            }
+            .is_readable()
+        );
         assert!(Version::V0_10_0.is_readable());
         assert!(Version::V0_11_0.is_readable());
         assert!(Version::V0_12_0.is_readable());
         // Past the ceiling: refused.
-        assert!(!Version {
-            major: 0,
-            minor: 13,
-            patch: 0,
-        }
-        .is_readable());
+        assert!(
+            !Version {
+                major: 0,
+                minor: 13,
+                patch: 0,
+            }
+            .is_readable()
+        );
         // Newer major: refused even with a smaller minor.
-        assert!(!Version {
-            major: 1,
-            minor: 0,
-            patch: 0,
-        }
-        .is_readable());
+        assert!(
+            !Version {
+                major: 1,
+                minor: 0,
+                patch: 0,
+            }
+            .is_readable()
+        );
     }
 
     #[test]
@@ -4556,30 +4571,38 @@ mod tests {
             minor: 2,
             patch: 0,
         };
-        assert!(Version {
-            major: 1,
-            minor: 2,
-            patch: 5,
-        }
-        .is_readable_by(reader));
-        assert!(Version {
-            major: 0,
-            minor: 99,
-            patch: 0,
-        }
-        .is_readable_by(reader));
-        assert!(!Version {
-            major: 1,
-            minor: 3,
-            patch: 0,
-        }
-        .is_readable_by(reader));
-        assert!(!Version {
-            major: 2,
-            minor: 0,
-            patch: 0,
-        }
-        .is_readable_by(reader));
+        assert!(
+            Version {
+                major: 1,
+                minor: 2,
+                patch: 5,
+            }
+            .is_readable_by(reader)
+        );
+        assert!(
+            Version {
+                major: 0,
+                minor: 99,
+                patch: 0,
+            }
+            .is_readable_by(reader)
+        );
+        assert!(
+            !Version {
+                major: 1,
+                minor: 3,
+                patch: 0,
+            }
+            .is_readable_by(reader)
+        );
+        assert!(
+            !Version {
+                major: 2,
+                minor: 0,
+                patch: 0,
+            }
+            .is_readable_by(reader)
+        );
     }
 
     /// Build a minimal valid USDC byte image: bootstrap, one TOKENS
@@ -5698,7 +5721,7 @@ mod tests {
         bytes.extend_from_slice(&1u64.to_le_bytes()); // numFields
         bytes.extend_from_slice(&0u64.to_le_bytes()); // names csize = 0
         bytes.extend_from_slice(&100u64.to_le_bytes()); // reps csize = 100
-                                                        // No reps payload bytes — section ends here.
+        // No reps payload bytes — section ends here.
         let err = FieldsSection::parse(&bytes).expect_err("oversize reps csize must fail");
         let msg = format!("{err:?}");
         assert!(
@@ -5780,7 +5803,11 @@ mod tests {
         assert_eq!(sec.reps_buffer_bytes.len() as u64, sec.reps_compressed_size);
         // Total footprint: 8 + 8 + 141 + 8 + 833 = 998.
         assert_eq!(
-            FieldsHeader::SIZE as u64 + 8 + sec.names_compressed_size + 8 + sec.reps_compressed_size,
+            FieldsHeader::SIZE as u64
+                + 8
+                + sec.names_compressed_size
+                + 8
+                + sec.reps_compressed_size,
             entry.size,
             "header(8) + csize₁ prefix(8) + csize₁ + csize₂ prefix(8) + csize₂ must equal section size",
         );
@@ -6061,8 +6088,8 @@ mod tests {
         let mut f = vec![0u8; BOOTSTRAP_SIZE];
         let carr_off = f.len();
         f.extend_from_slice(&(elements.len() as u64).to_le_bytes()); // count
-                                                                     // §16.3.7.2.3: the compressed stream opens with its u64
-                                                                     // compressedSize, then the §3a block.
+        // §16.3.7.2.3: the compressed stream opens with its u64
+        // compressedSize, then the §3a block.
         f.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
         f.extend_from_slice(&compressed);
         let toc_off = f.len() as u64;
@@ -6176,13 +6203,13 @@ mod tests {
         for r in &reps {
             if r.value_type() == Some(ValueType::Matrix4d) && r.is_array() && !r.is_compressed() {
                 let region = file.value_region(*r, &bytes).expect("resolve");
-                if let ValueRegion::Array { count, .. } = region {
-                    if let Some(elems) = region.array_elements_exact(128) {
-                        assert_eq!(elems.len() as u64, count * 128);
-                        let first = f64::from_le_bytes(elems[0..8].try_into().unwrap());
-                        if first == 1.0 {
-                            saw_identity_lead = true;
-                        }
+                if let ValueRegion::Array { count, .. } = region
+                    && let Some(elems) = region.array_elements_exact(128)
+                {
+                    assert_eq!(elems.len() as u64, count * 128);
+                    let first = f64::from_le_bytes(elems[0..8].try_into().unwrap());
+                    if first == 1.0 {
+                        saw_identity_lead = true;
                     }
                 }
             }
@@ -6470,7 +6497,7 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&1u64.to_le_bytes()); // count
         bytes.extend_from_slice(&100u64.to_le_bytes()); // csize
-        bytes.extend(std::iter::repeat(0u8).take(50));
+        bytes.extend(std::iter::repeat_n(0u8, 50));
         let err = FieldSetsSection::parse(&bytes).expect_err("short body must fail");
         let msg = format!("{err:?}");
         assert!(

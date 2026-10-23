@@ -17,7 +17,7 @@
 
 mod common;
 
-use oxideav_usdz::{usda::parse, UsdzDecoder, UsdzEncoder};
+use oxideav_usdz::{UsdzDecoder, UsdzEncoder, usda::parse};
 
 fn build_usdz(usda: &str) -> Vec<u8> {
     common::build_usdz(&[common::UsdzEntry {

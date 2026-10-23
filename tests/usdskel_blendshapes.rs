@@ -227,12 +227,16 @@ fn writer_emits_blend_shape_prims() {
         "BlendShape prim (channel name) must re-emit:\n{}",
         report.usda
     );
-    assert!(report
-        .usda
-        .contains("uniform token[] skel:blendShapes = [\"smile\", \"frown\"]"));
+    assert!(
+        report
+            .usda
+            .contains("uniform token[] skel:blendShapes = [\"smile\", \"frown\"]")
+    );
     assert!(report.usda.contains("rel skel:blendShapeTargets = ["));
     assert!(report.usda.contains("blendShapeWeights.timeSamples"));
-    assert!(report
-        .usda
-        .contains("uniform token[] blendShapes = [\"smile\", \"frown\"]"));
+    assert!(
+        report
+            .usda
+            .contains("uniform token[] blendShapes = [\"smile\", \"frown\"]")
+    );
 }

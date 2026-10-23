@@ -27,7 +27,7 @@ mod common;
 
 use std::process::Command;
 
-use common::{build_usdz, UsdzEntry};
+use common::{UsdzEntry, build_usdz};
 use oxideav_mesh3d::{Mesh3DDecoder, Scene3D, Transform};
 use oxideav_usdz::{CompositionMode, CompositionRecord, UsdzDecoder, UsdzEncoder};
 
@@ -798,10 +798,11 @@ over "VariantFixture"
         vec!["crate-variant-specs.usdc".to_string()]
     );
     let (_, s2) = preserve_fixed_point(&src);
-    assert!(s2
-        .nodes
-        .iter()
-        .any(|n| n.name.as_deref() == Some("VariantFixture")));
+    assert!(
+        s2.nodes
+            .iter()
+            .any(|n| n.name.as_deref() == Some("VariantFixture"))
+    );
 }
 
 // ---------------------------------------------------------------- scenes without a record

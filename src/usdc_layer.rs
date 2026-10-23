@@ -31,11 +31,11 @@
 
 use std::collections::BTreeMap;
 
+use crate::Result;
 use crate::error::invalid;
 use crate::usda::{Attr, Layer, ListOp, Prim, Value, Variant};
 use crate::usdc::{NamedSpec, UsdcFile, ValueRep};
 use crate::usdc_values::ValueDecoder;
-use crate::Result;
 
 /// §16.3.8.4.6 spec forms.
 const FORM_ATTRIBUTE: i32 = 1;
@@ -232,10 +232,10 @@ pub fn layer_from_usdc(bytes: &[u8]) -> Result<Layer> {
     // Roots in original spec order.
     let mut roots = Vec::new();
     for path in &prim_order {
-        if let Some(build) = prims.remove(path) {
-            if let Some(prim) = build.finished {
-                roots.push(prim);
-            }
+        if let Some(build) = prims.remove(path)
+            && let Some(prim) = build.finished
+        {
+            roots.push(prim);
         }
     }
     let roots = finish_children(roots, &root_order);
@@ -432,16 +432,16 @@ fn attach_attribute(
 
     // Fall back to the rep-derived spelling when the file authors no
     // typeName (rare; conforming exporters write it).
-    if type_token.is_empty() {
-        if let Some((_, rep)) = spec.fields.iter().find(|(n, _)| n == "default") {
-            let rep = ValueRep::from_raw(*rep);
-            if let Some(vt) = rep.value_type() {
-                type_token = if rep.is_array() {
-                    format!("{}[]", vt.name())
-                } else {
-                    vt.name().to_owned()
-                };
-            }
+    if type_token.is_empty()
+        && let Some((_, rep)) = spec.fields.iter().find(|(n, _)| n == "default")
+    {
+        let rep = ValueRep::from_raw(*rep);
+        if let Some(vt) = rep.value_type() {
+            type_token = if rep.is_array() {
+                format!("{}[]", vt.name())
+            } else {
+                vt.name().to_owned()
+            };
         }
     }
     let mut spelled = String::new();
@@ -484,10 +484,10 @@ fn attach_attribute(
     if let Some(mut sp) = spline {
         // The value data type is the attribute's own when the Crate
         // run left it unspecified.
-        if let Value::Spline(s) = &mut sp {
-            if s.data_type == crate::spline::DataType::Unspecified {
-                s.data_type = crate::spline::DataType::from_type_token(&type_token);
-            }
+        if let Value::Spline(s) = &mut sp
+            && s.data_type == crate::spline::DataType::Unspecified
+        {
+            s.data_type = crate::spline::DataType::from_type_token(&type_token);
         }
         prim.attrs.insert(
             format!("{attr_name}.spline"),

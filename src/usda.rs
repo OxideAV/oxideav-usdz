@@ -29,8 +29,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::error::invalid;
 use crate::Result;
+use crate::error::invalid;
 
 /// USDA magic banner — every layer starts with `#usda <version>`.
 pub const USDA_MAGIC: &[u8] = b"#usda";
@@ -1510,7 +1510,7 @@ fn read_spline(t: &mut Tokenizer<'_>) -> Result<crate::spline::Spline> {
                         return Err(invalid(format!(
                             "spline: unknown item `{other}` at {}",
                             t.pos_display()
-                        )))
+                        )));
                     }
                 }
             }
@@ -1554,7 +1554,7 @@ fn read_spline(t: &mut Tokenizer<'_>) -> Result<crate::spline::Spline> {
                                         other => {
                                             return Err(invalid(format!(
                                                 "spline: unknown interpolation `{other}`"
-                                            )))
+                                            )));
                                         }
                                     };
                                     t.skip_trivia();
@@ -1567,7 +1567,7 @@ fn read_spline(t: &mut Tokenizer<'_>) -> Result<crate::spline::Spline> {
                                 other => {
                                     return Err(invalid(format!(
                                         "spline: unknown knot parameter `{other}`"
-                                    )))
+                                    )));
                                 }
                             }
                         }
@@ -1575,7 +1575,7 @@ fn read_spline(t: &mut Tokenizer<'_>) -> Result<crate::spline::Spline> {
                             return Err(invalid(format!(
                                 "spline: expected a knot parameter at {}",
                                 t.pos_display()
-                            )))
+                            )));
                         }
                     }
                 }
@@ -1590,7 +1590,7 @@ fn read_spline(t: &mut Tokenizer<'_>) -> Result<crate::spline::Spline> {
                 return Err(invalid(format!(
                     "spline: unexpected character at {}",
                     t.pos_display()
-                )))
+                )));
             }
         }
     }

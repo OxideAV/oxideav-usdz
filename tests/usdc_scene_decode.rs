@@ -4,10 +4,10 @@
 //! archive whose default layer is that `.usdc` decodes to a full
 //! typed scene through the ordinary `UsdzDecoder` pipeline.
 
+use oxideav_usdz::UsdzDecoder;
 use oxideav_usdz::usda::{Prim, Value};
 use oxideav_usdz::usdc_layer::layer_from_usdc;
 use oxideav_usdz::zip_writer::Writer;
-use oxideav_usdz::UsdzDecoder;
 
 fn elephant_bytes() -> Option<Vec<u8>> {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -34,10 +34,10 @@ fn find_prim<'a>(prims: &'a [Prim], name: &str) -> Option<&'a Prim> {
 fn collect_assets(prims: &[Prim], out: &mut Vec<String>) {
     for p in prims {
         for attr in p.attrs.values() {
-            if let Value::Asset(a) = &attr.value {
-                if !out.contains(a) {
-                    out.push(a.clone());
-                }
+            if let Value::Asset(a) = &attr.value
+                && !out.contains(a)
+            {
+                out.push(a.clone());
             }
         }
         collect_assets(&p.children, out);

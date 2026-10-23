@@ -8,8 +8,8 @@
 
 mod common;
 
-use oxideav_usdz::usdc_layer::layer_from_usdc;
 use oxideav_usdz::UsdzDecoder;
+use oxideav_usdz::usdc_layer::layer_from_usdc;
 
 /// Locate the staged variant fixture. `docs/` is a private sibling
 /// checkout — skip (don't fail) when absent, mirroring the Elephant

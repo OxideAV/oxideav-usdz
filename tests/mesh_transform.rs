@@ -198,9 +198,11 @@ def Xform "Root" {
     let scene = UsdzDecoder::new().decode_bytes(&usdz).expect("decode");
     let body = carrier(&scene, "Body");
     assert_eq!(translation_of(&body.transform), [4.0, 5.0, 6.0]);
-    assert!(!scene.meshes[0].primitives[0]
-        .extras
-        .contains_key("usd:mesh_transform"));
+    assert!(
+        !scene.meshes[0].primitives[0]
+            .extras
+            .contains_key("usd:mesh_transform")
+    );
     // And the shape is a fixed point: def Xform "Root" > def Mesh
     // "Body" with the transform inside, cycle after cycle.
     let r1 = UsdzEncoder::new().encode_with_report(&scene).unwrap();

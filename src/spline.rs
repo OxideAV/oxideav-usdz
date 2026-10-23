@@ -27,10 +27,10 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map as JMap, Value as JValue};
 
+use crate::Result;
 use crate::error::{invalid, unsupported};
 use crate::usda::Value;
 use crate::usdc_values::half_to_f32;
-use crate::Result;
 
 /// §7.4.2.4.1 curve type.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -132,8 +132,8 @@ impl ExtrapolationMode {
             6 => Self::LoopOscillate,
             other => {
                 return Err(invalid(format!(
-                "USDC Splines: extrapolation code {other} is unassigned (§16.3.10.33 defines 0–6)"
-            )))
+                    "USDC Splines: extrapolation code {other} is unassigned (§16.3.10.33 defines 0–6)"
+                )));
             }
         })
     }
@@ -805,7 +805,7 @@ mod tests {
         b.extend_from_slice(&3u32.to_le_bytes()); // post loops
         b.extend_from_slice(&0.25f64.to_le_bytes()); // value offset
         b.extend_from_slice(&2u32.to_le_bytes()); // knot count
-                                                  // Knot 0: dual valued, interp curve (3 << 1), bezier.
+        // Knot 0: dual valued, interp curve (3 << 1), bezier.
         b.push(0x01 | (3 << 1));
         b.extend_from_slice(&1.0f64.to_le_bytes()); // time
         b.extend_from_slice(&0.0f64.to_le_bytes()); // value
@@ -814,8 +814,8 @@ mod tests {
         b.extend_from_slice(&1.5f64.to_le_bytes()); // post width
         b.extend_from_slice(&2.0f64.to_le_bytes()); // pre slope
         b.extend_from_slice(&2.5f64.to_le_bytes()); // post slope
-                                                    // Knot 1: single valued, interp held (1 << 1), hermite (bit 3),
-                                                    // post tangent in Maya form (0x20).
+        // Knot 1: single valued, interp held (1 << 1), hermite (bit 3),
+        // post tangent in Maya form (0x20).
         b.push((1 << 1) | 0x08 | 0x20);
         b.extend_from_slice(&5.0f64.to_le_bytes());
         b.extend_from_slice(&3.25f64.to_le_bytes());

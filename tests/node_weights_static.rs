@@ -119,10 +119,11 @@ fn sampled_weights_still_become_a_channel() {
         node.weights.is_empty(),
         "sampled weights are animation, not a static override"
     );
-    assert!(scene.animations.iter().any(|a| a
-        .channels
-        .iter()
-        .any(|c| c.target.property == AnimationProperty::MorphWeights)));
+    assert!(scene.animations.iter().any(|a| {
+        a.channels
+            .iter()
+            .any(|c| c.target.property == AnimationProperty::MorphWeights)
+    }));
 }
 
 #[test]
@@ -143,9 +144,11 @@ fn static_state_reemits_in_default_value_form() {
         "no timeSamples fabrication:\n{}",
         report.usda
     );
-    assert!(report
-        .usda
-        .contains("uniform token[] blendShapes = [\"smile\", \"frown\"]"));
+    assert!(
+        report
+            .usda
+            .contains("uniform token[] blendShapes = [\"smile\", \"frown\"]")
+    );
     // The geometry re-binds its animation source.
     assert!(
         report.usda.contains("rel skel:animationSource = <"),

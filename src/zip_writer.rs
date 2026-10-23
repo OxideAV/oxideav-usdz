@@ -19,8 +19,8 @@
 //! through with [`Writer::add_stored`] survive bit-identical from
 //! input to output.
 
-use crate::error::unsupported;
 use crate::Result;
+use crate::error::unsupported;
 
 const LFH_SIGNATURE: u32 = 0x04034b50;
 const CDIR_SIGNATURE: u32 = 0x02014b50;
@@ -126,8 +126,8 @@ impl Writer {
         self.out.extend_from_slice(&[0x14, 0x00]);
         self.out.extend_from_slice(&[0x00, 0x00]); // GP flags
         self.out.extend_from_slice(&[0x00, 0x00]); // Method: STORED
-                                                   // MS-DOS mod time + date — fixed sentinel ("1980-01-01
-                                                   // 00:00:02") so encoder output is reproducible across runs.
+        // MS-DOS mod time + date — fixed sentinel ("1980-01-01
+        // 00:00:02") so encoder output is reproducible across runs.
         self.out.extend_from_slice(&[0x00, 0x00, 0x21, 0x00]);
         self.out.extend_from_slice(&crc32.to_le_bytes());
         self.out.extend_from_slice(&payload_len.to_le_bytes()); // comp size

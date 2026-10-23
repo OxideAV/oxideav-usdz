@@ -37,12 +37,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use crate::Result;
 use crate::error::invalid;
 use crate::spline::Spline;
 use crate::usda::{Attr, Layer, ListEditOp, ListOp, Prim, Value, Variant};
-use crate::usdc::{ValueRep, ValueType, Version, BOOTSTRAP_SIZE};
+use crate::usdc::{BOOTSTRAP_SIZE, ValueRep, ValueType, Version};
 use crate::usdc_writer::CrateImage;
-use crate::Result;
 
 /// §16.3.8.4.6 spec forms.
 const FORM_ATTRIBUTE: i32 = 1;
@@ -406,7 +406,7 @@ impl Encoder {
                         return Err(invalid(format!(
                             "USDC encode: `{other}` is not a {} value",
                             vt.name()
-                        )))
+                        )));
                     }
                 };
                 Self::inline(vt, code)
@@ -428,7 +428,7 @@ impl Encoder {
                 return Err(invalid(format!(
                     "USDC encode: scalar {} is not an encodable attribute type",
                     other.name()
-                )))
+                )));
             }
         })
     }
@@ -712,7 +712,7 @@ impl Encoder {
                 return Err(invalid(format!(
                     "USDC encode: {} is not a list-op type",
                     other.name()
-                )))
+                )));
             }
         }
         Ok(())
@@ -1195,11 +1195,7 @@ impl Encoder {
                 root_word
             } else {
                 let t = self.token(&self.nodes[node].element.clone());
-                if self.nodes[node].is_property {
-                    -t
-                } else {
-                    t
-                }
+                if self.nodes[node].is_property { -t } else { t }
             };
             element_token_indices.push(word);
         }
@@ -1534,7 +1530,7 @@ fn element_bytes(vt: ValueType, comps: &[f64]) -> Result<Vec<u8>> {
             return Err(invalid(format!(
                 "USDC encode: {} has no fixed-width element layout",
                 other.name()
-            )))
+            )));
         }
     }
     Ok(out)

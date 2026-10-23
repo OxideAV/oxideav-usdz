@@ -22,13 +22,13 @@
 
 use std::collections::BTreeMap;
 
+use crate::Result;
 use crate::error::{invalid, unsupported};
 use crate::usda::{ListEditOp, ListOp, Value};
 use crate::usdc::{
-    construct_paths, decode_int_array, decode_int_array64, int_coded_max_len, CompressedBuffer,
-    SectionName, TokensSection, UsdcFile, ValueRep, ValueType, BOOTSTRAP_SIZE,
+    BOOTSTRAP_SIZE, CompressedBuffer, SectionName, TokensSection, UsdcFile, ValueRep, ValueType,
+    construct_paths, decode_int_array, decode_int_array64, int_coded_max_len,
 };
-use crate::Result;
 
 /// Maximum recursion depth for indirect values (`Value`,
 /// `UnregisteredValue`, dictionary members, time-sample members).
@@ -255,7 +255,7 @@ impl<'a> ValueDecoder<'a> {
                 return Err(invalid(format!(
                     "USDC value: type {} cannot be inlined",
                     other.name()
-                )))
+                )));
             }
         })
     }
@@ -315,8 +315,10 @@ impl<'a> ValueDecoder<'a> {
                 let count = self.count_at(off, "VT::DoubleVector")?;
                 let data = self.get(off + 8, count * 8)?;
                 Value::Array(
-                    data.chunks_exact(8)
-                        .map(|c| Value::Float(f64::from_le_bytes(c.try_into().unwrap())))
+                    data.as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|c| Value::Float(f64::from_le_bytes(*c)))
                         .collect(),
                 )
             }
@@ -324,7 +326,9 @@ impl<'a> ValueDecoder<'a> {
                 let count = self.count_at(off, "VT::LayerOffsetVector")?;
                 let data = self.get(off + 8, count * 16)?;
                 Value::Array(
-                    data.chunks_exact(16)
+                    data.as_chunks::<16>()
+                        .0
+                        .iter()
                         .map(|c| {
                             Value::Tuple(vec![
                                 Value::Float(f64::from_le_bytes(c[0..8].try_into().unwrap())),
@@ -347,7 +351,7 @@ impl<'a> ValueDecoder<'a> {
                 let count = self.count_at(off, "VT::VariantSelectionMap")?;
                 let data = self.get(off + 8, count * 8)?;
                 let mut map = BTreeMap::new();
-                for pair in data.chunks_exact(8) {
+                for pair in data.as_chunks::<8>().0 {
                     let key = u32::from_le_bytes(pair[0..4].try_into().unwrap());
                     let val = u32::from_le_bytes(pair[4..8].try_into().unwrap());
                     map.insert(
@@ -380,7 +384,7 @@ impl<'a> ValueDecoder<'a> {
                         return Err(invalid(format!(
                             "USDC VT::UnregisteredValue: inner value must be a string, dictionary, or unregistered-value list op, found {:?}",
                             other.map(ValueType::name)
-                        )))
+                        )));
                     }
                 }
                 self.decode_at_depth(inner, depth + 1)?
@@ -388,7 +392,7 @@ impl<'a> ValueDecoder<'a> {
             VT::UnregisteredValueOp => {
                 return Err(unsupported(
                     "USDC value: UnregisteredValueListOp payloads are not decoded yet",
-                ))
+                ));
             }
             VT::Relocates => {
                 // §16.3.10.15: `[u64 count][count × (u32 source path
@@ -396,7 +400,7 @@ impl<'a> ValueDecoder<'a> {
                 let count = self.count_at(off, "VT::Relocates")?;
                 let data = self.get(off + 8, count * 8)?;
                 let mut pairs = Vec::with_capacity(count);
-                for pair in data.chunks_exact(8) {
+                for pair in data.as_chunks::<8>().0 {
                     let src = u32::from_le_bytes(pair[0..4].try_into().unwrap());
                     let dst = u32::from_le_bytes(pair[4..8].try_into().unwrap());
                     pairs.push((
@@ -441,7 +445,7 @@ impl<'a> ValueDecoder<'a> {
                 return Err(invalid(format!(
                     "USDC value: type {} must be inlined when not an array (§16.3.9.1)",
                     vt.name()
-                )))
+                )));
             }
         })
     }
@@ -496,8 +500,8 @@ impl<'a> ValueDecoder<'a> {
         let count = self.count_at(off, what)?;
         let data = self.get(off + 8, count * 4)?;
         let mut out = Vec::with_capacity(count);
-        for c in data.chunks_exact(4) {
-            let idx = u32::from_le_bytes(c.try_into().unwrap());
+        for c in data.as_chunks::<4>().0 {
+            let idx = u32::from_le_bytes(*c);
             out.push(resolve(u64::from(idx), self)?);
         }
         Ok(Value::Array(out))
@@ -663,7 +667,7 @@ impl<'a> ValueDecoder<'a> {
             _ => {
                 return Err(invalid(
                     "USDC TimeSamples: timecodes did not decode to an array",
-                ))
+                ));
             }
         };
         let values_off_pos = times_rep_pos + 8;
@@ -678,8 +682,8 @@ impl<'a> ValueDecoder<'a> {
         }
         let reps = self.get(values_pos + 8, count * 8)?;
         let mut samples = Vec::with_capacity(count);
-        for (i, chunk) in reps.chunks_exact(8).enumerate() {
-            let rep = ValueRep::from_raw(u64::from_le_bytes(chunk.try_into().unwrap()));
+        for (i, chunk) in reps.as_chunks::<8>().0.iter().enumerate() {
+            let rep = ValueRep::from_raw(u64::from_le_bytes(*chunk));
             samples.push((times[i], self.decode_at_depth(rep, depth + 1)?));
         }
         Ok(Value::TimeSamples(samples))
@@ -774,7 +778,9 @@ impl<'a> ValueDecoder<'a> {
                     .map(|v| Value::Float(v as u64 as f64))
                     .collect(),
             )),
-            VT::Half | VT::Float | VT::Double => self.decode_compressed_float_array(vt, data_off, count),
+            VT::Half | VT::Float | VT::Double => {
+                self.decode_compressed_float_array(vt, data_off, count)
+            }
             other => Err(invalid(format!(
                 "USDC value: type {} arrays cannot be compressed (§16.3.9.3 restricts compression to simple element types)",
                 other.name()
@@ -823,7 +829,9 @@ impl<'a> ValueDecoder<'a> {
             b'i' => {
                 let ints = self.compressed_ints(data_off + 1, count)?;
                 Ok(Value::Array(
-                    ints.into_iter().map(|v| Value::Float(f64::from(v))).collect(),
+                    ints.into_iter()
+                        .map(|v| Value::Float(f64::from(v)))
+                        .collect(),
                 ))
             }
             b't' => {
@@ -835,8 +843,7 @@ impl<'a> ValueDecoder<'a> {
                     .chunks_exact(width)
                     .map(|c| float_from_bytes(vt, c))
                     .collect();
-                let indices =
-                    self.compressed_ints(data_off + 5 + lut_count * width, count)?;
+                let indices = self.compressed_ints(data_off + 5 + lut_count * width, count)?;
                 let mut out = Vec::with_capacity(count);
                 for idx in indices {
                     let value = usize::try_from(idx)
@@ -911,26 +918,34 @@ fn decode_element(vt: ValueType, bytes: &[u8]) -> Result<Value> {
     use ValueType as VT;
     fn f32s(bytes: &[u8]) -> Vec<f64> {
         bytes
-            .chunks_exact(4)
-            .map(|c| f64::from(f32::from_le_bytes(c.try_into().unwrap())))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f64::from(f32::from_le_bytes(*c)))
             .collect()
     }
     fn f64s(bytes: &[u8]) -> Vec<f64> {
         bytes
-            .chunks_exact(8)
-            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| f64::from_le_bytes(*c))
             .collect()
     }
     fn f16s(bytes: &[u8]) -> Vec<f64> {
         bytes
-            .chunks_exact(2)
-            .map(|c| f64::from(half_to_f32(u16::from_le_bytes(c.try_into().unwrap()))))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| f64::from(half_to_f32(u16::from_le_bytes(*c))))
             .collect()
     }
     fn i32s(bytes: &[u8]) -> Vec<f64> {
         bytes
-            .chunks_exact(4)
-            .map(|c| f64::from(i32::from_le_bytes(c.try_into().unwrap())))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f64::from(i32::from_le_bytes(*c)))
             .collect()
     }
     fn tuple(vals: Vec<f64>) -> Value {
@@ -975,7 +990,7 @@ fn decode_element(vt: ValueType, bytes: &[u8]) -> Result<Value> {
             return Err(invalid(format!(
                 "USDC value: {} is not a fixed-width element type",
                 other.name()
-            )))
+            )));
         }
     })
 }
@@ -1050,7 +1065,7 @@ fn specifier_name(code: i32) -> Result<&'static str> {
         other => {
             return Err(invalid(format!(
                 "USDC value: specifier code {other} is not def(0)/over(1)/class(2)"
-            )))
+            )));
         }
     })
 }
@@ -1063,7 +1078,7 @@ fn permission_name(code: i32) -> Result<&'static str> {
         other => {
             return Err(invalid(format!(
                 "USDC value: permission code {other} is not public(0)/private(1)"
-            )))
+            )));
         }
     })
 }
@@ -1076,7 +1091,7 @@ fn variability_name(code: i32) -> Result<&'static str> {
         other => {
             return Err(invalid(format!(
                 "USDC value: variability code {other} is not varying(0)/uniform(1)"
-            )))
+            )));
         }
     })
 }

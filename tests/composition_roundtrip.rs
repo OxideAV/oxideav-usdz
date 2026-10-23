@@ -30,9 +30,9 @@
 
 mod common;
 
-use common::{build_usdz, UsdzEntry};
-use oxideav_usdz::usda::{parse, Value};
+use common::{UsdzEntry, build_usdz};
 use oxideav_usdz::UsdzDecoder;
+use oxideav_usdz::usda::{Value, parse};
 
 use oxideav_mesh3d::Mesh3DDecoder;
 

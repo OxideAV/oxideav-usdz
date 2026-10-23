@@ -42,8 +42,8 @@
 //! catches malformed archives at the boundary instead of silently
 //! corrupting downstream parsing.
 
-use crate::error::{invalid, unsupported};
 use crate::Result;
+use crate::error::{invalid, unsupported};
 
 /// PKZIP signatures the walker recognises.
 const EOCD_SIGNATURE: u32 = 0x06054b50;
@@ -184,7 +184,7 @@ pub fn walk(archive: &[u8]) -> Result<Vec<ZipEntry>> {
         // §16.4.1.3 alignment — spec wording aligns the file *header*,
         // observed packagers align the *payload*; accept either, reject
         // an entry aligned under neither reading.
-        if payload_offset % USDZ_ALIGNMENT != 0 && lfh_offset % USDZ_ALIGNMENT != 0 {
+        if payload_offset % USDZ_ALIGNMENT != 0 && !lfh_offset.is_multiple_of(USDZ_ALIGNMENT) {
             return Err(invalid(format!(
                 "USDZ entry '{name}' violates the 64-byte alignment rule (spec §16.4.1.3): neither its file header (offset {lfh_offset}) nor its payload (offset {payload_offset}) sits on a 64-byte boundary"
             )));

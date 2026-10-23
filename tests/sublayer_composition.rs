@@ -36,7 +36,7 @@
 
 mod common;
 
-use common::{build_usdz, UsdzEntry};
+use common::{UsdzEntry, build_usdz};
 
 use oxideav_mesh3d::Mesh3DDecoder;
 use oxideav_usdz::UsdzDecoder;
@@ -404,9 +404,11 @@ def Xform "Root" {
     assert!(scene.meshes.is_empty());
     // Layer metadata for the missing entry stays on extras so a
     // writer round-trip preserves the opinion.
-    assert!(scene
-        .extras
-        .contains_key(oxideav_usdz::usda_writer::LAYER_METADATA_EXTRAS_KEY));
+    assert!(
+        scene
+            .extras
+            .contains_key(oxideav_usdz::usda_writer::LAYER_METADATA_EXTRAS_KEY)
+    );
     // ...and no `usd:composedSubLayers` stamp was added.
     assert!(!scene.extras.contains_key("usd:composedSubLayers"));
 }

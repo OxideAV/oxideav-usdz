@@ -25,9 +25,9 @@ use std::collections::HashMap;
 use oxideav_mesh3d::{Node, NodeId, Scene3D, Transform};
 use serde_json::{Map as JMap, Value as JValue};
 
+use crate::Result;
 use crate::error::invalid;
 use crate::usda::{Attr, Prim, Value};
-use crate::Result;
 
 /// `Node::extras` key carrying the JSON-encoded [`PointInstancer`].
 pub const EXTRAS_KEY: &str = "usd:pointInstancer";
@@ -730,15 +730,15 @@ fn read_sampled<T>(
         default: None,
         samples: Vec::new(),
     };
-    if let Some(attr) = prim.attrs.get(name) {
-        if !matches!(attr.value, Value::None) {
-            out.default = Some(read(&attr.value).ok_or_else(|| {
-                invalid(format!(
-                    "PointInstancer `{}`: `{name}` is not a well-formed array",
-                    prim.name
-                ))
-            })?);
-        }
+    if let Some(attr) = prim.attrs.get(name)
+        && !matches!(attr.value, Value::None)
+    {
+        out.default = Some(read(&attr.value).ok_or_else(|| {
+            invalid(format!(
+                "PointInstancer `{}`: `{name}` is not a well-formed array",
+                prim.name
+            ))
+        })?);
     }
     if let Some(Attr {
         value: Value::TimeSamples(samples),

@@ -177,9 +177,11 @@ fn writer_emits_canonical_attribute_names() {
     let report = UsdzEncoder::new()
         .encode_with_report(&scene)
         .expect("encode");
-    assert!(report
-        .usda
-        .contains("double3 xformOp:translate = (1, 2, 3)"));
+    assert!(
+        report
+            .usda
+            .contains("double3 xformOp:translate = (1, 2, 3)")
+    );
     assert!(report.usda.contains("quatf xformOp:orient = "));
     assert!(report.usda.contains("float3 xformOp:scale = (1, 1, 1)"));
     assert!(report

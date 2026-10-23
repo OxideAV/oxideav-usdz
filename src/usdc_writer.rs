@@ -39,10 +39,10 @@
 //! §3b common-delta choice is a free parameter) — the contract is that
 //! the reader recovers the same decoded content.
 
-use crate::error::{invalid, Result};
+use crate::error::{Result, invalid};
 use crate::usdc::{
-    encode_compressed_buffer, encode_int_coded, SectionName, UsdcFile, ValueRep, Version,
-    BOOTSTRAP_SIZE, TOC_RECORD_SIZE,
+    BOOTSTRAP_SIZE, SectionName, TOC_RECORD_SIZE, UsdcFile, ValueRep, Version,
+    encode_compressed_buffer, encode_int_coded,
 };
 
 /// The decoded content of a USDC file's six standard sections, in a

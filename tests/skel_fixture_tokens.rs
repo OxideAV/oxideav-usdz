@@ -65,7 +65,9 @@ fn production_fixture_carries_the_staged_usdskel_schema_tokens() {
         );
     }
     // §1.5 geomBindTransform is present in this asset too.
-    assert!(tokens
-        .iter()
-        .any(|t| t == "primvars:skel:geomBindTransform"));
+    assert!(
+        tokens
+            .iter()
+            .any(|t| t == "primvars:skel:geomBindTransform")
+    );
 }

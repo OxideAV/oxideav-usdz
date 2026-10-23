@@ -3,7 +3,7 @@
 //! single-line and triple-quoted strings, and the `inf` / `-inf` /
 //! `nan` number spellings.
 
-use oxideav_usdz::usda::{parse, Value};
+use oxideav_usdz::usda::{Value, parse};
 
 fn layer_with(value_stmt: &str) -> oxideav_usdz::usda::Layer {
     let src = format!("#usda 1.0\ndef Scope \"S\" {{\n    {value_stmt}\n}}\n");

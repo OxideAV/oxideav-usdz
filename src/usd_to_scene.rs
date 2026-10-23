@@ -35,11 +35,11 @@ use oxideav_mesh3d::{
     Transform, Unit,
 };
 
-use crate::asset_source::{mime_from_filename, ZipStoredAsset};
+use crate::Result;
+use crate::asset_source::{ZipStoredAsset, mime_from_filename};
 use crate::error::{invalid, unsupported};
 use crate::usda::{Attr, Layer, Prim, Value};
 use crate::zip::ZipEntry;
-use crate::Result;
 
 /// Convert a parsed USDA layer + the surrounding ZIP archive into
 /// a [`Scene3D`].
@@ -136,10 +136,9 @@ pub fn translate_with_root(
         .get("timeCodesPerSecond")
         .or_else(|| layer.metadata.get("framesPerSecond"))
         .and_then(|v| v.as_f32())
+        && tcps > 0.0
     {
-        if tcps > 0.0 {
-            ctx.time_codes_per_second = tcps as f64;
-        }
+        ctx.time_codes_per_second = tcps as f64;
     }
 
     // LayerStack composition (round 10): gather every in-archive
@@ -1850,10 +1849,8 @@ fn resolve_binding(
         if let Some(b) = direct.as_ref().filter(|b| !stronger_only || b.stronger) {
             return Some(b.path.clone());
         }
-        if with_all {
-            if let Some(b) = level.all.as_ref().filter(|b| !stronger_only || b.stronger) {
-                return Some(b.path.clone());
-            }
+        if with_all && let Some(b) = level.all.as_ref().filter(|b| !stronger_only || b.stronger) {
+            return Some(b.path.clone());
         }
         None
     };
@@ -2255,10 +2252,11 @@ fn index_skeletons(ctx: &mut Ctx, parent: &str, prims: &[Prim]) -> Result<()> {
         }
         // §1.4: BlendShape prims register alongside — their
         // `rel skel:blendShapeTargets` referrers resolve by path.
-        if prim.spec == "def" && prim.type_name == "BlendShape" {
-            if let Some(data) = read_blend_shape(prim) {
-                ctx.blendshapes_by_path.insert(path.clone(), data);
-            }
+        if prim.spec == "def"
+            && prim.type_name == "BlendShape"
+            && let Some(data) = read_blend_shape(prim)
+        {
+            ctx.blendshapes_by_path.insert(path.clone(), data);
         }
         index_skeletons(ctx, &path, &prim.children)?;
     }
@@ -2386,23 +2384,23 @@ fn build_skeleton(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<SkelInfo> {
     };
     let bind = read_matrices("bindTransforms");
     let rest = read_matrices("restTransforms");
-    if let Some(b) = &bind {
-        if b.len() != joint_tokens.len() {
-            return Err(invalid(format!(
-                "Skeleton `{path}`: bindTransforms count {} != joints count {}",
-                b.len(),
-                joint_tokens.len()
-            )));
-        }
+    if let Some(b) = &bind
+        && b.len() != joint_tokens.len()
+    {
+        return Err(invalid(format!(
+            "Skeleton `{path}`: bindTransforms count {} != joints count {}",
+            b.len(),
+            joint_tokens.len()
+        )));
     }
-    if let Some(r) = &rest {
-        if r.len() != joint_tokens.len() {
-            return Err(invalid(format!(
-                "Skeleton `{path}`: restTransforms count {} != joints count {}",
-                r.len(),
-                joint_tokens.len()
-            )));
-        }
+    if let Some(r) = &rest
+        && r.len() != joint_tokens.len()
+    {
+        return Err(invalid(format!(
+            "Skeleton `{path}`: restTransforms count {} != joints count {}",
+            r.len(),
+            joint_tokens.len()
+        )));
     }
 
     // One node per joint. The token is a relative SdfPath
@@ -3054,7 +3052,7 @@ fn build_audio_emitter(ctx: &Ctx, path: &str, prim: &Prim) -> Result<(AudioSourc
         _ => {
             return Err(invalid(format!(
                 "SpatialAudio `{path}` `filePath` must be an asset reference (`@...@`)"
-            )))
+            )));
         }
     };
 
@@ -3403,17 +3401,17 @@ fn build_mesh(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Mesh> {
     // per morph-target slot, shared by every primitive of the mesh —
     // a GeomSubset split clones the base roster).
     for p in &mut mesh.primitives {
-        if let Some(v) = p.extras.remove(PENDING_TARGET_NAMES) {
-            if mesh.target_names.is_empty() {
-                mesh.target_names = v
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|n| n.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-            }
+        if let Some(v) = p.extras.remove(PENDING_TARGET_NAMES)
+            && mesh.target_names.is_empty()
+        {
+            mesh.target_names = v
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|n| n.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
         }
     }
     Ok(mesh)
@@ -3716,10 +3714,8 @@ fn apply_geom_subsets(
         }
         sp.extras
             .insert("usd:subset".into(), serde_json::Value::Object(marker));
-        if double_sided {
-            if let Some(mat) = ctx.scene.materials.get_mut(ms.material.0 as usize) {
-                mat.double_sided = true;
-            }
+        if double_sided && let Some(mat) = ctx.scene.materials.get_mut(ms.material.0 as usize) {
+            mat.double_sided = true;
         }
         subset_primitives.push(sp);
     }
@@ -3777,20 +3773,18 @@ fn build_triangle_primitive(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Pr
         .attrs
         .get("primvars:normals")
         .or_else(|| prim.attrs.get("normals"))
+        && let Some(arr) = read_vec3_array(&normals.value)
     {
-        if let Some(arr) = read_vec3_array(&normals.value) {
-            prim_out.normals = Some(arr);
-        }
+        prim_out.normals = Some(arr);
     }
 
     if let Some(uvs) = prim
         .attrs
         .get("primvars:st")
         .or_else(|| prim.attrs.get("primvars:uv"))
+        && let Some(arr) = read_vec2_array(&uvs.value)
     {
-        if let Some(arr) = read_vec2_array(&uvs.value) {
-            prim_out.uvs.push(arr);
-        }
+        prim_out.uvs.push(arr);
     }
     // §2.5 multi-UV: additional `primvars:st1`, `primvars:st2`, ...
     // sets land on `uvs[1]`, `uvs[2]`, ... (a `UsdPrimvarReader_float2`
@@ -3834,60 +3828,60 @@ fn build_triangle_primitive(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Pr
     // with `primvars:displayOpacity` supplying the alpha channel.
     // Constant / non-vertex interpolations have no typed slot and
     // ride on extras verbatim.
-    if let Some(dc) = prim.attrs.get("primvars:displayColor") {
-        if let Some(colors) = read_vec3_array(&dc.value) {
-            let opacity: Option<Vec<f32>> = prim
-                .attrs
-                .get("primvars:displayOpacity")
-                .and_then(|a| a.value.as_seq())
-                .map(|seq| seq.iter().filter_map(|v| v.as_f32()).collect());
-            if colors.len() == prim_out.positions.len() {
-                let rgba: Vec<[f32; 4]> = colors
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| {
-                        let a = opacity
-                            .as_ref()
-                            .and_then(|o| o.get(i).copied())
-                            .unwrap_or(1.0);
-                        [c[0], c[1], c[2], a]
-                    })
-                    .collect();
-                prim_out.colors.push(rgba);
-            } else {
-                // Constant / uniform interpolation — preserve on
-                // extras so the writer re-emits the authored shape.
+    if let Some(dc) = prim.attrs.get("primvars:displayColor")
+        && let Some(colors) = read_vec3_array(&dc.value)
+    {
+        let opacity: Option<Vec<f32>> = prim
+            .attrs
+            .get("primvars:displayOpacity")
+            .and_then(|a| a.value.as_seq())
+            .map(|seq| seq.iter().filter_map(|v| v.as_f32()).collect());
+        if colors.len() == prim_out.positions.len() {
+            let rgba: Vec<[f32; 4]> = colors
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let a = opacity
+                        .as_ref()
+                        .and_then(|o| o.get(i).copied())
+                        .unwrap_or(1.0);
+                    [c[0], c[1], c[2], a]
+                })
+                .collect();
+            prim_out.colors.push(rgba);
+        } else {
+            // Constant / uniform interpolation — preserve on
+            // extras so the writer re-emits the authored shape.
+            prim_out.extras.insert(
+                "usd:displayColor".into(),
+                serde_json::Value::Array(
+                    colors
+                        .iter()
+                        .map(|c| {
+                            serde_json::Value::Array(
+                                c.iter()
+                                    .filter_map(|x| {
+                                        serde_json::Number::from_f64(*x as f64)
+                                            .map(serde_json::Value::Number)
+                                    })
+                                    .collect(),
+                            )
+                        })
+                        .collect(),
+                ),
+            );
+            if let Some(o) = opacity {
                 prim_out.extras.insert(
-                    "usd:displayColor".into(),
+                    "usd:displayOpacity".into(),
                     serde_json::Value::Array(
-                        colors
-                            .iter()
-                            .map(|c| {
-                                serde_json::Value::Array(
-                                    c.iter()
-                                        .filter_map(|x| {
-                                            serde_json::Number::from_f64(*x as f64)
-                                                .map(serde_json::Value::Number)
-                                        })
-                                        .collect(),
-                                )
+                        o.iter()
+                            .filter_map(|x| {
+                                serde_json::Number::from_f64(*x as f64)
+                                    .map(serde_json::Value::Number)
                             })
                             .collect(),
                     ),
                 );
-                if let Some(o) = opacity {
-                    prim_out.extras.insert(
-                        "usd:displayOpacity".into(),
-                        serde_json::Value::Array(
-                            o.iter()
-                                .filter_map(|x| {
-                                    serde_json::Number::from_f64(*x as f64)
-                                        .map(serde_json::Value::Number)
-                                })
-                                .collect(),
-                        ),
-                    );
-                }
             }
         }
     }
@@ -4205,24 +4199,22 @@ fn apply_skel_binding(ctx: &mut Ctx, path: &str, prim: &Prim, out: &mut Primitiv
     if let (Some(a), Some(b)) = (
         meta_text(idx_attr, "interpolation"),
         meta_text(w_attr, "interpolation"),
-    ) {
-        if a != b {
-            return Err(invalid(format!(
-                "Mesh `{path}`: jointIndices interpolation `{a}` != jointWeights \
+    ) && a != b
+    {
+        return Err(invalid(format!(
+            "Mesh `{path}`: jointIndices interpolation `{a}` != jointWeights \
                  interpolation `{b}` (§1.6 requires identical layout)"
-            )));
-        }
+        )));
     }
     if let (Some(a), Some(b)) = (
         meta_i32(idx_attr, "elementSize"),
         meta_i32(w_attr, "elementSize"),
-    ) {
-        if a != b {
-            return Err(invalid(format!(
-                "Mesh `{path}`: jointIndices elementSize {a} != jointWeights elementSize \
+    ) && a != b
+    {
+        return Err(invalid(format!(
+            "Mesh `{path}`: jointIndices elementSize {a} != jointWeights elementSize \
                  {b} (§1.6 requires identical layout)"
-            )));
-        }
+        )));
     }
     // Read the (now known-consistent) knobs from either primvar,
     // preferring jointIndices.
@@ -4249,7 +4241,7 @@ fn apply_skel_binding(ctx: &mut Ctx, path: &str, prim: &Prim, out: &mut Primitiv
             return Err(invalid(format!(
                 "Mesh `{path}`: joint-influence interpolation `{other}` is not in the schema \
                  (`constant` | `vertex`)"
-            )))
+            )));
         }
     };
     if indices.len() != expected {
@@ -4424,16 +4416,16 @@ fn build_skel_animation(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Option
     // as one keyframe at t = 0) into (times_seconds, per-sample
     // sequence-of-tuples) pairs.
     let read_samples = |name: &str| -> Option<(Vec<f32>, Vec<Vec<Value>>)> {
-        if let Some(attr) = prim.attrs.get(&format!("{name}.timeSamples")) {
-            if let Value::TimeSamples(samples) = &attr.value {
-                let mut times = Vec::with_capacity(samples.len());
-                let mut frames = Vec::with_capacity(samples.len());
-                for (t, v) in samples {
-                    times.push((t / tcps) as f32);
-                    frames.push(v.as_seq().map(<[Value]>::to_vec).unwrap_or_default());
-                }
-                return Some((times, frames));
+        if let Some(attr) = prim.attrs.get(&format!("{name}.timeSamples"))
+            && let Value::TimeSamples(samples) = &attr.value
+        {
+            let mut times = Vec::with_capacity(samples.len());
+            let mut frames = Vec::with_capacity(samples.len());
+            for (t, v) in samples {
+                times.push((t / tcps) as f32);
+                frames.push(v.as_seq().map(<[Value]>::to_vec).unwrap_or_default());
             }
+            return Some((times, frames));
         }
         let attr = prim.attrs.get(name)?;
         let frame = attr.value.as_seq()?.to_vec();
@@ -4541,44 +4533,44 @@ fn build_skel_animation(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Option
         })
         .unwrap_or_default();
     let mut pending_blend: Option<PendingBlendWeights> = None;
-    if !blend_names.is_empty() {
-        if let Some((times, frames)) = read_samples("blendShapeWeights") {
-            // A `.timeSamples` map is animation; a plain default
-            // value is a *static* weight state (§1.3's arrays are
-            // time-varying only when sampled) and maps onto the
-            // typed model's per-instance `Node::weights` override.
-            let static_default = !matches!(
-                prim.attrs
-                    .get("blendShapeWeights.timeSamples")
-                    .map(|a| &a.value),
-                Some(Value::TimeSamples(_))
-            );
-            let mut weight_frames = Vec::with_capacity(frames.len());
-            for frame in &frames {
-                if frame.len() != blend_names.len() {
-                    return Err(invalid(format!(
-                        "SkelAnimation `{path}`: a `blendShapeWeights` sample has {} \
+    if !blend_names.is_empty()
+        && let Some((times, frames)) = read_samples("blendShapeWeights")
+    {
+        // A `.timeSamples` map is animation; a plain default
+        // value is a *static* weight state (§1.3's arrays are
+        // time-varying only when sampled) and maps onto the
+        // typed model's per-instance `Node::weights` override.
+        let static_default = !matches!(
+            prim.attrs
+                .get("blendShapeWeights.timeSamples")
+                .map(|a| &a.value),
+            Some(Value::TimeSamples(_))
+        );
+        let mut weight_frames = Vec::with_capacity(frames.len());
+        for frame in &frames {
+            if frame.len() != blend_names.len() {
+                return Err(invalid(format!(
+                    "SkelAnimation `{path}`: a `blendShapeWeights` sample has {} \
                          entries for {} blendShapes channels",
-                        frame.len(),
-                        blend_names.len()
-                    )));
-                }
-                weight_frames.push(
-                    frame
-                        .iter()
-                        .filter_map(|v| v.as_f32())
-                        .collect::<Vec<f32>>(),
-                );
+                    frame.len(),
+                    blend_names.len()
+                )));
             }
-            pending_blend = Some(PendingBlendWeights {
-                anim_idx: 0, // patched below once the index is known
-                anim_path: path.to_string(),
-                channel_names: blend_names,
-                times,
-                frames: weight_frames,
-                static_default,
-            });
+            weight_frames.push(
+                frame
+                    .iter()
+                    .filter_map(|v| v.as_f32())
+                    .collect::<Vec<f32>>(),
+            );
         }
+        pending_blend = Some(PendingBlendWeights {
+            anim_idx: 0, // patched below once the index is known
+            anim_path: path.to_string(),
+            channel_names: blend_names,
+            times,
+            frames: weight_frames,
+            static_default,
+        });
     }
 
     if channels.is_empty() && pending_blend.is_none() {
@@ -4646,10 +4638,9 @@ fn attach_blend_weight_channels(ctx: &mut Ctx) {
                 .extras
                 .get("usd:skel:animationSource")
                 .and_then(|v| v.as_str())
+                && source != entry.anim_path
             {
-                if source != entry.anim_path {
-                    continue;
-                }
+                continue;
             }
             // Per-frame weight vector in mesh channel order.
             let remap = |frame: &[f32]| -> Vec<f32> {
@@ -4812,14 +4803,12 @@ fn apply_material_binding(
     let mut levels: Vec<PrimBindingLevel> = ctx.binding_levels.clone();
     levels.push(own_level);
     let resolved = resolve_binding(&levels, &ctx.collections, path);
-    if let Some(path) = &resolved {
-        if let Some(&mid) = ctx.materials_by_path.get(path) {
-            out.material = Some(mid);
-            if double_sided {
-                if let Some(mat) = ctx.scene.materials.get_mut(mid.0 as usize) {
-                    mat.double_sided = true;
-                }
-            }
+    if let Some(path) = &resolved
+        && let Some(&mid) = ctx.materials_by_path.get(path)
+    {
+        out.material = Some(mid);
+        if double_sided && let Some(mat) = ctx.scene.materials.get_mut(mid.0 as usize) {
+            mat.double_sided = true;
         }
     }
     let authored = collect_binding_attrs(prim);
@@ -4865,13 +4854,13 @@ fn apply_mesh_metadata_to_primitive(prim: &Prim, out: &mut Primitive) {
         out.extras
             .insert("usd:no_fold".into(), serde_json::Value::Bool(true));
     }
-    if let Some(v) = prim.metadata.get("usd:original_topology") {
-        if let Some(s) = v.as_text() {
-            out.extras.insert(
-                "usd:original_topology".into(),
-                serde_json::Value::String(s.to_string()),
-            );
-        }
+    if let Some(v) = prim.metadata.get("usd:original_topology")
+        && let Some(s) = v.as_text()
+    {
+        out.extras.insert(
+            "usd:original_topology".into(),
+            serde_json::Value::String(s.to_string()),
+        );
     }
     // A Mesh prim's own `xformOp:*` opinions land on the typed
     // carrier node's `Transform` (see `build_mesh_group` /
@@ -5141,11 +5130,11 @@ fn apply_preview_surface(
     // authored opinion re-emits (no typed slot in the model).
     {
         let input = "displacement";
-        if let Some(f) = scalar(&format!("inputs:{input}")) {
-            if let Some(n) = serde_json::Number::from_f64(f as f64) {
-                mat.extras
-                    .insert(format!("usd:inputs:{input}"), serde_json::Value::Number(n));
-            }
+        if let Some(f) = scalar(&format!("inputs:{input}"))
+            && let Some(n) = serde_json::Number::from_f64(f as f64)
+        {
+            mat.extras
+                .insert(format!("usd:inputs:{input}"), serde_json::Value::Number(n));
         }
     }
 
@@ -5154,22 +5143,20 @@ fn apply_preview_surface(
     }
     // A constant (unconnected) normal opinion other than the
     // unperturbed default (0, 0, 1) has no typed slot — preserve it.
-    if !surface.attrs.contains_key("inputs:normal.connect") {
-        if let Some(nrm) = color("inputs:normal") {
-            if nrm != [0.0, 0.0, 1.0] {
-                mat.extras.insert(
-                    "usd:inputs:normal".into(),
-                    serde_json::Value::Array(
-                        nrm.iter()
-                            .filter_map(|c| {
-                                serde_json::Number::from_f64(*c as f64)
-                                    .map(serde_json::Value::Number)
-                            })
-                            .collect(),
-                    ),
-                );
-            }
-        }
+    if !surface.attrs.contains_key("inputs:normal.connect")
+        && let Some(nrm) = color("inputs:normal")
+        && nrm != [0.0, 0.0, 1.0]
+    {
+        mat.extras.insert(
+            "usd:inputs:normal".into(),
+            serde_json::Value::Array(
+                nrm.iter()
+                    .filter_map(|c| {
+                        serde_json::Number::from_f64(*c as f64).map(serde_json::Value::Number)
+                    })
+                    .collect(),
+            ),
+        );
     }
 
     // Texture connections — `inputs:diffuseColor.connect = </path/to/Tex.outputs:rgb>`.
@@ -5372,36 +5359,36 @@ fn resolve_shader_connect(
     // bound geometry. Preserve the reader's authored inputs (variant
     // type, `varname` with its type spelling, `fallback` as an exact
     // USDA literal) so the writer re-emits the reader prim verbatim.
-    if let Some(variant) = info_id.strip_prefix("UsdPrimvarReader_") {
-        if PRIMVAR_READER_VARIANTS.contains(&variant) {
-            let mut stash = serde_json::Map::new();
+    if let Some(variant) = info_id.strip_prefix("UsdPrimvarReader_")
+        && PRIMVAR_READER_VARIANTS.contains(&variant)
+    {
+        let mut stash = serde_json::Map::new();
+        stash.insert(
+            "type".into(),
+            serde_json::Value::String(variant.to_string()),
+        );
+        if let Some(vn_attr) = shader.attrs.get("inputs:varname")
+            && let Some(vn) = vn_attr.value.as_text()
+        {
+            stash.insert("varname".into(), serde_json::Value::String(vn.to_string()));
             stash.insert(
-                "type".into(),
-                serde_json::Value::String(variant.to_string()),
+                "varname_type".into(),
+                serde_json::Value::String(vn_attr.type_token.clone()),
             );
-            if let Some(vn_attr) = shader.attrs.get("inputs:varname") {
-                if let Some(vn) = vn_attr.value.as_text() {
-                    stash.insert("varname".into(), serde_json::Value::String(vn.to_string()));
-                    stash.insert(
-                        "varname_type".into(),
-                        serde_json::Value::String(vn_attr.type_token.clone()),
-                    );
-                }
-            }
-            if let Some(fb) = shader.attrs.get("inputs:fallback") {
-                stash.insert(
-                    "fallback".into(),
-                    serde_json::Value::String(crate::usda_writer::format_metadata_value(&fb.value)),
-                );
-                stash.insert(
-                    "fallback_type".into(),
-                    serde_json::Value::String(fb.type_token.clone()),
-                );
-            }
-            return Ok(Some(ShaderConnect::PrimvarReader(
-                serde_json::Value::Object(stash),
-            )));
         }
+        if let Some(fb) = shader.attrs.get("inputs:fallback") {
+            stash.insert(
+                "fallback".into(),
+                serde_json::Value::String(crate::usda_writer::format_metadata_value(&fb.value)),
+            );
+            stash.insert(
+                "fallback_type".into(),
+                serde_json::Value::String(fb.type_token.clone()),
+            );
+        }
+        return Ok(Some(ShaderConnect::PrimvarReader(
+            serde_json::Value::Object(stash),
+        )));
     }
     if info_id != "UsdUVTexture" {
         return Err(unsupported(format!(
@@ -5653,10 +5640,10 @@ fn value_to_json(v: &Value) -> Option<serde_json::Value> {
         Value::ListOp(list) => {
             let mut obj = serde_json::Map::new();
             for (op, sublist) in list.entries() {
-                if let Some(keyword) = op.keyword().or(Some("explicit")) {
-                    if let Some(j) = value_to_json(sublist) {
-                        obj.insert(keyword.to_string(), j);
-                    }
+                if let Some(keyword) = op.keyword().or(Some("explicit"))
+                    && let Some(j) = value_to_json(sublist)
+                {
+                    obj.insert(keyword.to_string(), j);
                 }
             }
             J::Object(obj)

@@ -15,9 +15,9 @@ mod common;
 
 use std::process::Command;
 
-use common::{build_usdz, UsdzEntry};
+use common::{UsdzEntry, build_usdz};
 use oxideav_mesh3d::{Mesh3DDecoder, Scene3D};
-use oxideav_usdz::usda::{parse, Layer, Value};
+use oxideav_usdz::usda::{Layer, Value, parse};
 use oxideav_usdz::usdc::{UsdcFile, Version};
 use oxideav_usdz::usdc_encode::encode_layer;
 use oxideav_usdz::usdc_layer::layer_from_usdc;

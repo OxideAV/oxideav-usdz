@@ -177,9 +177,11 @@ fn writer_emits_spatial_audio_block() {
         report.usda
     );
     assert!(report.usda.contains("uniform asset filePath = @"));
-    assert!(report
-        .usda
-        .contains("uniform token auralMode = \"spatial\""));
+    assert!(
+        report
+            .usda
+            .contains("uniform token auralMode = \"spatial\"")
+    );
     assert!(report.usda.contains("uniform double gain = 0.5"));
 }
 

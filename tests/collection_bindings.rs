@@ -7,7 +7,7 @@
 
 mod common;
 
-use common::{build_usdz, UsdzEntry};
+use common::{UsdzEntry, build_usdz};
 use oxideav_mesh3d::{Mesh3DDecoder, Mesh3DEncoder, Scene3D};
 use oxideav_usdz::{UsdzDecoder, UsdzEncoder};
 

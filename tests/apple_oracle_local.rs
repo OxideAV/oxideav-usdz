@@ -29,10 +29,10 @@ fn usdcat_available() -> bool {
 fn pxr_python() -> Option<String> {
     for candidate in ["python3", "python3.11", "python3.10", "python3.9"] {
         let out = Command::new(candidate).arg("-c").arg("import pxr").output();
-        if let Ok(o) = out {
-            if o.status.success() {
-                return Some(candidate.into());
-            }
+        if let Ok(o) = out
+            && o.status.success()
+        {
+            return Some(candidate.into());
         }
     }
     None

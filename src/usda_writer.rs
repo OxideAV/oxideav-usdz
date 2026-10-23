@@ -197,10 +197,9 @@ pub fn emitted_texture_ids(scene: &Scene3D, opts: &WriteOptions) -> Vec<bool> {
                 .get(key)
                 .and_then(|v| v.get("texture"))
                 .and_then(|v| v.as_u64())
+                && let Some(slot) = used.get_mut(idx as usize)
             {
-                if let Some(slot) = used.get_mut(idx as usize) {
-                    *slot = true;
-                }
+                *slot = true;
             }
         }
     }
@@ -880,63 +879,56 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
         && !node.extras.contains_key("usd:materialBindings")
         && !node.extras.contains_key("usd:collections");
     if prim_metadata_lines.is_empty() || carrier_metadata_ok {
-        if let Some(mesh_id) = node.mesh {
-            if node.children.is_empty()
-                && node.audio_emitter.is_none()
-                && node.camera.is_none()
-                && node.light.is_none()
-            {
-                if let Some(mesh) = scene.mesh(mesh_id) {
-                    let mesh_name = sanitize_prim_name(mesh.name.as_deref().unwrap_or("Mesh"));
-                    // A hand-built primitive carrying its own
-                    // `usd:mesh_transform` keeps the Xform wrapper for
-                    // a non-identity carrier transform (both apply).
-                    let explicit_inner = mesh
-                        .primitives
-                        .iter()
-                        .any(|p| p.extras.contains_key("usd:mesh_transform"));
-                    if mesh_name == safe_name && (is_identity(&node.transform) || !explicit_inner) {
-                        // A skinned carrier still collapses — the
-                        // geometry prim itself carries every §1.5
-                        // BindingAPI opinion, so no Xform wrapper is
-                        // needed (and keeping one would re-grow the
-                        // tree each encode→decode cycle). The carrier's
-                        // transform goes on the Mesh prim itself
-                        // (UsdGeomXformable), which the decoder maps
-                        // straight back onto the carrier node.
-                        let skel = skel_binding_paths(scene, id, node);
-                        w.carrier_transform =
-                            (!is_identity(&node.transform)).then_some(node.transform);
-                        w.carrier_metadata =
-                            (!prim_metadata_lines.is_empty()).then(|| prim_metadata_lines.clone());
-                        write_mesh(w, scene, mesh, mesh_id, parent_path, skel.as_ref());
-                        w.carrier_transform = None;
-                        w.carrier_metadata = None;
-                        return;
-                    }
-                }
+        if let Some(mesh_id) = node.mesh
+            && node.children.is_empty()
+            && node.audio_emitter.is_none()
+            && node.camera.is_none()
+            && node.light.is_none()
+            && let Some(mesh) = scene.mesh(mesh_id)
+        {
+            let mesh_name = sanitize_prim_name(mesh.name.as_deref().unwrap_or("Mesh"));
+            // A hand-built primitive carrying its own
+            // `usd:mesh_transform` keeps the Xform wrapper for
+            // a non-identity carrier transform (both apply).
+            let explicit_inner = mesh
+                .primitives
+                .iter()
+                .any(|p| p.extras.contains_key("usd:mesh_transform"));
+            if mesh_name == safe_name && (is_identity(&node.transform) || !explicit_inner) {
+                // A skinned carrier still collapses — the
+                // geometry prim itself carries every §1.5
+                // BindingAPI opinion, so no Xform wrapper is
+                // needed (and keeping one would re-grow the
+                // tree each encode→decode cycle). The carrier's
+                // transform goes on the Mesh prim itself
+                // (UsdGeomXformable), which the decoder maps
+                // straight back onto the carrier node.
+                let skel = skel_binding_paths(scene, id, node);
+                w.carrier_transform = (!is_identity(&node.transform)).then_some(node.transform);
+                w.carrier_metadata =
+                    (!prim_metadata_lines.is_empty()).then(|| prim_metadata_lines.clone());
+                write_mesh(w, scene, mesh, mesh_id, parent_path, skel.as_ref());
+                w.carrier_transform = None;
+                w.carrier_metadata = None;
+                return;
             }
         }
         // An audio-carrier node (the decoder's shape for a
         // `SpatialAudio` prim) re-emits as that prim directly, its
         // transform inside — otherwise each cycle wraps it in one
         // more Xform.
-        if let Some(emitter_id) = node.audio_emitter {
-            if prim_metadata_lines.is_empty()
-                && node.mesh.is_none()
-                && node.children.is_empty()
-                && node.camera.is_none()
-                && node.light.is_none()
-            {
-                if let Some(emitter) = scene.audio_emitter(emitter_id) {
-                    if let Some(source) = scene.audio_source(emitter.source) {
-                        if spatial_audio_prim_name(emitter, source) == safe_name {
-                            write_spatial_audio(w, emitter, source, Some(&node.transform));
-                            return;
-                        }
-                    }
-                }
-            }
+        if let Some(emitter_id) = node.audio_emitter
+            && prim_metadata_lines.is_empty()
+            && node.mesh.is_none()
+            && node.children.is_empty()
+            && node.camera.is_none()
+            && node.light.is_none()
+            && let Some(emitter) = scene.audio_emitter(emitter_id)
+            && let Some(source) = scene.audio_source(emitter.source)
+            && spatial_audio_prim_name(emitter, source) == safe_name
+        {
+            write_spatial_audio(w, emitter, source, Some(&node.transform));
+            return;
         }
     }
 
@@ -1009,11 +1001,11 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
     // `<parent>/<node_name>/<mesh_name>`. A skinned node passes its
     // bound skeleton's emitted prim path down so the geometry prim
     // carries the §1.5 BindingAPI opinions.
-    if let Some(mesh_id) = node.mesh {
-        if let Some(mesh) = scene.mesh(mesh_id) {
-            let skel = skel_binding_paths(scene, id, node);
-            write_mesh(w, scene, mesh, mesh_id, &path, skel.as_ref());
-        }
+    if let Some(mesh_id) = node.mesh
+        && let Some(mesh) = scene.mesh(mesh_id)
+    {
+        let skel = skel_binding_paths(scene, id, node);
+        write_mesh(w, scene, mesh, mesh_id, &path, skel.as_ref());
     }
 
     // Audio emitter attachment — emit a child `def SpatialAudio`
@@ -1021,12 +1013,11 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
     // produces a sibling node carrying the emitter; on the writer
     // side we nest it inside the parent Xform so the prim path
     // matches the typical USDZ authoring tool's output.
-    if let Some(emitter_id) = node.audio_emitter {
-        if let Some(emitter) = scene.audio_emitter(emitter_id) {
-            if let Some(source) = scene.audio_source(emitter.source) {
-                write_spatial_audio(w, emitter, source, None);
-            }
-        }
+    if let Some(emitter_id) = node.audio_emitter
+        && let Some(emitter) = scene.audio_emitter(emitter_id)
+        && let Some(source) = scene.audio_source(emitter.source)
+    {
+        write_spatial_audio(w, emitter, source, None);
     }
 
     // Children.
@@ -1786,16 +1777,15 @@ fn write_one_mesh_prim(
             .extras
             .get("usd:skel:geomBindTransform")
             .and_then(|v| v.as_array())
+            && let Some(m) = json_matrix4(rows)
         {
-            if let Some(m) = json_matrix4(rows) {
-                w.write_indent();
-                writeln!(
-                    w.s,
-                    "matrix4d primvars:skel:geomBindTransform = {}",
-                    format_matrix4(m)
-                )
-                .unwrap();
-            }
+            w.write_indent();
+            writeln!(
+                w.s,
+                "matrix4d primvars:skel:geomBindTransform = {}",
+                format_matrix4(m)
+            )
+            .unwrap();
         }
         if let Some(method) = prim
             .extras
@@ -1814,11 +1804,12 @@ fn write_one_mesh_prim(
     // §1.5: bind the blend-weight animation source. Skinned geometry
     // already authored the relationship above (one property per prim
     // — the TRS source also carries the blend table in that case).
-    if !prim.targets.is_empty() && !anim_rel_emitted {
-        if let Some(bp) = skel.and_then(|s| s.blend_animation.as_ref()) {
-            w.write_indent();
-            writeln!(w.s, "rel skel:animationSource = <{bp}>").unwrap();
-        }
+    if !prim.targets.is_empty()
+        && !anim_rel_emitted
+        && let Some(bp) = skel.and_then(|s| s.blend_animation.as_ref())
+    {
+        w.write_indent();
+        writeln!(w.s, "rel skel:animationSource = <{bp}>").unwrap();
     }
     // UsdGeomSubset (staged schema Part 1): §1.4 familyType
     // properties replay on the geometric prim with their exact
@@ -1927,12 +1918,12 @@ fn write_geom_subset_child(w: &mut Out, scene: &Scene3D, sub: &SubsetChild) {
         // forms, bindMaterialAs metadata, collection forms).
         Some(bindings) => write_attr_map(w, &bindings.attrs),
         None => {
-            if let Some(mat_id) = sub.material {
-                if let Some(mat) = scene.materials.get(mat_id.0 as usize) {
-                    let mat_name = material_prim_name(mat, mat_id.0 as usize);
-                    w.write_indent();
-                    writeln!(w.s, "rel material:binding = </Materials/{mat_name}>").unwrap();
-                }
+            if let Some(mat_id) = sub.material
+                && let Some(mat) = scene.materials.get(mat_id.0 as usize)
+            {
+                let mat_name = material_prim_name(mat, mat_id.0 as usize);
+                w.write_indent();
+                writeln!(w.s, "rel material:binding = </Materials/{mat_name}>").unwrap();
             }
         }
     }
@@ -1980,12 +1971,12 @@ fn write_material_binding(
 ) {
     if extras.contains_key("usd:materialBindings") {
         replay_attr_stash(w, extras, "usd:materialBindings");
-    } else if let Some(mat_id) = material {
-        if let Some(mat) = scene.materials.get(mat_id.0 as usize) {
-            let mat_name = material_prim_name(mat, mat_id.0 as usize);
-            w.write_indent();
-            writeln!(w.s, "rel material:binding = </Materials/{mat_name}>").unwrap();
-        }
+    } else if let Some(mat_id) = material
+        && let Some(mat) = scene.materials.get(mat_id.0 as usize)
+    {
+        let mat_name = material_prim_name(mat, mat_id.0 as usize);
+        w.write_indent();
+        writeln!(w.s, "rel material:binding = </Materials/{mat_name}>").unwrap();
     }
     replay_attr_stash(w, extras, "usd:collections");
 }
@@ -3528,19 +3519,19 @@ fn write_spatial_audio(
         ("usd:endTime", "endTime"),
         ("usd:mediaOffset", "mediaOffset"),
     ] {
-        if let Some(v) = source.extras.get(extra_key) {
-            if let Some(num) = v.as_f64() {
-                w.write_indent();
-                writeln!(w.s, "uniform double {attr_key} = {}", format_float(num)).unwrap();
-            }
+        if let Some(v) = source.extras.get(extra_key)
+            && let Some(num) = v.as_f64()
+        {
+            w.write_indent();
+            writeln!(w.s, "uniform double {attr_key} = {}", format_float(num)).unwrap();
         }
     }
 
-    if let Some(v) = emitter.extras.get("usd:fillBufferTime") {
-        if let Some(num) = v.as_f64() {
-            w.write_indent();
-            writeln!(w.s, "uniform double fillBufferTime = {}", format_float(num)).unwrap();
-        }
+    if let Some(v) = emitter.extras.get("usd:fillBufferTime")
+        && let Some(num) = v.as_f64()
+    {
+        w.write_indent();
+        writeln!(w.s, "uniform double fillBufferTime = {}", format_float(num)).unwrap();
     }
 
     w.indent -= 1;
@@ -3829,19 +3820,18 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
         .extras
         .get("usd:inputs:specularColor")
         .and_then(|v| v.as_array())
+        && sc.len() == 3
     {
-        if sc.len() == 3 {
-            let c = |i: usize| sc[i].as_f64().unwrap_or(0.0);
-            w.write_indent();
-            writeln!(
-                w.s,
-                "color3f inputs:specularColor = ({}, {}, {})",
-                format_float(c(0)),
-                format_float(c(1)),
-                format_float(c(2))
-            )
-            .unwrap();
-        }
+        let c = |i: usize| sc[i].as_f64().unwrap_or(0.0);
+        w.write_indent();
+        writeln!(
+            w.s,
+            "color3f inputs:specularColor = ({}, {}, {})",
+            format_float(c(0)),
+            format_float(c(1)),
+            format_float(c(2))
+        )
+        .unwrap();
     }
     // Index of refraction — the typed `MaterialExt::ior` slot is
     // `Option`-shaped, so `Some` is exactly "the source authored an
@@ -3894,19 +3884,18 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
         .extras
         .get("usd:inputs:normal")
         .and_then(|v| v.as_array())
+        && nrm.len() == 3
     {
-        if nrm.len() == 3 {
-            let c = |i: usize| nrm[i].as_f64().unwrap_or(0.0);
-            w.write_indent();
-            writeln!(
-                w.s,
-                "normal3f inputs:normal = ({}, {}, {})",
-                format_float(c(0)),
-                format_float(c(1)),
-                format_float(c(2))
-            )
-            .unwrap();
-        }
+        let c = |i: usize| nrm[i].as_f64().unwrap_or(0.0);
+        w.write_indent();
+        writeln!(
+            w.s,
+            "normal3f inputs:normal = ({}, {}, {})",
+            format_float(c(0)),
+            format_float(c(1)),
+            format_float(c(2))
+        )
+        .unwrap();
     }
 
     if let Some(tref) = mat.base_color_texture {
@@ -4104,20 +4093,20 @@ fn write_material(w: &mut Out, scene: &Scene3D, mat: &Material, idx: usize) {
             }
         }
         for key in ["scale", "bias", "fallback"] {
-            if let Some(v4) = stash.and_then(|s| s.get(key)).and_then(|v| v.as_array()) {
-                if v4.len() == 4 {
-                    let c = |i: usize| v4[i].as_f64().unwrap_or(0.0);
-                    w.write_indent();
-                    writeln!(
-                        w.s,
-                        "float4 inputs:{key} = ({}, {}, {}, {})",
-                        format_float(c(0)),
-                        format_float(c(1)),
-                        format_float(c(2)),
-                        format_float(c(3))
-                    )
-                    .unwrap();
-                }
+            if let Some(v4) = stash.and_then(|s| s.get(key)).and_then(|v| v.as_array())
+                && v4.len() == 4
+            {
+                let c = |i: usize| v4[i].as_f64().unwrap_or(0.0);
+                w.write_indent();
+                writeln!(
+                    w.s,
+                    "float4 inputs:{key} = ({}, {}, {}, {})",
+                    format_float(c(0)),
+                    format_float(c(1)),
+                    format_float(c(2)),
+                    format_float(c(3))
+                )
+                .unwrap();
             }
         }
         if let Some(cs) = stash_str("sourceColorSpace") {

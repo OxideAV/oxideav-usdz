@@ -21,7 +21,7 @@ use std::sync::Arc;
 use oxideav_mesh3d::{Mesh3DDecoder, Scene3D};
 
 use crate::error::unsupported;
-use crate::{usd_to_scene, usda, usdc_layer, zip, Result};
+use crate::{Result, usd_to_scene, usda, usdc_layer, zip};
 
 /// USDZ decoder. Constructed via [`UsdzDecoder::new`] (state is
 /// reset on every `decode()` call so a single instance can be
@@ -64,7 +64,7 @@ impl UsdzDecoder {
             other => {
                 return Err(unsupported(format!(
                     "unrecognised USDZ default-layer extension `{other}` (expected .usd / .usda / .usdc)"
-                )))
+                )));
             }
         };
         let layer = if is_crate {

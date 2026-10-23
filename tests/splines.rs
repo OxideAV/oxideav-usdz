@@ -10,10 +10,10 @@
 
 mod common;
 
-use common::{build_usdz, UsdzEntry};
+use common::{UsdzEntry, build_usdz};
 use oxideav_mesh3d::Mesh3DDecoder;
 use oxideav_usdz::spline::{CurveType, DataType, ExtrapolationMode, InterpolationMode};
-use oxideav_usdz::usda::{parse, Value};
+use oxideav_usdz::usda::{Value, parse};
 use oxideav_usdz::usdc::{UsdcFile, Version};
 use oxideav_usdz::usdc_layer::layer_from_usdc;
 use oxideav_usdz::usdc_writer::CrateImage;

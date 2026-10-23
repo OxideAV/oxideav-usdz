@@ -17,7 +17,7 @@ mod common;
 
 use std::process::Command;
 
-use common::{build_usdz, UsdzEntry};
+use common::{UsdzEntry, build_usdz};
 use oxideav_mesh3d::{Mesh3DDecoder, Scene3D, Transform};
 use oxideav_usdz::point_instancer::{self, ExpandOptions, PointInstancer};
 use oxideav_usdz::{UsdzDecoder, UsdzEncoder};
@@ -224,10 +224,11 @@ fn expand_applies_order_and_mask() {
     assert!(!usda.contains("PointInstancer"), "{usda}");
     assert!(usda.contains("def Xform \"Scatter_inst1\""), "{usda}");
     let s2 = decode(&UsdzEncoder::new().encode_bytes(&scene).unwrap());
-    assert!(s2
-        .nodes
-        .iter()
-        .any(|n| n.name.as_deref() == Some("Scatter_inst0")));
+    assert!(
+        s2.nodes
+            .iter()
+            .any(|n| n.name.as_deref() == Some("Scatter_inst0"))
+    );
 }
 
 #[test]

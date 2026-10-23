@@ -14,8 +14,8 @@
 
 mod common;
 
-use oxideav_usdz::usda::{parse, Prim, Value};
 use oxideav_usdz::UsdzDecoder;
+use oxideav_usdz::usda::{Prim, Value, parse};
 
 /// Build a USDZ archive carrying a single USDA layer.
 fn usdz(usda: &str) -> Vec<u8> {

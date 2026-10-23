@@ -94,9 +94,11 @@ fn triangle_fan_expands_into_triangle_list() {
     let report = UsdzEncoder::new()
         .encode_with_report(&scene)
         .expect("encode");
-    assert!(report
-        .usda
-        .contains("(usd:original_topology = \"triangleFan\")"));
+    assert!(
+        report
+            .usda
+            .contains("(usd:original_topology = \"triangleFan\")")
+    );
     let scene2 = UsdzDecoder::new()
         .decode_bytes(&report.bytes)
         .expect("decode");

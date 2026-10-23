@@ -107,9 +107,11 @@ def Material "Mat" {
     let bytes = UsdzEncoder::new().encode_bytes(&scene).expect("encode ok");
     let s2 = UsdzDecoder::new().decode(&bytes).expect("re-decode ok");
     assert_eq!(s2.materials[0].ext.specular, None);
-    assert!(s2.materials[0]
-        .extras
-        .contains_key("usd:inputs:specularColor"));
+    assert!(
+        s2.materials[0]
+            .extras
+            .contains_key("usd:inputs:specularColor")
+    );
     let out = UsdzEncoder::new()
         .encode_with_report(&scene)
         .expect("encode ok")
@@ -166,13 +168,15 @@ def Xform "Root" {
 
     let bytes = UsdzEncoder::new().encode_bytes(&scene).expect("encode ok");
     let s2 = UsdzDecoder::new().decode(&bytes).expect("re-decode ok");
-    assert!(s2.materials[0]
-        .ext
-        .specular
-        .as_ref()
-        .expect("workflow survives")
-        .color_texture
-        .is_some());
+    assert!(
+        s2.materials[0]
+            .ext
+            .specular
+            .as_ref()
+            .expect("workflow survives")
+            .color_texture
+            .is_some()
+    );
     let first = UsdzEncoder::new()
         .encode_with_report(&scene)
         .expect("encode ok")

@@ -11,7 +11,7 @@
 
 mod common;
 
-use common::{build_usdz, UsdzEntry};
+use common::{UsdzEntry, build_usdz};
 use oxideav_mesh3d::{Mesh3DDecoder, Scene3D};
 use oxideav_usdz::{CompositionMode, LayerFormat, UsdzDecoder, UsdzEncoder};
 
@@ -299,10 +299,10 @@ fn elephant_crate_fixture_is_a_fixed_point() {
     fn collect(prims: &[oxideav_usdz::usda::Prim], out: &mut Vec<String>) {
         for p in prims {
             for a in p.attrs.values() {
-                if let oxideav_usdz::usda::Value::Asset(path) = &a.value {
-                    if !out.contains(path) {
-                        out.push(path.clone());
-                    }
+                if let oxideav_usdz::usda::Value::Asset(path) = &a.value
+                    && !out.contains(path)
+                {
+                    out.push(path.clone());
                 }
             }
             collect(&p.children, out);

@@ -15,9 +15,9 @@
 
 mod common;
 
-use common::{build_usdz, UsdzEntry};
+use common::{UsdzEntry, build_usdz};
 use oxideav_mesh3d::{Mesh3DDecoder, Scene3D, Transform};
-use oxideav_usdz::usda::{parse, Value};
+use oxideav_usdz::usda::{Value, parse};
 use oxideav_usdz::usdc::{UsdcFile, Version};
 use oxideav_usdz::usdc_layer::layer_from_usdc;
 use oxideav_usdz::usdc_writer::CrateImage;
@@ -130,10 +130,12 @@ fn relocate_moves_the_referenced_child_under_the_local_over() {
     // contributes the rest (translate is not authored locally, so the
     // merged xformOpOrder is the local one — scale only).
     assert!(matches!(moved.transform, Transform::Trs { scale, .. } if scale == [2.0, 2.0, 2.0]));
-    assert!(moved
-        .children
-        .iter()
-        .any(|c| scene.node(*c).unwrap().mesh.is_some()));
+    assert!(
+        moved
+            .children
+            .iter()
+            .any(|c| scene.node(*c).unwrap().mesh.is_some())
+    );
     assert_eq!(
         scene.extras["usd:composedRelocates"],
         serde_json::json!(["/Root/Child|/Root/Relocated_Child"])
@@ -174,10 +176,12 @@ fn invalid_relocates_entries_are_ignored() {
         "</Root> : </Elsewhere>, </Root/Child> : </Root/Child/Deeper>, </Root/Child> : </Root/Child>, </Root/Missing> : </Root/Nope>",
     );
     let scene = decode(&package(&root));
-    assert!(scene
-        .nodes
-        .iter()
-        .any(|n| n.name.as_deref() == Some("Child")));
+    assert!(
+        scene
+            .nodes
+            .iter()
+            .any(|n| n.name.as_deref() == Some("Child"))
+    );
     assert!(!scene.extras.contains_key("usd:composedRelocates"));
 }
 

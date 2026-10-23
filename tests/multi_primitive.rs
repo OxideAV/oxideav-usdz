@@ -124,15 +124,21 @@ fn three_primitive_mesh_with_distinct_materials() {
         .expect("encode");
     // Each primitive must reference its bound material via
     // `rel material:binding` against the synthetic /Materials scope.
-    assert!(report
-        .usda
-        .contains("rel material:binding = </Materials/Red>"));
-    assert!(report
-        .usda
-        .contains("rel material:binding = </Materials/Green>"));
-    assert!(report
-        .usda
-        .contains("rel material:binding = </Materials/Blue>"));
+    assert!(
+        report
+            .usda
+            .contains("rel material:binding = </Materials/Red>")
+    );
+    assert!(
+        report
+            .usda
+            .contains("rel material:binding = </Materials/Green>")
+    );
+    assert!(
+        report
+            .usda
+            .contains("rel material:binding = </Materials/Blue>")
+    );
     assert!(report.usda.contains("def Mesh \"Multi\""));
     assert!(report.usda.contains("def Mesh \"Multi_1\""));
     assert!(report.usda.contains("def Mesh \"Multi_2\""));

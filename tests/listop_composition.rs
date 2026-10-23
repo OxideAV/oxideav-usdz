@@ -13,9 +13,9 @@
 
 mod common;
 
-use common::{build_usdz, UsdzEntry};
-use oxideav_usdz::usda::{parse, ListEditOp, Value};
+use common::{UsdzEntry, build_usdz};
 use oxideav_usdz::UsdzDecoder;
+use oxideav_usdz::usda::{ListEditOp, Value, parse};
 
 fn usdz_of(entries: &[(&str, &str)]) -> Vec<u8> {
     let entries: Vec<UsdzEntry> = entries
