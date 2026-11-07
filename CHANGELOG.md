@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-usdz/compare/v0.0.5...v0.0.6) - 2026-11-07
+
+### Other
+
+- API hygiene: #[non_exhaustive] on growable enums + scene / composition records, Default and setters, hide Crate / zip plumbing modules
+- edition 2024, MSRV 1.95
+
 ### Added
 
 - `Default` on `composition::SourceLayer`, `composition::SourceAsset`, `EncodeReport`, `usda::Prim`, `usda::Layer` and `usda_writer::EmittedAsset`; `usda::Attr::new(..)` (every field, in declaration order); `with_<field>` setters on `usda_writer::WriteOptions` and `point_instancer::ExpandOptions`.
