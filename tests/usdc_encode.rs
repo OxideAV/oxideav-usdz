@@ -232,12 +232,14 @@ fn canonical(v: &Value) -> Value {
                     other => Value::Array(vec![other]),
                 })
             };
-            Value::ListOp(Box::new(oxideav_usdz::usda::ListOp {
-                prepended: sub(&op.prepended),
-                appended: sub(&op.appended),
-                deleted: sub(&op.deleted),
-                explicit: sub(&op.explicit),
-                reordered: sub(&op.reordered),
+            Value::ListOp(Box::new({
+                let mut list_op = oxideav_usdz::usda::ListOp::default();
+                list_op.prepended = sub(&op.prepended);
+                list_op.appended = sub(&op.appended);
+                list_op.deleted = sub(&op.deleted);
+                list_op.explicit = sub(&op.explicit);
+                list_op.reordered = sub(&op.reordered);
+                list_op
             }))
         }
         other => other.clone(),

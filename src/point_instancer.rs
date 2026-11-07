@@ -107,6 +107,7 @@ pub enum OrientationPrecision {
 
 /// The §2.1 / §2.2 / §2.4 surface of one `PointInstancer` prim.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct PointInstancer {
     /// §2.1 `rel prototypes` — absolute prim paths, target order =
     /// prototype index.
@@ -546,12 +547,29 @@ fn interpolate<const N: usize>(
 
 /// Options for [`expand`].
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct ExpandOptions {
     /// Evaluation time in the layer's timeCodes; `None` evaluates
     /// the default values.
     pub time: Option<f64>,
     /// The layer's `timeCodesPerSecond` (§2.3 velocity time-scaling).
     pub time_codes_per_second: f64,
+}
+
+impl ExpandOptions {
+    /// Set `time`.
+    #[must_use]
+    pub fn with_time(mut self, time: Option<f64>) -> Self {
+        self.time = time;
+        self
+    }
+
+    /// Set `time_codes_per_second`.
+    #[must_use]
+    pub fn with_time_codes_per_second(mut self, time_codes_per_second: f64) -> Self {
+        self.time_codes_per_second = time_codes_per_second;
+        self
+    }
 }
 
 impl Default for ExpandOptions {

@@ -58,6 +58,7 @@ pub const PRIM_ARC_KEYS: [&str; 4] = ["references", "payload", "inherits", "spec
 
 /// How the encoder treats composed structure.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CompositionMode {
     /// Emit one self-contained layer with every composed opinion
     /// flattened in. Consumed arcs are not re-authored; in-archive
@@ -76,7 +77,8 @@ pub enum CompositionMode {
 }
 
 /// One package entry the composition consumed, with its bytes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct SourceLayer {
     /// Archive entry name (e.g. `geom.usda`, `props/Marble.usd`).
     pub path: String,
@@ -89,7 +91,8 @@ pub struct SourceLayer {
 }
 
 /// A non-layer package entry referenced from a [`SourceLayer`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct SourceAsset {
     /// Archive entry name.
     pub path: String,
@@ -99,6 +102,7 @@ pub struct SourceAsset {
 
 /// The typed opinion model — see the module docs.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct CompositionRecord {
     /// Entry name of the root (default) layer in the source package.
     pub root_layer: String,

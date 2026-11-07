@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Default` on `composition::SourceLayer`, `composition::SourceAsset`, `EncodeReport`, `usda::Prim`, `usda::Layer` and `usda_writer::EmittedAsset`; `usda::Attr::new(..)` (every field, in declaration order); `with_<field>` setters on `usda_writer::WriteOptions` and `point_instancer::ExpandOptions`.
+
+### Changed
+
+- `#[non_exhaustive]` on the growable enums `CompositionMode`, `LayerFormat` and `usda::Value`, and on the records `ZipStoredAsset`, `CompositionRecord`, `composition::SourceLayer`, `composition::SourceAsset`, `EncodeReport`, `PointInstancer`, `point_instancer::ExpandOptions`, `spline::Knot`, `spline::Spline`, `usda::Prim`, `usda::Variant`, `usda::Attr`, `usda::ListOp`, `usda::Layer`, `usda_writer::WriteOptions`, `usda_writer::EmittedAsset`. The Core-Specification enums `spline::CurveType`, `spline::InterpolationMode`, `spline::ExtrapolationMode`, `spline::DataType`, `usda::ListEditOp` and `point_instancer::OrientationPrecision` stay exhaustive, as do the value records `spline::Tangent`, `spline::LoopParams` and `point_instancer::Sampled`.
+- `#[doc(hidden)]` on the Crate / archive plumbing modules `usdc`, `usdc_encode`, `usdc_layer`, `usdc_values`, `usdc_writer`, `usd_to_scene`, `variant_codec`, `zip` and `zip_writer` (still `pub` for the crate's tests).
+
 ### Changed
 
 - edition 2024, MSRV 1.95

@@ -178,6 +178,7 @@ pub struct Tangent {
 
 /// §7.4.2.4.3 spline knot.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct Knot {
     /// Knot time (timeCode).
     pub time: f64,
@@ -240,6 +241,7 @@ impl DataType {
 
 /// The spline value.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct Spline {
     /// Curve type.
     pub curve_type: CurveType,

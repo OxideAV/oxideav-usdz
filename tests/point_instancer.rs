@@ -240,10 +240,9 @@ fn expand_at_time_uses_velocity_path() {
     let ids = point_instancer::expand(
         &mut scene,
         id,
-        ExpandOptions {
-            time: Some(12.0),
-            time_codes_per_second: 24.0,
-        },
+        ExpandOptions::default()
+            .with_time(Some(12.0))
+            .with_time_codes_per_second(24.0),
     )
     .unwrap();
     let inst0 = scene.node(ids[0]).unwrap();

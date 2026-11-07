@@ -27,6 +27,7 @@ use oxideav_mesh3d::asset::{AssetSource, RawStorage, ReadSeek};
 /// `archive` is the entire ZIP bytes (Arc'd so multiple
 /// `AssetSource`s can share without copying); `offset` and `length`
 /// pin the inner-file payload.
+#[non_exhaustive]
 pub struct ZipStoredAsset {
     /// Reference to the entire USDZ archive bytes.
     pub archive: Arc<Vec<u8>>,

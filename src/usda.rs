@@ -39,7 +39,8 @@ pub const USDA_MAGIC: &[u8] = b"#usda";
 ///
 /// Children appear in declaration order; metadata + attrs are
 /// stored in `BTreeMap` for deterministic iteration in tests.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Default)]
+#[non_exhaustive]
 pub struct Prim {
     /// `def`, `over`, or `class`. Round 1 only acts on `def`; the
     /// other two are preserved for round-trip but ignored by
@@ -104,6 +105,7 @@ pub struct Prim {
 /// [`Prim::variant_sets`] and the type/spec are inherited from the
 /// enclosing prim when the variant is selected.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct Variant {
     /// Optional `( ... )` metadata block — `prepend references = ...`,
     /// `kind = "..."`, etc. Same shape as [`Prim::metadata`].
@@ -249,6 +251,7 @@ impl Prim {
 
 /// One attribute or relationship statement inside a prim body.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Attr {
     /// Type token as written, e.g. `point3f[]`, `color3f`,
     /// `uniform token`, `rel`. Preserved verbatim so a writer
@@ -261,8 +264,20 @@ pub struct Attr {
     pub metadata: BTreeMap<String, Value>,
 }
 
+impl Attr {
+    /// Build `Attr` from every field, in declaration order.
+    pub fn new(type_token: String, value: Value, metadata: BTreeMap<String, Value>) -> Self {
+        Self {
+            type_token,
+            value,
+            metadata,
+        }
+    }
+}
+
 /// USDA value variants relevant to the round-1 schema mappings.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Value {
     /// Token / identifier without quotes (`"none"` ↔ raw `none`).
     Token(String),
@@ -412,6 +427,7 @@ impl ListEditOp {
 /// `prepend references = @b@`) merge losslessly. Entries are stored in
 /// authoring order within each sublist.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct ListOp {
     /// `prepend`-authored value (the strongest additive sublist).
     pub prepended: Option<Value>,
@@ -543,7 +559,8 @@ impl Value {
 }
 
 /// Top-level parsed USDA layer.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Default)]
+#[non_exhaustive]
 pub struct Layer {
     /// Layer-level `( ... )` metadata block — `defaultPrim`,
     /// `upAxis`, `metersPerUnit`, custom keys.

@@ -550,16 +550,25 @@ pub mod encoder;
 pub mod error;
 pub mod point_instancer;
 pub mod spline;
+#[doc(hidden)] // internal — exposed for tests; not part of the stable API
 pub mod usd_to_scene;
 pub mod usda;
 pub mod usda_writer;
+#[doc(hidden)] // internal — exposed for tests; not part of the stable API
 pub mod usdc;
+#[doc(hidden)] // internal — exposed for tests; not part of the stable API
 pub mod usdc_encode;
+#[doc(hidden)] // internal — exposed for tests; not part of the stable API
 pub mod usdc_layer;
+#[doc(hidden)] // internal — exposed for tests; not part of the stable API
 pub mod usdc_values;
+#[doc(hidden)] // internal — exposed for tests; not part of the stable API
 pub mod usdc_writer;
+#[doc(hidden)] // internal — exposed for tests; not part of the stable API
 pub mod variant_codec;
+#[doc(hidden)] // internal — exposed for tests; not part of the stable API
 pub mod zip;
+#[doc(hidden)] // internal — exposed for tests; not part of the stable API
 pub mod zip_writer;
 
 pub use asset_source::ZipStoredAsset;

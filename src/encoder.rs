@@ -35,6 +35,7 @@ use crate::zip_writer::Writer;
 
 /// Serialisation of the emitted root layer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LayerFormat {
     /// `#usda 1.0` text (`scene.usda`) — the default.
     #[default]
@@ -251,7 +252,8 @@ impl Mesh3DEncoder for UsdzEncoder {
 }
 
 /// Verbose return shape from [`UsdzEncoder::encode_with_report`].
-#[derive(Debug)]
+#[derive(Debug, Default)]
+#[non_exhaustive]
 pub struct EncodeReport {
     /// Final USDZ archive bytes.
     pub bytes: Vec<u8>,

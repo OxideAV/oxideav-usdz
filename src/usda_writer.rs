@@ -32,10 +32,20 @@ pub const DEFAULT_ROOT_LAYER_NAME: &str = "scene.usda";
 
 /// Writer options — see [`write_layer_with`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct WriteOptions {
     /// Flatten (default) or preserve the composed structure recorded
     /// on `Scene3D::extras["usd:composition"]`.
     pub composition: CompositionMode,
+}
+
+impl WriteOptions {
+    /// Set `composition`.
+    #[must_use]
+    pub fn with_composition(mut self, composition: CompositionMode) -> Self {
+        self.composition = composition;
+        self
+    }
 }
 
 /// `Scene3D::extras` key holding the lossless layer-metadata blob
@@ -348,7 +358,8 @@ fn bake_texture_transforms(scene: &Scene3D) -> Option<Scene3D> {
 /// whether the bytes came straight from a `RawStorage` slice (the
 /// USDZ → USDZ optimisation surface) or were materialised through
 /// the streaming `open()` path.
-#[derive(Debug)]
+#[derive(Debug, Default)]
+#[non_exhaustive]
 pub struct EmittedAsset {
     pub name: String,
     pub bytes: Vec<u8>,
