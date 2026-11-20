@@ -6,8 +6,9 @@
 //!
 //! * Every entry uses PKZIP method 0 (STORED — uncompressed).
 //! * Every payload begins on a multiple-of-64 byte offset from the
-//!   archive start. The local-file-header `extra` field is padded
-//!   with NULs to push the payload onto the boundary.
+//!   archive start. The local-file-header `extra` field holds one
+//!   padding record (id `0x1986`, zero body) that pushes the payload
+//!   onto the boundary.
 //! * Each central-directory entry mirrors the local file header and
 //!   carries the same CRC32 (computed over the payload here, not
 //!   inherited from any source).
@@ -26,6 +27,11 @@ const LFH_SIGNATURE: u32 = 0x04034b50;
 const CDIR_SIGNATURE: u32 = 0x02014b50;
 const EOCD_SIGNATURE: u32 = 0x06054b50;
 const USDZ_ALIGNMENT: u64 = 64;
+
+/// Header id of the extra-field record that carries the alignment
+/// padding, and the size of a record header (id + body size).
+const PAD_RECORD_ID: u16 = 0x1986;
+const PAD_RECORD_HEADER: u64 = 4;
 
 /// Largest value the classic (non-ZIP64) 4-byte size/offset slots can
 /// hold. USDZ forbids ZIP64 (`GAP-TRACKER.md` §3), so a payload, local
@@ -112,11 +118,15 @@ impl Writer {
         let payload_len = payload.len() as u32;
         let crc32 = crc32(payload);
 
-        // Local file header is 30 bytes fixed + name + extra. We
-        // pick `extra_len` so the absolute payload offset is a
-        // multiple of 64.
-        let base = lfh_offset + 30 + name.len() as u64;
-        let extra_len = ((USDZ_ALIGNMENT - (base % USDZ_ALIGNMENT)) % USDZ_ALIGNMENT) as u16;
+        // Local file header is 30 bytes fixed + name + extra. The
+        // extra field is one well-formed record — header id
+        // `0x1986`, a 2-byte body size, a zero body — sized so the
+        // absolute payload offset is a multiple of 64 (erratum 2 of
+        // the staged notes on §16.4.1.3: the record is present even
+        // when its body is empty).
+        let base = lfh_offset + 30 + name.len() as u64 + PAD_RECORD_HEADER;
+        let pad_body = ((USDZ_ALIGNMENT - (base % USDZ_ALIGNMENT)) % USDZ_ALIGNMENT) as u16;
+        let extra_len = PAD_RECORD_HEADER as u16 + pad_body;
 
         // ---- LFH ----------------------------------------------------
         self.out.extend_from_slice(&LFH_SIGNATURE.to_le_bytes());
@@ -136,7 +146,9 @@ impl Writer {
             .extend_from_slice(&(name.len() as u16).to_le_bytes());
         self.out.extend_from_slice(&extra_len.to_le_bytes());
         self.out.extend_from_slice(name.as_bytes());
-        self.out.resize(self.out.len() + extra_len as usize, 0);
+        self.out.extend_from_slice(&PAD_RECORD_ID.to_le_bytes());
+        self.out.extend_from_slice(&pad_body.to_le_bytes());
+        self.out.resize(self.out.len() + pad_body as usize, 0);
 
         debug_assert_eq!(
             self.out.len() as u64 % USDZ_ALIGNMENT,

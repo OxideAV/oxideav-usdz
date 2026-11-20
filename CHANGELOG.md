@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `usda_emit::layer_to_usda` — a generic text writer for the layer model (§16.2): any `usda::Layer`, read from text or from a Crate file, prints as `#usda 1.0`, numbers at the shortest digits that read back exactly at the attribute's precision.
 - Layer model: `Value::Reference` (reference / payload items with a layer offset or custom data), `Value::Block` (a blocked attribute default, distinct from no default), `Value::Typed` (dictionary members whose declared type their value does not imply), `Value::Integer` (64-bit integers past 2⁵³), `ListOp::added` (the deprecated `add` operator kept apart from `append`), `Variant::variant_sets` (nested variant sets), and the `subLayerOffsets` / `primOrder` / `propertyOrder` / `comment` fields.
 - Text parser: layer offsets on `subLayers`, reference and payload items (`(offset = …; scale = …; customData = {…})`), list-edited relationship and `.connect` statements, `reorder nameChildren` / `reorder properties` / `reorder rootPrims`, the bare comment string of a metadata block, quoted dictionary keys, `;` statement separators, nested `variantSet` blocks, exact 64-bit integer literals.
+- `tests/usdz_package_rules.rs`: the §16.4 container rules re-checked on the written bytes by an independent walker and by `usdchecker` / `usdzip` / `usdcat` where installed.
 - `tests/layer_sweep.rs`: every staged fixture and the in-tree reference layer through read → write (Crate and text) → read, with byte-level fixed points and black-box agreement.
 
 - Crate writer array coding: integral arrays take the §16.3.9.3.1 compressed-integer form and scalar `half` / `float` / `double` arrays the §16.3.9.3.2 all-integral (`i`) or lookup-table (`t`) form whenever that is smaller than the raw run; uncompressed arrays sit on 8-byte boundaries. Identical values, time-code vectors, time-sample records, dictionaries and field sets are stored once. The staged Elephant fixture re-encodes to 736 462 B (raw writer 2 932 917 B, source file 851 298 B). `usdc_encode::encode_layer_with` + `ArrayCoding::{Smallest, Raw}` select the policy; `encode_layer` uses `Smallest`.
@@ -20,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- USDZ writer: the alignment padding in a local file header's extra field is a well-formed record (header id `0x1986`, body size, zero body) instead of bare zero bytes that no ZIP reader can parse as extra records.
+- A prim that authors `material:binding` applies `MaterialBindingAPI` in its `apiSchemas` (merged into any authored `prepend apiSchemas` line; `SkelBindingAPI` joins the same line instead of a second statement that replaced the first for other readers).
 - Crate `inheritPaths` is the `inherits` arc: the reader left it under its field name (so a Crate-authored inherit never composed) and the writer emitted a field named `inherits` that no other reader looks for.
 - Crate `documentation` on attributes and relationships maps to `doc`, as it already did on prims and layers; `primOrder` / `propertyOrder` are written as token vectors and `permission` as its enumeration.
 - Crate reader keeps reference / payload layer offsets and reference custom data instead of dropping them, and non-identity sublayer offsets survive the text form.

@@ -40,8 +40,17 @@ let out   = UsdzEncoder::new().encode(&scene)?;
   and the count of central-directory records walked is validated against
   the EOCD's declared total.
 - **Writer** emits a byte-faithful archive: STORED entries only, every
-  payload offset padded (via the LFH `extra` field) onto a 64-byte
-  boundary, per-entry CRC32, correct central directory + EOCD. The
+  payload offset padded onto a 64-byte boundary by one well-formed
+  extra-field record in the local file header (id `0x1986`, zero
+  body — present even when no padding is needed), per-entry CRC32,
+  the root layer first in both the file and the central directory,
+  and the End of Central Directory record last with no comment.
+  `tests/usdz_package_rules.rs` re-walks the bytes with its own
+  parser and, where the tools are installed, has `usdchecker` pass
+  the package, `usdzip` report the same entries at the same data
+  offsets and `usdcat` open the root layer through it — for a text
+  and for a Crate root layer. A prim that authors a material
+  binding applies `MaterialBindingAPI`. The
   fallible `Writer::try_add_stored` / `try_finish` surface returns
   `Unsupported` when an entry or the assembled archive would cross the
   ZIP64 boundary USDZ forbids (a `≥ 2³²`-byte payload/offset or `> 2¹⁶-1`

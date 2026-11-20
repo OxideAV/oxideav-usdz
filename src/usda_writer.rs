@@ -1701,11 +1701,14 @@ fn write_one_mesh_prim(
     if extras_no_fold(&prim.extras) {
         metadata_lines.push("usd:no_fold = 1".to_string());
     }
+    if binds_material(scene, prim) {
+        apply_api_schema(&mut metadata_lines, "MaterialBindingAPI");
+    }
     let skinned = skel.is_some_and(|s| s.skeleton.is_some()) && prim.joints.is_some();
     if skinned {
         // §1.5: BindingAPI is an applied API schema — declare it on
         // the skinned geometry prim.
-        metadata_lines.push("prepend apiSchemas = [\"SkelBindingAPI\"]".to_string());
+        apply_api_schema(&mut metadata_lines, "SkelBindingAPI");
     }
     w.write_indent();
     if metadata_lines.is_empty() {
@@ -1995,6 +1998,54 @@ fn write_material_binding(
         writeln!(w.s, "rel material:binding = </Materials/{mat_name}>").unwrap();
     }
     replay_attr_stash(w, extras, "usd:collections");
+}
+
+/// `true` when [`write_material_binding`] will author a binding for
+/// this primitive.
+fn binds_material(scene: &Scene3D, prim: &Primitive) -> bool {
+    prim.extras.contains_key("usd:materialBindings")
+        || prim
+            .material
+            .is_some_and(|id| scene.materials.get(id.0 as usize).is_some())
+}
+
+/// Declare an applied API schema in a prim's metadata lines (staged
+/// UsdShade notes, Part 3: applying `MaterialBindingAPI` adds it to
+/// the prim's `apiSchemas` list op; UsdSkel §1.5 likewise for
+/// `SkelBindingAPI`). A schema some line already names is left
+/// alone; otherwise it joins the existing `prepend apiSchemas` line,
+/// or a new one placed where the key sorts — the position a decoded
+/// prim's own metadata gives it, so the output is stable across
+/// encode → decode cycles.
+fn apply_api_schema(lines: &mut Vec<String>, schema: &str) {
+    fn key(line: &str) -> &str {
+        let head = line.split('=').next().unwrap_or_default().trim();
+        head.rsplit(' ').next().unwrap_or_default()
+    }
+    let quoted = format!("\"{schema}\"");
+    if lines
+        .iter()
+        .any(|l| key(l) == "apiSchemas" && !l.starts_with("delete ") && l.contains(&quoted))
+    {
+        return;
+    }
+    if let Some(line) = lines
+        .iter_mut()
+        .find(|l| l.starts_with("prepend apiSchemas = [") && l.ends_with(']'))
+    {
+        line.pop();
+        if !line.ends_with('[') {
+            line.push_str(", ");
+        }
+        line.push_str(&quoted);
+        line.push(']');
+        return;
+    }
+    let at = lines
+        .iter()
+        .position(|l| key(l) > "apiSchemas")
+        .unwrap_or(lines.len());
+    lines.insert(at, format!("prepend apiSchemas = [{quoted}]"));
 }
 
 /// Re-author a decoder-split subset mesh as a **single**
@@ -3305,6 +3356,9 @@ fn write_basis_curves_prim(w: &mut Out, scene: &Scene3D, prim: &Primitive, prim_
     if extras_no_fold(&prim.extras) {
         metadata_lines.push("usd:no_fold = 1".to_string());
     }
+    if binds_material(scene, prim) {
+        apply_api_schema(&mut metadata_lines, "MaterialBindingAPI");
+    }
     w.write_indent();
     writeln!(
         w.s,
@@ -3404,6 +3458,9 @@ fn write_points_prim(w: &mut Out, scene: &Scene3D, prim: &Primitive, prim_name: 
     metadata_lines.push("usd:original_topology = \"points\"".to_string());
     if extras_no_fold(&prim.extras) {
         metadata_lines.push("usd:no_fold = 1".to_string());
+    }
+    if binds_material(scene, prim) {
+        apply_api_schema(&mut metadata_lines, "MaterialBindingAPI");
     }
     w.write_indent();
     writeln!(
