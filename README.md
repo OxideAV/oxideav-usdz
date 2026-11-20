@@ -395,6 +395,38 @@ generic `.usd` layer dispatches on its header byte run (§16.1:
   reads our output and `usdchecker` passes the package where the
   tools are installed, and the staged fixtures are one-cycle fixed
   points through the Crate form.
+- **Array coding and value sharing** — per array the writer
+  stores the smallest of the §16.3.9.3 forms: raw (on an 8-byte
+  boundary, §16.3.3), compressed integers for `int` / `uint` /
+  `int64` / `uint64`, and for scalar `half` / `float` / `double`
+  arrays the all-integral (`i`) or lookup-table (`t`) coding;
+  dimensioned element types stay raw, as the format requires.
+  Arrays shorter than sixteen elements are never compressed.
+  Identical values (arrays, offset scalars, list operations,
+  time-code vectors, whole time-sample records, dictionaries) are
+  stored once, identical field sets share one run, and the
+  time-sample record is a single position-independent block. The
+  output decodes to the same layer as the raw form, is byte-stable
+  through read → write, and a black-box reader prints both forms
+  identically. `usdc_encode::encode_layer_with(layer,
+  ArrayCoding::Raw)` keeps the uncompressed, unshared layout.
+- **Dictionary keys** index the STRINGS section on both the read
+  and the write path — what a Crate written by a black-box encoder
+  carries (pinned by `tests/data/dictionary-keys.usdc`);
+  §16.3.10.19 words the key as a TOKENS index, which neither that
+  file nor a black-box reader bears out.
+- `timecode` values stamp Crate 0.9.0 and `pathExpression` values
+  0.10.0 (§16.3.8.2).
+
+### Crate writer size
+
+Staged fixtures read into the layer model and written back
+(`cargo test --release --test usdc_compression -- --nocapture`):
+
+| Fixture | Source file | Raw writer | Smallest coding |
+|---|---:|---:|---:|
+| `SoC-ElephantWithMonochord.usdc` | 851 298 B | 2 932 917 B | **736 462 B** (0.25× raw, 0.87× source) |
+| `crate-variant-specs.usdc` | 1 836 B | 1 943 B | **1 764 B** |
 
 Variant / VariantSet spec forms (10/11) bridge into the text
 model's `variantSet` blocks — the `{set=sel}` selector paths fold

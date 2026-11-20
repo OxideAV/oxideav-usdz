@@ -9,7 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Crate writer array coding: integral arrays take the §16.3.9.3.1 compressed-integer form and scalar `half` / `float` / `double` arrays the §16.3.9.3.2 all-integral (`i`) or lookup-table (`t`) form whenever that is smaller than the raw run; uncompressed arrays sit on 8-byte boundaries. Identical values, time-code vectors, time-sample records, dictionaries and field sets are stored once. The staged Elephant fixture re-encodes to 736 462 B (raw writer 2 932 917 B, source file 851 298 B). `usdc_encode::encode_layer_with` + `ArrayCoding::{Smallest, Raw}` select the policy; `encode_layer` uses `Smallest`.
+- `pathExpression` attribute type on the Crate writer.
 - `Default` on `composition::SourceLayer`, `composition::SourceAsset`, `EncodeReport`, `usda::Prim`, `usda::Layer` and `usda_writer::EmittedAsset`; `usda::Attr::new(..)` (every field, in declaration order); `with_<field>` setters on `usda_writer::WriteOptions` and `point_instancer::ExpandOptions`.
+
+### Fixed
+
+- Crate dictionary keys are STRINGS-section indices on read and write. Keys were resolved through TOKENS, which misnamed every member of a dictionary written by another encoder and made a black-box reader print ours with empty keys.
+- The Crate writer stamps 0.9.0 for `timecode` values and 0.10.0 for `pathExpression` values instead of 0.8.0.
+- A property authored only through a companion statement (`float x.timeSamples = {…}`) takes its place in name order, so a text layer and its re-read Crate form encode to the same bytes.
 
 ### Changed
 

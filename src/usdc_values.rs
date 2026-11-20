@@ -454,18 +454,19 @@ impl<'a> ValueDecoder<'a> {
         Ok(i32::from_le_bytes(self.get(off, 4)?.try_into().unwrap()))
     }
 
-    /// §16.3.10.19 dictionary: `[u64 count]` then per entry a 4-byte
-    /// token-index key and an 8-byte signed offset (relative to the
-    /// offset field's own position) to the member's rep word.
     /// §16.3.10.19 dictionary: `[u64 count]`, then per member a
-    /// `u32` key token and an `i64` forward offset (from the `i64`'s
+    /// `u32` key and an `i64` forward offset (from the `i64`'s
     /// own position) to the member's rep word. Members are
     /// **chained**: the member's payload bytes sit between its `i64`
     /// and its rep word, and the next member's key follows that rep
     /// word — pinned on a production file (a black-box-produced
     /// dictionary crate; §16.3.10.19 states the offset but not the
-    /// interleaving). Returns the map and the position just past the
-    /// last member's rep word.
+    /// interleaving). The key is an index into the **STRINGS**
+    /// section: §16.3.10.19 words it "an Index to the Token section",
+    /// but a Crate written by a black-box encoder from a text layer
+    /// with known keys resolves only through STRINGS (pinned by
+    /// `tests/data/dictionary-keys.usdc`). Returns the map and the
+    /// position just past the last member's rep word.
     fn decode_dictionary(&self, off: usize, depth: u32) -> Result<BTreeMap<String, Value>> {
         Ok(self.decode_dictionary_span(off, depth)?.0)
     }
@@ -480,7 +481,7 @@ impl<'a> ValueDecoder<'a> {
         let mut cursor = off + 8;
         for _ in 0..count {
             let key_idx = u32::from_le_bytes(self.get(cursor, 4)?.try_into().unwrap());
-            let key = self.token(u64::from(key_idx))?.to_owned();
+            let key = self.string(u64::from(key_idx))?.to_owned();
             let rel = self.i64_at(cursor + 4)?;
             let target = checked_rel(cursor + 4, rel)?;
             let inner = ValueRep::from_raw(self.u64_at(target)?);

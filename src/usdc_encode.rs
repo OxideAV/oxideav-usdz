@@ -19,8 +19,11 @@
 //!   with `variantChildren`, Variant (10) with its body;
 //! * **value encoding** per §16.3.9 / §16.3.10: the inlining rules
 //!   (4-byte scalars, pool indices, int8 vectors and matrix
-//!   diagonals, empty dictionaries), offset scalars, uncompressed
-//!   arrays, dictionaries, the six-sublist list operations, reference
+//!   diagonals, empty dictionaries), offset scalars, arrays in the
+//!   smallest of their §16.3.9.3 forms (raw, compressed integers,
+//!   all-integral / lookup-table floats), values stored once however
+//!   often they are authored, dictionaries, the six-sublist list
+//!   operations, reference
 //!   / payload records, variant-selection maps, time samples,
 //!   string / token / path vectors, relocates (0.11) and splines
 //!   (0.12).
@@ -36,12 +39,16 @@
 //! encoding here is pinned against).
 
 use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
 
 use crate::Result;
 use crate::error::invalid;
 use crate::spline::Spline;
 use crate::usda::{Attr, Layer, ListEditOp, ListOp, Prim, Value, Variant};
-use crate::usdc::{BOOTSTRAP_SIZE, ValueRep, ValueType, Version};
+use crate::usdc::{
+    BOOTSTRAP_SIZE, ValueRep, ValueType, Version, encode_compressed_buffer, encode_int_coded,
+    encode_int_coded64,
+};
 use crate::usdc_writer::CrateImage;
 
 /// §16.3.8.4.6 spec forms.
@@ -54,7 +61,12 @@ const FORM_VARIANT_SET: i32 = 11;
 
 /// Serialise a layer to Crate bytes.
 pub fn encode_layer(layer: &Layer) -> Result<Vec<u8>> {
-    let mut enc = Encoder::new();
+    encode_layer_with(layer, ArrayCoding::Smallest)
+}
+
+/// Serialise a layer to Crate bytes under an explicit array policy.
+pub fn encode_layer_with(layer: &Layer, coding: ArrayCoding) -> Result<Vec<u8>> {
+    let mut enc = Encoder::new(coding);
     enc.build(layer)?;
     enc.finish()
 }
@@ -85,12 +97,45 @@ struct Encoder {
     /// path reference written so far — they hold *node* indices until
     /// `finish` knows the walk order and patches them into path slots.
     path_refs: Vec<usize>,
+    /// Content index of the value blob: hash of a stored block →
+    /// the blocks carrying that hash. A later request for the same
+    /// bytes resolves to the earlier offset instead of a second copy.
+    blocks: HashMap<u64, Vec<StoredBlock>>,
+    /// Array storage policy (see [`ArrayCoding`]).
+    coding: ArrayCoding,
     version: Version,
 }
 
+/// One block of the value blob known to the content index.
+struct StoredBlock {
+    /// Position relative to the blob start.
+    start: usize,
+    len: usize,
+    /// Block-relative positions of the path references it holds
+    /// (node indices until `finish` patches them) — two blocks are
+    /// interchangeable only when these agree as well as the bytes.
+    refs: Vec<usize>,
+}
+
+/// How the writer stores arrays and repeated values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ArrayCoding {
+    /// Per array, the smallest of the encodings §16.3.9.3 offers
+    /// (raw, compressed integers, the all-integral and lookup-table
+    /// floating-point forms), with identical values stored once.
+    #[default]
+    Smallest,
+    /// Every array raw and every value stored where it is authored —
+    /// the reference point the size tables compare against.
+    Raw,
+}
+
 impl Encoder {
-    fn new() -> Self {
+    fn new(coding: ArrayCoding) -> Self {
         let mut enc = Self {
+            blocks: HashMap::new(),
+            coding,
             tokens: Vec::new(),
             token_index: HashMap::new(),
             strings: Vec::new(),
@@ -264,19 +309,164 @@ impl Encoder {
         self.put(&v.to_le_bytes())
     }
 
+    /// Place a self-contained block in the value blob and return its
+    /// absolute offset. Under [`ArrayCoding::Smallest`] a block whose
+    /// bytes (and path-reference positions) match one already stored
+    /// resolves to that earlier offset. `refs` are block-relative
+    /// positions of `u32` path references; `align8` puts the block on
+    /// an 8-byte boundary (§16.3.3 recommends it for uncompressed
+    /// arrays).
+    fn intern(&mut self, bytes: &[u8], refs: &[usize], align8: bool) -> u64 {
+        let dedup = self.coding == ArrayCoding::Smallest;
+        let mut key = 0u64;
+        if dedup {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut h);
+            key = h.finish();
+            if let Some(found) = self.blocks.get(&key).and_then(|list| {
+                list.iter().find(|b| {
+                    b.len == bytes.len()
+                        && (!align8 || b.start % 8 == 0)
+                        && b.refs == refs
+                        && self.values[b.start..b.start + b.len] == *bytes
+                })
+            }) {
+                return (BOOTSTRAP_SIZE + found.start) as u64;
+            }
+        }
+        if align8 {
+            // The bootstrap is 88 bytes, so blob-relative alignment is
+            // file alignment.
+            let pad = self.values.len().next_multiple_of(8);
+            self.values.resize(pad, 0);
+        }
+        let start = self.values.len();
+        self.values.extend_from_slice(bytes);
+        self.path_refs.extend(refs.iter().map(|r| start + r));
+        if dedup {
+            self.blocks.entry(key).or_default().push(StoredBlock {
+                start,
+                len: bytes.len(),
+                refs: refs.to_vec(),
+            });
+        }
+        (BOOTSTRAP_SIZE + start) as u64
+    }
+
     /// Store an offset-valued scalar / structure and return its rep.
     fn stored(&mut self, vt: ValueType, bytes: &[u8]) -> u64 {
-        let off = self.put(bytes);
+        let off = self.intern(bytes, &[], false);
         Self::rep(vt, 0, off)
     }
 
+    /// An uncompressed array: `[u64 count][elements]`, 8-aligned.
     fn array_rep(&mut self, vt: ValueType, count: usize, elements: &[u8]) -> u64 {
         if count == 0 {
             return Self::rep(vt, ValueRep::FLAG_ARRAY, 0);
         }
-        let off = self.put_u64(count as u64);
-        self.put(elements);
+        let mut block = Vec::with_capacity(8 + elements.len());
+        block.extend_from_slice(&(count as u64).to_le_bytes());
+        block.extend_from_slice(elements);
+        let off = self.intern(&block, &[], true);
         Self::rep(vt, ValueRep::FLAG_ARRAY, off)
+    }
+
+    /// A compressed array: `[u64 count][coded body]` (§16.3.9.3.1 /
+    /// §16.3.9.3.2).
+    fn compressed_array_rep(&mut self, vt: ValueType, count: usize, body: &[u8]) -> u64 {
+        let mut block = Vec::with_capacity(8 + body.len());
+        block.extend_from_slice(&(count as u64).to_le_bytes());
+        block.extend_from_slice(body);
+        let off = self.intern(&block, &[], false);
+        Self::rep(vt, ValueRep::FLAG_ARRAY | ValueRep::FLAG_COMPRESSED, off)
+    }
+
+    /// §16.3.9.3.1: a 32-bit integral array, compressed when that is
+    /// smaller. `raw` is the element run as it would be stored
+    /// uncompressed.
+    fn int_array_rep(&mut self, vt: ValueType, ints: &[i32], raw: &[u8]) -> u64 {
+        if self.coding == ArrayCoding::Smallest && ints.len() >= MIN_COMPRESSED_ELEMENTS {
+            let body = int_stream(&encode_int_coded(ints));
+            if body.len() < raw.len() {
+                return self.compressed_array_rep(vt, ints.len(), &body);
+            }
+        }
+        self.array_rep(vt, ints.len(), raw)
+    }
+
+    /// §16.3.9.3.1 for the 64-bit integral types.
+    fn int64_array_rep(&mut self, vt: ValueType, ints: &[i64], raw: &[u8]) -> u64 {
+        if self.coding == ArrayCoding::Smallest && ints.len() >= MIN_COMPRESSED_ELEMENTS {
+            let body = int_stream(&encode_int_coded64(ints));
+            if body.len() < raw.len() {
+                return self.compressed_array_rep(vt, ints.len(), &body);
+            }
+        }
+        self.array_rep(vt, ints.len(), raw)
+    }
+
+    /// §16.3.9.3.2: a scalar floating-point array as the smallest of
+    /// raw, `i` (every element an exact 32-bit integer) and `t`
+    /// (lookup table of the distinct elements + compressed indices).
+    /// `raw` holds the wire elements, `width` bytes each.
+    fn float_array_rep(&mut self, vt: ValueType, raw: &[u8], width: usize) -> u64 {
+        let count = raw.len() / width;
+        if self.coding != ArrayCoding::Smallest || count < MIN_COMPRESSED_ELEMENTS {
+            return self.array_rep(vt, count, raw);
+        }
+        let mut best: Option<Vec<u8>> = None;
+        // `i`: every wire element converts to an i32 and back to the
+        // same bit pattern (so -0, fractions, NaN and out-of-range
+        // values disqualify the array).
+        let ints: Option<Vec<i32>> = raw
+            .chunks_exact(width)
+            .map(|c| {
+                let f = wire_float(vt, c);
+                let n = f as i32;
+                (f64::from(n).to_bits() == f.to_bits()).then_some(n)
+            })
+            .collect();
+        if let Some(ints) = ints {
+            let mut body = vec![b'i'];
+            body.extend_from_slice(&int_stream(&encode_int_coded(&ints)));
+            if body.len() < raw.len() {
+                best = Some(body);
+            }
+        }
+        // `t`: distinct wire elements in first-seen order. The table
+        // alone costs `width` bytes per entry and the index stream at
+        // least a quarter byte per element, so the scan stops once
+        // those two exceed the raw run.
+        let budget = raw.len().saturating_sub(count.div_ceil(4) + 18);
+        let mut slot_of: HashMap<&[u8], i32> = HashMap::new();
+        let mut table: Vec<u8> = Vec::new();
+        let mut indices: Vec<i32> = Vec::with_capacity(count);
+        let mut fits = true;
+        for c in raw.chunks_exact(width) {
+            let next = slot_of.len() as i32;
+            let slot = *slot_of.entry(c).or_insert(next);
+            if slot == next {
+                table.extend_from_slice(c);
+                if table.len() > budget {
+                    fits = false;
+                    break;
+                }
+            }
+            indices.push(slot);
+        }
+        if fits {
+            let mut body = vec![b't'];
+            body.extend_from_slice(&(slot_of.len() as u32).to_le_bytes());
+            body.extend_from_slice(&table);
+            body.extend_from_slice(&int_stream(&encode_int_coded(&indices)));
+            if body.len() < best.as_ref().map_or(raw.len(), Vec::len) {
+                best = Some(body);
+            }
+        }
+        match best {
+            Some(body) => self.compressed_array_rep(vt, count, &body),
+            None => self.array_rep(vt, count, raw),
+        }
     }
 
     /// Encode a value under an attribute type token (`point3f[]`,
@@ -286,6 +476,21 @@ impl Encoder {
             Some(t) => t,
             None => return self.encode_by_shape(v),
         };
+        // §16.3.8.2: TimeCode needs 0.9.0, PathExpression 0.10.0.
+        let needed = match vt {
+            ValueType::TimeCode => Some(Version {
+                major: 0,
+                minor: 9,
+                patch: 0,
+            }),
+            ValueType::PathExpression => Some(Version::V0_10_0),
+            _ => None,
+        };
+        if let Some(needed) = needed
+            && self.version.dispatch_key() < needed.dispatch_key()
+        {
+            self.version = needed;
+        }
         if is_array {
             let items: Vec<Value> = match v {
                 Value::Array(items) => items.clone(),
@@ -471,7 +676,31 @@ impl Encoder {
                 }
             }
         }
-        Ok(self.array_rep(vt, items.len(), &bytes))
+        Ok(match vt {
+            _ if items.is_empty() => self.array_rep(vt, 0, &[]),
+            VT::Int | VT::Uint => {
+                let ints: Vec<i32> = bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| i32::from_le_bytes(*c))
+                    .collect();
+                self.int_array_rep(vt, &ints, &bytes)
+            }
+            VT::Int64 | VT::Uint64 => {
+                let ints: Vec<i64> = bytes
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|c| i64::from_le_bytes(*c))
+                    .collect();
+                self.int64_array_rep(vt, &ints, &bytes)
+            }
+            VT::Half => self.float_array_rep(vt, &bytes, 2),
+            VT::Float => self.float_array_rep(vt, &bytes, 4),
+            VT::Double => self.float_array_rep(vt, &bytes, 8),
+            _ => self.array_rep(vt, items.len(), &bytes),
+        })
     }
 
     /// Infer a wire type from a value's shape (metadata, dictionary
@@ -571,7 +800,11 @@ impl Encoder {
     }
 
     /// §16.3.10.19 dictionary, laid out the way production files
-    /// are: `[u64 count]`, then per member `[u32 keyToken][i64 rel]`
+    /// are: `[u64 count]`, then per member `[u32 key][i64 rel]` — the
+    /// key an index into the STRINGS section, which is what files in
+    /// circulation carry and what a black-box reader resolves (the
+    /// clause's "Index to the Token section" does not survive either
+    /// test) —
     /// immediately followed by the member's own payload bytes (if
     /// any) and its rep word — `rel` is the forward distance from the
     /// `i64`'s own position to that rep word (8 for an inlined
@@ -580,9 +813,25 @@ impl Encoder {
         if map.is_empty() {
             return Ok(Self::inline(ValueType::Dictionary, 0));
         }
+        if self.coding == ArrayCoding::Smallest {
+            // Members first, then one position-independent table
+            // (every link is the fixed +8 to the rep word beside it),
+            // so an identical dictionary resolves to the same block.
+            let mut block = Vec::with_capacity(8 + map.len() * 20);
+            block.extend_from_slice(&(map.len() as u64).to_le_bytes());
+            for (k, v) in map {
+                let key = self.string(k);
+                let rep = self.encode_by_shape(v)?;
+                block.extend_from_slice(&key.to_le_bytes());
+                block.extend_from_slice(&8i64.to_le_bytes());
+                block.extend_from_slice(&rep.to_le_bytes());
+            }
+            let off = self.intern(&block, &[], false);
+            return Ok(Self::rep(ValueType::Dictionary, 0, off));
+        }
         let off = self.put_u64(map.len() as u64);
         for (k, v) in map {
-            let key = self.token(k) as u32;
+            let key = self.string(k);
             self.put(&key.to_le_bytes());
             let link_pos = self.put_u64(0);
             let rep = self.encode_by_shape(v)?;
@@ -648,9 +897,7 @@ impl Encoder {
                 self.encode_list_item(vt, item, &mut bytes, &mut refs)?;
             }
         }
-        let off = self.put(&bytes);
-        let base = (off - BOOTSTRAP_SIZE as u64) as usize;
-        self.path_refs.extend(refs.into_iter().map(|r| base + r));
+        let off = self.intern(&bytes, &refs, false);
         Ok(Self::rep(vt, 0, off))
     }
 
@@ -730,28 +977,28 @@ impl Encoder {
         for (t, _) in samples {
             times.extend_from_slice(&t.to_le_bytes());
         }
-        let times_off = self.put(&times);
+        let times_off = self.intern(&times, &[], true);
         let times_rep = Self::rep(ValueType::DoubleVector, 0, times_off);
         // Sample values, encoded under the attribute's element type.
         let mut reps = Vec::with_capacity(samples.len());
         for (_, v) in samples {
             reps.push(self.encode_typed(v, elem_type)?);
         }
-        let times_rep_pos = self.put_u64(times_rep);
-        // Placeholder for the i64 → values array.
-        let link_pos = self.put_u64(0);
-        let values_pos = self.put_u64(samples.len() as u64);
+        // One position-independent record:
+        // `[times rep][i64 +8][u64 count][count × rep][i64 back]`,
+        // the value's payload addressing the trailing `i64`, whose
+        // target is the times rep at the head.
+        let mut block = Vec::with_capacity(32 + reps.len() * 8);
+        block.extend_from_slice(&times_rep.to_le_bytes());
+        block.extend_from_slice(&8i64.to_le_bytes());
+        block.extend_from_slice(&(samples.len() as u64).to_le_bytes());
         for r in reps {
-            self.put_u64(r);
+            block.extend_from_slice(&r.to_le_bytes());
         }
-        let rel = values_pos as i64 - link_pos as i64;
-        let link_at = (link_pos - BOOTSTRAP_SIZE as u64) as usize;
-        self.values[link_at..link_at + 8].copy_from_slice(&rel.to_le_bytes());
-        // The rep's payload: an i64 (relative to itself) to the times rep.
-        let off = self.offset();
-        let rel_times = times_rep_pos as i64 - off as i64;
-        self.put(&rel_times.to_le_bytes());
-        Ok(Self::rep(ValueType::TimeSamples, 0, off))
+        let tail = block.len();
+        block.extend_from_slice(&(-(tail as i64)).to_le_bytes());
+        let off = self.intern(&block, &[], false);
+        Ok(Self::rep(ValueType::TimeSamples, 0, off + tail as u64))
     }
 
     fn encode_relocates(&mut self, pairs: &[(String, String)]) -> Result<u64> {
@@ -769,9 +1016,7 @@ impl Encoder {
             refs.push(bytes.len());
             bytes.extend_from_slice(&b.to_le_bytes());
         }
-        let off = self.put(&bytes);
-        let base = (off - BOOTSTRAP_SIZE as u64) as usize;
-        self.path_refs.extend(refs.into_iter().map(|r| base + r));
+        let off = self.intern(&bytes, &refs, false);
         Ok(Self::rep(ValueType::Relocates, 0, off))
     }
 
@@ -799,7 +1044,7 @@ impl Encoder {
             // `encode_dictionary`, without a rep of its own).
             self.put_u64(dict.len() as u64);
             for (k, v) in dict.iter() {
-                let key = self.token(k) as u32;
+                let key = self.string(k);
                 self.put(&key.to_le_bytes());
                 let link_pos = self.put_u64(0);
                 let rep = self.encode_by_shape(v)?;
@@ -985,36 +1230,36 @@ impl Encoder {
             fields.push((name, rep));
         }
         // Properties: companion statements (`.timeSamples`,
-        // `.connect`, `.spline`) fold into their attribute's spec.
-        let mut property_names: Vec<String> = Vec::new();
+        // `.connect`, `.spline`) fold into their attribute's spec. A
+        // companion without a base statement (a bare
+        // `float x.timeSamples = {…}`) still gets the spec, in the
+        // same name order a re-read layer would present it.
+        let mut bases: BTreeMap<&str, &Attr> = BTreeMap::new();
         for (name, attr) in attrs {
-            if name.contains('.') {
-                continue;
+            match name.rsplit_once('.') {
+                None => {
+                    bases.insert(name, attr);
+                }
+                Some((base, companion)) => {
+                    if matches!(companion, "timeSamples" | "connect" | "spline") {
+                        bases.entry(base).or_insert(attr);
+                    }
+                }
             }
-            property_names.push(name.clone());
-            self.build_property(node, name, attr, attrs)?;
         }
-        // Companions without a base statement (a bare
-        // `float x.timeSamples = {…}`): give them a spec of their own.
-        for (name, attr) in attrs {
-            let Some((base, companion)) = name.rsplit_once('.') else {
-                continue;
-            };
-            if attrs.contains_key(base)
-                || !matches!(companion, "timeSamples" | "connect" | "spline")
-            {
-                continue;
+        let mut property_names: Vec<String> = Vec::with_capacity(bases.len());
+        for (name, attr) in bases {
+            property_names.push(name.to_owned());
+            if attrs.contains_key(name) {
+                self.build_property(node, name, attr, attrs)?;
+            } else {
+                let bare = Attr {
+                    type_token: attr.type_token.clone(),
+                    value: Value::None,
+                    metadata: BTreeMap::new(),
+                };
+                self.build_property(node, name, &bare, attrs)?;
             }
-            if property_names.iter().any(|p| p == base) {
-                continue;
-            }
-            property_names.push(base.to_owned());
-            let bare = Attr {
-                type_token: attr.type_token.clone(),
-                value: Value::None,
-                metadata: BTreeMap::new(),
-            };
-            self.build_property(node, base, &bare, attrs)?;
         }
         if !property_names.is_empty() {
             let rep = self.token_vector(&property_names);
@@ -1215,6 +1460,9 @@ impl Encoder {
         let mut fields: Vec<(i32, u64)> = Vec::new();
         let mut field_index: HashMap<(i32, u64), i32> = HashMap::new();
         let mut field_sets: Vec<i32> = Vec::new();
+        // Identical field sets are stored once (§16.3.8.4.4: a spec
+        // addresses its run by index, so runs can be shared).
+        let mut field_set_index: HashMap<Vec<i32>, i32> = HashMap::new();
         let mut spec_path_indices = Vec::new();
         let mut spec_fieldset_indices = Vec::new();
         let mut spec_types = Vec::new();
@@ -1231,7 +1479,7 @@ impl Encoder {
             })
             .collect();
         for (node, form, spec_fields) in specs {
-            let set_start = field_sets.len() as i32;
+            let mut run: Vec<i32> = Vec::with_capacity(spec_fields.len() + 1);
             for (name, rep) in spec_fields {
                 let name_idx = self.token(&name);
                 let key = (name_idx, rep);
@@ -1244,9 +1492,18 @@ impl Encoder {
                         i
                     }
                 };
-                field_sets.push(idx);
+                run.push(idx);
             }
-            field_sets.push(-1);
+            run.push(-1);
+            let set_start = match field_set_index.get(&run) {
+                Some(&start) if self.coding == ArrayCoding::Smallest => start,
+                _ => {
+                    let start = field_sets.len() as i32;
+                    field_sets.extend_from_slice(&run);
+                    field_set_index.insert(run, start);
+                    start
+                }
+            };
             spec_path_indices.push(slot_of_node[node] as i32);
             spec_fieldset_indices.push(set_start);
             spec_types.push(form);
@@ -1270,6 +1527,37 @@ impl Encoder {
 }
 
 // ---- helpers --------------------------------------------------------------
+
+/// The shortest array the writer compresses, in elements. §16.3.9.3
+/// words the floor as "arrays that are 16 bytes or smaller should not
+/// be compressed"; files in circulation draw the line at sixteen
+/// *elements* (a 15-element array of any type is raw, a 16-element
+/// one compressed), and a black-box reader takes a shorter array as
+/// raw whatever its flag says — so the element count is the floor
+/// that both readings accept.
+const MIN_COMPRESSED_ELEMENTS: usize = 16;
+
+/// §16.3.7.2.3: `[u64 compressedSize][LZ4 buffer]` around an
+/// int-coded body.
+fn int_stream(coded: &[u8]) -> Vec<u8> {
+    let buf = encode_compressed_buffer(coded);
+    let mut out = Vec::with_capacity(8 + buf.len());
+    out.extend_from_slice(&(buf.len() as u64).to_le_bytes());
+    out.extend_from_slice(&buf);
+    out
+}
+
+/// One scalar floating-point wire element as the value a reader
+/// recovers from it.
+fn wire_float(vt: ValueType, bytes: &[u8]) -> f64 {
+    match vt {
+        ValueType::Half => f64::from(crate::usdc_values::half_to_f32(u16::from_le_bytes([
+            bytes[0], bytes[1],
+        ]))),
+        ValueType::Float => f64::from(f32::from_le_bytes(bytes.try_into().unwrap())),
+        _ => f64::from_le_bytes(bytes.try_into().unwrap()),
+    }
+}
 
 fn text_of(v: &Value) -> Result<String> {
     match v {
@@ -1351,6 +1639,7 @@ fn wire_type(token: &str) -> Option<(ValueType, bool)> {
         "string" => VT::String,
         "token" => VT::Token,
         "asset" => VT::Asset,
+        "pathExpression" => VT::PathExpression,
         "half2" | "texCoord2h" => VT::Half2,
         "half3" | "point3h" | "normal3h" | "vector3h" | "color3h" | "texCoord3h" => VT::Half3,
         "half4" | "color4h" => VT::Half4,
