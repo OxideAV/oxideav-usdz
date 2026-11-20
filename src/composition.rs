@@ -283,6 +283,7 @@ pub fn remap_paths(prim: &mut Prim, from: &str, to: &str) {
                 for x in [
                     &mut list.prepended,
                     &mut list.appended,
+                    &mut list.added,
                     &mut list.deleted,
                     &mut list.explicit,
                     &mut list.reordered,
@@ -385,6 +386,7 @@ pub fn referenced_asset_paths(
         match v {
             Value::Asset(a) => push(a),
             Value::AssetWithPath { asset, .. } => push(asset),
+            Value::Reference(r) => push(&r.asset),
             Value::Tuple(seq) | Value::Array(seq) => seq.iter().for_each(|x| walk_value(x, push)),
             Value::Dict(map) => map.values().for_each(|x| walk_value(x, push)),
             Value::TimeSamples(samples) => samples.iter().for_each(|(_, x)| walk_value(x, push)),
@@ -436,6 +438,7 @@ pub fn rebase_assets(prim: &mut Prim, resolve: &dyn Fn(&str) -> Option<String>) 
         match v {
             Value::Asset(a) => fix(a, resolve),
             Value::AssetWithPath { asset, .. } => fix(asset, resolve),
+            Value::Reference(r) => fix(&mut r.asset, resolve),
             Value::Tuple(seq) | Value::Array(seq) => {
                 seq.iter_mut().for_each(|x| walk_value(x, resolve))
             }
@@ -447,6 +450,7 @@ pub fn rebase_assets(prim: &mut Prim, resolve: &dyn Fn(&str) -> Option<String>) 
                 for x in [
                     &mut list.prepended,
                     &mut list.appended,
+                    &mut list.added,
                     &mut list.deleted,
                     &mut list.explicit,
                     &mut list.reordered,

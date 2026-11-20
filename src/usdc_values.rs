@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 
 use crate::Result;
 use crate::error::{invalid, unsupported};
-use crate::usda::{ListEditOp, ListOp, Value};
+use crate::usda::{ListEditOp, ListOp, Value, integer_value};
 use crate::usdc::{
     BOOTSTRAP_SIZE, CompressedBuffer, SectionName, TokensSection, UsdcFile, ValueRep, ValueType,
     construct_paths, decode_int_array, decode_int_array64, int_coded_max_len,
@@ -270,8 +270,8 @@ impl<'a> ValueDecoder<'a> {
             VT::Double | VT::TimeCode => {
                 Value::Float(f64::from_le_bytes(self.get(off, 8)?.try_into().unwrap()))
             }
-            VT::Int64 => Value::Float(self.i64_at(off)? as f64),
-            VT::Uint64 => Value::Float(self.u64_at(off)? as f64),
+            VT::Int64 => integer_value(i128::from(self.i64_at(off)?)),
+            VT::Uint64 => integer_value(i128::from(self.u64_at(off)?)),
             // §16.3.10.13: a non-inlined asset is an Index to the
             // STRINGS section (the payload is the index, not an
             // offset). VT::PathExpression shares the representation.
@@ -485,7 +485,14 @@ impl<'a> ValueDecoder<'a> {
             let rel = self.i64_at(cursor + 4)?;
             let target = checked_rel(cursor + 4, rel)?;
             let inner = ValueRep::from_raw(self.u64_at(target)?);
-            map.insert(key, self.decode_at_depth(inner, depth + 1)?);
+            let value = self.decode_at_depth(inner, depth + 1)?;
+            // A member keeps its wire type when its value alone would
+            // not tell (`double d = 1`, `float f = 1.5`).
+            let value = match wire_type_name(inner) {
+                Some(name) => crate::usda::typed_member(&name, value),
+                None => value,
+            };
+            map.insert(key, value);
             cursor = target + 8;
         }
         Ok((map, cursor))
@@ -595,8 +602,8 @@ impl<'a> ValueDecoder<'a> {
                     ))),
                     cursor + 4,
                 ),
-                VT::Int64ListOp => (Value::Float(self.i64_at(cursor)? as f64), cursor + 8),
-                VT::UInt64ListOp => (Value::Float(self.u64_at(cursor)? as f64), cursor + 8),
+                VT::Int64ListOp => (integer_value(i128::from(self.i64_at(cursor)?)), cursor + 8),
+                VT::UInt64ListOp => (integer_value(i128::from(self.u64_at(cursor)?)), cursor + 8),
                 VT::ReferenceListOp => self.decode_reference(cursor, true, depth)?,
                 VT::PayloadListOp => self.decode_reference(cursor, false, depth)?,
                 _ => unreachable!("decode_list_op only dispatches list-op types"),
@@ -623,13 +630,14 @@ impl<'a> ValueDecoder<'a> {
         let path_idx = u32::from_le_bytes(head[4..8].try_into().unwrap());
         let asset = self.string(u64::from(asset_idx))?.to_owned();
         let prim_path = self.path(u64::from(path_idx))?.to_owned();
-        // The 16-byte layer offset (time offset + scale doubles) and
-        // any custom data have no slot on `usda::Value`'s composition
-        // arc form; they are decoded for framing correctness.
+        // §16.3.10.20 layer offset: time offset, then scale.
+        let offset = f64::from_le_bytes(head[8..16].try_into().unwrap());
+        let scale = f64::from_le_bytes(head[16..24].try_into().unwrap());
         let mut cursor = off + 24;
+        let mut custom_data = BTreeMap::new();
         if with_custom_data {
-            // Walk the dictionary to find its end (and validate it).
-            let (_, end) = self.decode_dictionary_span(cursor, depth)?;
+            let (dict, end) = self.decode_dictionary_span(cursor, depth)?;
+            custom_data = dict;
             cursor = end;
         }
         let prim_path = if prim_path == "/" {
@@ -637,7 +645,21 @@ impl<'a> ValueDecoder<'a> {
         } else {
             prim_path
         };
-        Ok((Value::AssetWithPath { asset, prim_path }, cursor))
+        // An item that is nothing but its target keeps the plain
+        // asset-with-path form; a layer offset or custom data needs
+        // the full record.
+        let item = crate::usda::Reference::new(asset, prim_path)
+            .with_layer_offset(offset, scale)
+            .with_custom_data(custom_data);
+        let value = if item.is_plain() {
+            Value::AssetWithPath {
+                asset: item.asset,
+                prim_path: item.prim_path,
+            }
+        } else {
+            Value::Reference(Box::new(item))
+        };
+        Ok((value, cursor))
     }
 
     /// §16.3.10.31 time samples. Layouts pinned on the fixture:
@@ -770,13 +792,13 @@ impl<'a> ValueDecoder<'a> {
             VT::Int64 => Ok(Value::Array(
                 self.compressed_ints64(data_off, count)?
                     .into_iter()
-                    .map(|v| Value::Float(v as f64))
+                    .map(|v| integer_value(i128::from(v)))
                     .collect(),
             )),
             VT::Uint64 => Ok(Value::Array(
                 self.compressed_ints64(data_off, count)?
                     .into_iter()
-                    .map(|v| Value::Float(v as u64 as f64))
+                    .map(|v| integer_value(i128::from(v as u64)))
                     .collect(),
             )),
             VT::Half | VT::Float | VT::Double => {
@@ -864,6 +886,53 @@ impl<'a> ValueDecoder<'a> {
             ))),
         }
     }
+}
+
+/// The text spelling of a rep's type when it is a plain value type
+/// (the ones a dictionary member can declare).
+fn wire_type_name(rep: ValueRep) -> Option<String> {
+    use ValueType as VT;
+    let vt = rep.value_type()?;
+    let name = match vt {
+        VT::TimeCode => "timecode",
+        VT::PathExpression => "pathExpression",
+        VT::Bool
+        | VT::Uchar
+        | VT::Int
+        | VT::Uint
+        | VT::Int64
+        | VT::Uint64
+        | VT::Half
+        | VT::Float
+        | VT::Double
+        | VT::String
+        | VT::Token
+        | VT::Asset
+        | VT::Matrix2d
+        | VT::Matrix3d
+        | VT::Matrix4d
+        | VT::Quatd
+        | VT::Quatf
+        | VT::Quath
+        | VT::Double2
+        | VT::Float2
+        | VT::Half2
+        | VT::Int2
+        | VT::Double3
+        | VT::Float3
+        | VT::Half3
+        | VT::Int3
+        | VT::Double4
+        | VT::Float4
+        | VT::Half4
+        | VT::Int4 => vt.name(),
+        _ => return None,
+    };
+    Some(if rep.is_array() {
+        format!("{name}[]")
+    } else {
+        name.to_owned()
+    })
 }
 
 /// Apply a signed relative offset to a base position, bounds-checked.
@@ -970,8 +1039,8 @@ fn decode_element(vt: ValueType, bytes: &[u8]) -> Result<Value> {
         VT::Uchar => Value::Float(f64::from(bytes[0])),
         VT::Int => Value::Float(f64::from(i32::from_le_bytes(bytes.try_into().unwrap()))),
         VT::Uint => Value::Float(f64::from(u32::from_le_bytes(bytes.try_into().unwrap()))),
-        VT::Int64 => Value::Float(i64::from_le_bytes(bytes.try_into().unwrap()) as f64),
-        VT::Uint64 => Value::Float(u64::from_le_bytes(bytes.try_into().unwrap()) as f64),
+        VT::Int64 => integer_value(i128::from(i64::from_le_bytes(bytes.try_into().unwrap()))),
+        VT::Uint64 => integer_value(i128::from(u64::from_le_bytes(bytes.try_into().unwrap()))),
         VT::Half => Value::Float(f64::from(half_to_f32(u16::from_le_bytes(
             bytes.try_into().unwrap(),
         )))),

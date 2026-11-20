@@ -116,6 +116,88 @@ pub struct Variant {
     /// Child prims declared inside the variant body, in declaration
     /// order.
     pub children: Vec<Prim>,
+    /// `variantSet` blocks nested inside the variant body
+    /// (§16.2.17: a variant's contents are prim contents), keyed
+    /// like [`Prim::variant_sets`].
+    pub variant_sets: BTreeMap<String, BTreeMap<String, Variant>>,
+}
+
+/// A reference / payload list item that carries more than its target
+/// (§16.2.17 `ReferenceListItem`, §16.3.10.21): a layer offset and,
+/// for references, custom data. An item with neither stays the plain
+/// [`Value::AssetWithPath`] / [`Value::Asset`] / [`Value::Path`].
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct Reference {
+    /// `@…@` layer path; empty for an internal reference.
+    pub asset: String,
+    /// `<…>` target prim; empty for the layer's default prim.
+    pub prim_path: String,
+    /// §16.3.10.20 layer offset: time offset (identity `0`).
+    pub offset: f64,
+    /// §16.3.10.20 layer offset: time scale (identity `1`).
+    pub scale: f64,
+    /// `customData = { … }` (references only).
+    pub custom_data: BTreeMap<String, Value>,
+}
+
+impl Default for Reference {
+    fn default() -> Self {
+        Self {
+            asset: String::new(),
+            prim_path: String::new(),
+            offset: 0.0,
+            scale: 1.0,
+            custom_data: BTreeMap::new(),
+        }
+    }
+}
+
+impl Reference {
+    /// A reference to `prim_path` in `asset` with the identity layer
+    /// offset and no custom data.
+    pub fn new(asset: impl Into<String>, prim_path: impl Into<String>) -> Self {
+        Self {
+            asset: asset.into(),
+            prim_path: prim_path.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Set the layer offset.
+    pub fn with_layer_offset(mut self, offset: f64, scale: f64) -> Self {
+        self.offset = offset;
+        self.scale = scale;
+        self
+    }
+
+    /// Set the custom data.
+    pub fn with_custom_data(mut self, custom_data: BTreeMap<String, Value>) -> Self {
+        self.custom_data = custom_data;
+        self
+    }
+
+    /// `true` when the item is nothing but its target — the case the
+    /// plain asset / path values already express.
+    pub fn is_plain(&self) -> bool {
+        self.offset == 0.0 && self.scale == 1.0 && self.custom_data.is_empty()
+    }
+
+    /// The value form of this item: itself when it carries a layer
+    /// offset or custom data, the plain asset / path value otherwise.
+    pub fn into_value(self) -> Value {
+        if !self.is_plain() {
+            return Value::Reference(Box::new(self));
+        }
+        match (self.asset.is_empty(), self.prim_path.is_empty()) {
+            (true, false) => Value::Path(self.prim_path),
+            (false, true) => Value::Asset(self.asset),
+            _ => Value::AssetWithPath {
+                asset: self.asset,
+                prim_path: self.prim_path,
+            },
+        }
+    }
 }
 
 impl Prim {
@@ -363,9 +445,168 @@ pub enum Value {
     Spline(Box<crate::spline::Spline>),
     /// Anything we didn't recognise; preserved verbatim.
     Raw(String),
+    /// A reference / payload item with a layer offset or custom data
+    /// (`@a.usd@</P> (offset = 10; scale = 2)`). Items without either
+    /// keep the plain [`Value::AssetWithPath`] / [`Value::Asset`] /
+    /// [`Value::Path`] forms.
+    Reference(Box<Reference>),
+    /// A dictionary member whose declared type is not the one its
+    /// value's shape implies — `double d = 1` (an integral number
+    /// reads as `int`), `float f = 1.5`, `int64 n = 5`,
+    /// `string[] s = []`. Members whose type follows from the value
+    /// stay unwrapped, so most dictionaries never hold this variant.
+    Typed(Box<TypedValue>),
+    /// An integer a double cannot hold exactly (beyond ±2⁵³) — an
+    /// `int64` / `uint64` value such as an id or a hash. Every other
+    /// number, integral or not, is a [`Value::Float`].
+    Integer(i64),
+    /// As [`Value::Integer`], for the `uint64` values above
+    /// `i64::MAX`.
+    Unsigned(u64),
+    /// A blocked attribute default (`int x = None`, §16.2.16.2; the
+    /// Crate `ValueBlock`) — distinct from [`Value::None`], which on
+    /// an attribute means no default is authored at all. Inside
+    /// time samples and other value positions a block stays
+    /// [`Value::None`].
+    Block,
     /// Empty value — attribute declared but not assigned (`token
     /// outputs:surface`).
     None,
+}
+
+/// A value with an explicit type — see [`Value::Typed`].
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct TypedValue {
+    /// The declared type as the text form spells it (`double`,
+    /// `float3`, `token[]`).
+    pub type_name: String,
+    /// The value.
+    pub value: Value,
+}
+
+impl TypedValue {
+    /// Pair a value with its declared type.
+    pub fn new(type_name: impl Into<String>, value: Value) -> Self {
+        Self {
+            type_name: type_name.into(),
+            value,
+        }
+    }
+}
+
+/// The type a value's shape alone implies, as the text form spells
+/// it — the inference both writers apply to a value that carries no
+/// type of its own (dictionary members, unregistered metadata).
+/// `None` for shapes with no plain value type (paths, arcs, list
+/// operations).
+pub(crate) fn shape_type_name(v: &Value) -> Option<String> {
+    let whole = |f: &f64| *f == f.trunc() && f.abs() < 2_147_483_648.0;
+    Some(match v {
+        Value::Bool(_) => "bool".to_owned(),
+        Value::Float(f) => if whole(f) { "int" } else { "double" }.to_owned(),
+        Value::Integer(_) => "int64".to_owned(),
+        Value::Unsigned(_) => "uint64".to_owned(),
+        Value::Token(_) => "token".to_owned(),
+        Value::String(_) | Value::Raw(_) => "string".to_owned(),
+        Value::Asset(_) => "asset".to_owned(),
+        Value::Dict(_) => "dictionary".to_owned(),
+        Value::Tuple(items) => {
+            let rows = !items.is_empty()
+                && items
+                    .iter()
+                    .all(|x| matches!(x, Value::Tuple(r) if r.len() == items.len()));
+            let integral = items
+                .iter()
+                .all(|x| matches!(x, Value::Float(f) if *f == f.trunc()));
+            match (items.len(), rows, integral) {
+                (2..=4, true, _) => format!("matrix{}d", items.len()),
+                (2..=4, false, true) => format!("int{}", items.len()),
+                (2..=4, false, false) => format!("double{}", items.len()),
+                _ => return None,
+            }
+        }
+        Value::Array(items) => {
+            let elem = match items.first() {
+                None => "int".to_owned(),
+                Some(Value::Bool(_)) => "bool".to_owned(),
+                Some(Value::Integer(_) | Value::Unsigned(_) | Value::Float(_))
+                    if items.iter().any(|x| matches!(x, Value::Unsigned(_))) =>
+                {
+                    "uint64".to_owned()
+                }
+                Some(Value::Integer(_) | Value::Float(_))
+                    if items.iter().any(|x| matches!(x, Value::Integer(_))) =>
+                {
+                    "int64".to_owned()
+                }
+                Some(Value::Float(_)) => {
+                    if items
+                        .iter()
+                        .all(|x| matches!(x, Value::Float(f) if whole(f)))
+                    {
+                        "int".to_owned()
+                    } else {
+                        "double".to_owned()
+                    }
+                }
+                Some(Value::Token(_)) => "token".to_owned(),
+                Some(Value::String(_)) | Some(Value::Raw(_)) => "string".to_owned(),
+                Some(Value::Asset(_)) => "asset".to_owned(),
+                Some(Value::Tuple(t)) if (2..=4).contains(&t.len()) => {
+                    format!("double{}", t.len())
+                }
+                _ => return None,
+            };
+            format!("{elem}[]")
+        }
+        _ => return None,
+    })
+}
+
+/// A 64-bit integer as the model stores it: a [`Value::Float`] when
+/// a double holds it exactly, [`Value::Integer`] otherwise.
+pub(crate) fn integer_value(n: i128) -> Value {
+    let f = n as f64;
+    if f as i128 == n {
+        Value::Float(f)
+    } else if let Ok(signed) = i64::try_from(n) {
+        Value::Integer(signed)
+    } else {
+        Value::Unsigned(n as u64)
+    }
+}
+
+/// A dictionary member as the model stores it: the value alone when
+/// its declared type is what its shape implies, [`Value::Typed`]
+/// otherwise. Text leaves follow the declared type first (`token`
+/// members hold tokens, `bool` members booleans).
+pub(crate) fn typed_member(type_name: &str, value: Value) -> Value {
+    let base = type_name.rsplit(' ').next().unwrap_or_default();
+    if base == "dictionary" || matches!(value, Value::None | Value::Typed(_)) {
+        return value;
+    }
+    let elem = base.trim_end_matches("[]");
+    let retag = |v: Value| -> Value {
+        match (elem, v) {
+            ("token", Value::String(s)) => Value::Token(s),
+            ("string", Value::Token(s)) => Value::String(s),
+            ("asset", Value::String(s)) | ("asset", Value::Token(s)) => Value::Asset(s),
+            ("bool", Value::Float(f)) => Value::Bool(f != 0.0),
+            (_, other) => other,
+        }
+    };
+    let value = match value {
+        Value::Array(items) if base.ends_with("[]") => {
+            Value::Array(items.into_iter().map(retag).collect())
+        }
+        other => retag(other),
+    };
+    if shape_type_name(&value).as_deref() == Some(base) {
+        value
+    } else {
+        Value::Typed(Box::new(TypedValue::new(base, value)))
+    }
 }
 
 /// A single USD list-edit operator keyword.
@@ -440,6 +681,11 @@ pub struct ListOp {
     pub explicit: Option<Value>,
     /// `reorder`-authored value (round-trip only).
     pub reordered: Option<Value>,
+    /// `add`-authored value — the deprecated operator (§7: "add" and
+    /// "reorder" are deprecated but still carried by both file
+    /// formats). Composes as the weakest additive sublist, after
+    /// `appended`.
+    pub added: Option<Value>,
 }
 
 impl ListOp {
@@ -457,7 +703,8 @@ impl ListOp {
     pub fn set(&mut self, op: ListEditOp, value: Value) {
         let slot = match op {
             ListEditOp::Prepend => &mut self.prepended,
-            ListEditOp::Append | ListEditOp::Add => &mut self.appended,
+            ListEditOp::Append => &mut self.appended,
+            ListEditOp::Add => &mut self.added,
             ListEditOp::Delete => &mut self.deleted,
             ListEditOp::Explicit => &mut self.explicit,
             ListEditOp::Reorder => &mut self.reordered,
@@ -476,6 +723,7 @@ impl ListOp {
             (ListEditOp::Prepend, self.prepended.as_ref()),
             (ListEditOp::Explicit, self.explicit.as_ref()),
             (ListEditOp::Append, self.appended.as_ref()),
+            (ListEditOp::Add, self.added.as_ref()),
             (ListEditOp::Delete, self.deleted.as_ref()),
             (ListEditOp::Reorder, self.reordered.as_ref()),
         ]
@@ -492,6 +740,7 @@ impl ListOp {
             (ListEditOp::Prepend, self.prepended.as_ref()),
             (ListEditOp::Explicit, self.explicit.as_ref()),
             (ListEditOp::Append, self.appended.as_ref()),
+            (ListEditOp::Add, self.added.as_ref()),
         ]
         .into_iter()
         .filter_map(|(op, v)| v.map(|val| (op, val)))
@@ -521,6 +770,8 @@ impl Value {
                 Some(s.as_str())
             }
             Self::AssetWithPath { asset, .. } => Some(asset.as_str()),
+            Self::Reference(r) => Some(r.asset.as_str()),
+            Self::Typed(t) => t.value.as_text(),
             _ => None,
         }
     }
@@ -529,6 +780,9 @@ impl Value {
     pub fn as_f32(&self) -> Option<f32> {
         match self {
             Self::Float(f) => Some(*f as f32),
+            Self::Integer(n) => Some(*n as f32),
+            Self::Unsigned(n) => Some(*n as f32),
+            Self::Typed(t) => t.value.as_f32(),
             _ => None,
         }
     }
@@ -538,6 +792,7 @@ impl Value {
     pub fn as_seq(&self) -> Option<&[Value]> {
         match self {
             Self::Array(v) | Self::Tuple(v) => Some(v.as_slice()),
+            Self::Typed(t) => t.value.as_seq(),
             _ => None,
         }
     }
@@ -581,7 +836,7 @@ pub fn parse(source: &[u8]) -> Result<Layer> {
     tokens.eat_line();
     tokens.skip_trivia();
 
-    let metadata = if tokens.peek_char() == Some('(') {
+    let mut metadata = if tokens.peek_char() == Some('(') {
         tokens.advance();
         parse_metadata_block(&mut tokens)?
     } else {
@@ -593,6 +848,21 @@ pub fn parse(source: &[u8]) -> Result<Layer> {
         tokens.skip_trivia();
         if tokens.eof() {
             break;
+        }
+        // §16.2.18: `reorder rootPrims = [...]` is the layer's
+        // `primOrder` field; a later statement replaces an earlier.
+        if peek_ident(&tokens).as_deref() == Some("reorder") {
+            let _ = read_ident(&mut tokens)?;
+            tokens.skip_trivia();
+            let what = read_ident(&mut tokens)?;
+            if what != "rootPrims" {
+                return Err(invalid(format!(
+                    "expected `rootPrims` after `reorder` at {}, got `{what}`",
+                    tokens.pos_display()
+                )));
+            }
+            metadata.insert("primOrder".to_owned(), read_name_list(&mut tokens)?);
+            continue;
         }
         prims.push(parse_prim(&mut tokens)?);
     }
@@ -610,11 +880,21 @@ pub fn parse(source: &[u8]) -> Result<Layer> {
 struct Tokenizer<'a> {
     src: &'a str,
     pos: usize,
+    /// Set while the value of a `references` / `payload` /
+    /// `subLayers` field is being read: an asset or path item may
+    /// then carry a `( offset = …; scale = …; customData = {…} )`
+    /// parameter block. Anywhere else a `(` after an asset opens the
+    /// statement's metadata block.
+    arc_items: bool,
 }
 
 impl<'a> Tokenizer<'a> {
     fn new(src: &'a str) -> Self {
-        Self { src, pos: 0 }
+        Self {
+            src,
+            pos: 0,
+            arc_items: false,
+        }
     }
 
     fn eof(&self) -> bool {
@@ -722,6 +1002,13 @@ fn parse_metadata_block(t: &mut Tokenizer<'_>) -> Result<BTreeMap<String, Value>
         // (a `delete` is a removal, not an add) and must be preserved
         // so composition resolves the right target set and the writer
         // re-emits the operator the author wrote.
+        // §16.2 `SharedMetadata <- String / …`: a bare string is the
+        // spec's `comment` field.
+        if matches!(t.peek_char(), Some('"' | '\'')) {
+            let text = read_quoted_string(t)?;
+            out.insert("comment".to_owned(), Value::String(text));
+            continue;
+        }
         let mut list_edit_op: Option<ListEditOp> = None;
         let saved = t.pos;
         if let Some(word) = peek_ident(t) {
@@ -745,9 +1032,142 @@ fn parse_metadata_block(t: &mut Tokenizer<'_>) -> Result<BTreeMap<String, Value>
             continue;
         }
         t.skip_trivia();
-        let value = parse_value(t)?;
+        let arcs = matches!(name.as_str(), "references" | "payload" | "subLayers");
+        let outer = std::mem::replace(&mut t.arc_items, arcs);
+        let value = parse_value(t);
+        t.arc_items = outer;
+        let value = value?;
+        if name == "subLayers" {
+            // §16.2.18: each item's layer offset is the matching
+            // entry of the parallel `subLayerOffsets` field, authored
+            // only when some item has a non-identity offset.
+            let (layers, offsets) = split_sublayer_offsets(value);
+            if let Some(offsets) = offsets {
+                out.insert("subLayerOffsets".to_owned(), offsets);
+            } else {
+                out.remove("subLayerOffsets");
+            }
+            insert_metadata(&mut out, name, list_edit_op, layers);
+            continue;
+        }
         insert_metadata(&mut out, name, list_edit_op, value);
     }
+}
+
+/// Split a parsed `subLayers` value into the plain asset list and,
+/// when any item carries a non-identity layer offset, the parallel
+/// `(offset, scale)` list.
+fn split_sublayer_offsets(value: Value) -> (Value, Option<Value>) {
+    let Value::Array(items) = value else {
+        return (value, None);
+    };
+    if !items.iter().any(|v| matches!(v, Value::Reference(_))) {
+        return (Value::Array(items), None);
+    }
+    let mut layers = Vec::with_capacity(items.len());
+    let mut offsets = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            Value::Reference(r) => {
+                offsets.push(Value::Tuple(vec![
+                    Value::Float(r.offset),
+                    Value::Float(r.scale),
+                ]));
+                layers.push(Value::Asset(r.asset));
+            }
+            other => {
+                offsets.push(Value::Tuple(vec![Value::Float(0.0), Value::Float(1.0)]));
+                layers.push(other);
+            }
+        }
+    }
+    (Value::Array(layers), Some(Value::Array(offsets)))
+}
+
+/// `= ["a", "b"]` (or `= "a"`) after a `reorder …` keyword, as the
+/// token vector the Crate form stores.
+fn read_name_list(t: &mut Tokenizer<'_>) -> Result<Value> {
+    t.skip_trivia();
+    if !t.eat('=') {
+        return Err(invalid(format!(
+            "expected `=` in reorder statement at {}",
+            t.pos_display()
+        )));
+    }
+    let names = match parse_value(t)? {
+        Value::Array(items) => items,
+        other => vec![other],
+    };
+    Ok(Value::Array(
+        names
+            .into_iter()
+            .filter_map(|v| v.as_text().map(|s| Value::Token(s.to_owned())))
+            .collect(),
+    ))
+}
+
+/// The optional `( offset = …; scale = …; customData = {…} )` block
+/// after a reference / payload / sublayer item (§16.2.17
+/// `ReferenceParameters`). Returns the item as a value: a
+/// [`Value::Reference`] only when the block says something.
+fn read_arc_parameters(t: &mut Tokenizer<'_>, asset: String, prim_path: String) -> Result<Value> {
+    let mut item = Reference::new(asset, prim_path);
+    // Inline padding only: a `(` on a later line belongs to whatever
+    // follows.
+    let saved = t.pos;
+    while matches!(t.peek_char(), Some(' ' | '\t')) {
+        t.advance();
+    }
+    if !t.eat('(') {
+        t.pos = saved;
+        return Ok(item.into_value());
+    }
+    loop {
+        t.skip_trivia();
+        if t.eat(')') {
+            break;
+        }
+        if t.eat(';') || t.eat(',') {
+            continue;
+        }
+        if t.eof() {
+            return Err(invalid("EOF inside reference parameters"));
+        }
+        let key = read_ident(t)?;
+        t.skip_trivia();
+        if !t.eat('=') {
+            return Err(invalid(format!(
+                "expected `=` after `{key}` at {}",
+                t.pos_display()
+            )));
+        }
+        t.skip_trivia();
+        match key.as_str() {
+            "offset" | "scale" => {
+                let Value::Float(n) = read_number(t)? else {
+                    unreachable!("read_number only returns Float");
+                };
+                if key == "offset" {
+                    item.offset = n;
+                } else {
+                    item.scale = n;
+                }
+            }
+            "customData" => {
+                let outer = std::mem::replace(&mut t.arc_items, false);
+                let dict = read_dict(t);
+                t.arc_items = outer;
+                item.custom_data = dict?;
+            }
+            other => {
+                return Err(invalid(format!(
+                    "unknown reference parameter `{other}` at {}",
+                    t.pos_display()
+                )));
+            }
+        }
+    }
+    Ok(item.into_value())
 }
 
 /// Insert a parsed metadata field into the block map, folding
@@ -1109,64 +1529,70 @@ fn read_array(t: &mut Tokenizer<'_>) -> Result<Vec<Value>> {
 
 /// Parse a numeric literal — int or float, optional sign + exponent.
 fn read_number(t: &mut Tokenizer<'_>) -> Result<Value> {
-    let mut s = String::new();
-    if matches!(t.peek_char(), Some('+' | '-')) {
-        s.push(t.advance().unwrap());
+    Ok(Value::Float(scan_number(t)?.0))
+}
+
+/// A numeric literal in a value position: [`Value::Float`], or
+/// [`Value::Integer`] / [`Value::Unsigned`] for an integer literal a
+/// double cannot hold exactly.
+fn read_number_value(t: &mut Tokenizer<'_>) -> Result<Value> {
+    Ok(match scan_number(t)? {
+        (_, Some(exact)) => integer_value(exact),
+        (f, None) => Value::Float(f),
+    })
+}
+
+/// Scan one §16.2.5 Number. Returns its double value and, when the
+/// literal is an integer that the double does not reproduce, the
+/// exact integer.
+fn scan_number(t: &mut Tokenizer<'_>) -> Result<(f64, Option<i128>)> {
+    let bytes = t.src.as_bytes();
+    let start = t.pos;
+    let mut i = start;
+    let negative = bytes.get(i) == Some(&b'-');
+    if matches!(bytes.get(i), Some(b'+' | b'-')) {
+        i += 1;
     }
     // §16.2.5 Number: `inf` (optionally signed) and `nan` are number
     // spellings, not identifiers.
-    if t.rest().starts_with("inf") {
-        for _ in 0..3 {
-            t.advance();
-        }
-        return Ok(Value::Float(if s.starts_with('-') {
-            f64::NEG_INFINITY
-        } else {
-            f64::INFINITY
-        }));
-    }
-    if t.rest().starts_with("nan") && s.is_empty() {
-        for _ in 0..3 {
-            t.advance();
-        }
-        return Ok(Value::Float(f64::NAN));
-    }
-    let mut saw_digit = false;
-    while let Some(c) = t.peek_char() {
-        if c.is_ascii_digit() {
-            s.push(c);
-            t.advance();
-            saw_digit = true;
-        } else {
-            break;
-        }
-    }
-    if t.peek_char() == Some('.') {
-        s.push('.');
-        t.advance();
-        while let Some(c) = t.peek_char() {
-            if c.is_ascii_digit() {
-                s.push(c);
-                t.advance();
-                saw_digit = true;
+    if bytes[i..].starts_with(b"inf") {
+        t.pos = i + 3;
+        return Ok((
+            if negative {
+                f64::NEG_INFINITY
             } else {
-                break;
-            }
-        }
+                f64::INFINITY
+            },
+            None,
+        ));
     }
-    if matches!(t.peek_char(), Some('e' | 'E')) {
-        s.push(t.advance().unwrap());
-        if matches!(t.peek_char(), Some('+' | '-')) {
-            s.push(t.advance().unwrap());
+    if i == start && bytes[i..].starts_with(b"nan") {
+        t.pos = i + 3;
+        return Ok((f64::NAN, None));
+    }
+    let digits = |from: usize| -> usize {
+        bytes[from..]
+            .iter()
+            .position(|c| !c.is_ascii_digit())
+            .map_or(bytes.len(), |n| from + n)
+    };
+    let int_end = digits(i);
+    let mut saw_digit = int_end > i;
+    let mut integral = true;
+    i = int_end;
+    if bytes.get(i) == Some(&b'.') {
+        integral = false;
+        let frac_end = digits(i + 1);
+        saw_digit |= frac_end > i + 1;
+        i = frac_end;
+    }
+    if matches!(bytes.get(i), Some(b'e' | b'E')) {
+        integral = false;
+        i += 1;
+        if matches!(bytes.get(i), Some(b'+' | b'-')) {
+            i += 1;
         }
-        while let Some(c) = t.peek_char() {
-            if c.is_ascii_digit() {
-                s.push(c);
-                t.advance();
-            } else {
-                break;
-            }
-        }
+        i = digits(i);
     }
     if !saw_digit {
         return Err(invalid(format!(
@@ -1174,10 +1600,22 @@ fn read_number(t: &mut Tokenizer<'_>) -> Result<Value> {
             t.pos_display()
         )));
     }
-    let f: f64 = s
+    let text = &t.src[start..i];
+    let f: f64 = text
         .parse()
-        .map_err(|_| invalid(format!("malformed numeric literal `{s}`")))?;
-    Ok(Value::Float(f))
+        .map_err(|_| invalid(format!("malformed numeric literal `{text}`")))?;
+    t.pos = i;
+    // Only literals past 2^53 can differ from their double.
+    let exact = if integral && f.abs() >= 9_007_199_254_740_992.0 {
+        text.trim_start_matches('+')
+            .parse::<i128>()
+            .ok()
+            .filter(|n| (i128::from(i64::MIN)..=i128::from(u64::MAX)).contains(n))
+            .filter(|n| (*n as f64) as i128 != *n)
+    } else {
+        None
+    };
+    Ok((f, exact))
 }
 
 /// Parse one [`Value`] dispatched on the leading character.
@@ -1196,12 +1634,31 @@ fn parse_value(t: &mut Tokenizer<'_>) -> Result<Value> {
             // syntax round-trips losslessly; otherwise fall back to
             // a plain `Asset`.
             let asset = read_asset(t)?;
+            if t.arc_items {
+                // §16.2.17: `AssetRef (InlinePadding)* (PathRef)?
+                // (InlinePadding)* (ReferenceParameters)?`.
+                let saved = t.pos;
+                while matches!(t.peek_char(), Some(' ' | '\t')) {
+                    t.advance();
+                }
+                let prim_path = if t.peek_char() == Some('<') {
+                    read_path(t)?
+                } else {
+                    t.pos = saved;
+                    String::new()
+                };
+                return read_arc_parameters(t, asset, prim_path);
+            }
             if t.peek_char() == Some('<') {
                 let prim_path = read_path(t)?;
                 Ok(Value::AssetWithPath { asset, prim_path })
             } else {
                 Ok(Value::Asset(asset))
             }
+        }
+        '<' if t.arc_items => {
+            let prim_path = read_path(t)?;
+            read_arc_parameters(t, String::new(), prim_path)
         }
         '<' => Ok(Value::Path(read_path(t)?)),
         '(' => Ok(Value::Tuple(read_tuple(t)?)),
@@ -1227,8 +1684,8 @@ fn parse_value(t: &mut Tokenizer<'_>) -> Result<Value> {
                 Ok(Value::Dict(read_dict(t)?))
             }
         }
-        '+' | '-' => read_number(t),
-        c if c.is_ascii_digit() => read_number(t),
+        '+' | '-' => read_number_value(t),
+        c if c.is_ascii_digit() => read_number_value(t),
         c if is_ident_start(c) => {
             let id = read_ident(t)?;
             match id.as_str() {
@@ -1297,18 +1754,42 @@ fn read_dict(t: &mut Tokenizer<'_>) -> Result<BTreeMap<String, Value>> {
         // existing type-then-name reader so all USD type-spelling
         // quirks (`uniform`, `[]` array suffix, etc.) are handled
         // uniformly.
-        let (_type_token, name) = read_type_then_name(t)?;
+        let (type_token, name) = read_dict_type_then_key(t)?;
         t.skip_trivia();
         if t.eat('=') {
             t.skip_trivia();
             let value = parse_value(t)?;
-            out.insert(name, value);
+            out.insert(name, typed_member(&type_token, value));
         } else {
             // Bare entry without `=` — store as `Value::None` so
             // the key still round-trips.
             out.insert(name, Value::None);
         }
     }
+}
+
+/// A dictionary member's `type key` prefix. §16.2
+/// `DictionaryKey <- String / Identifier`: a key that is not an
+/// identifier is quoted.
+fn read_dict_type_then_key(t: &mut Tokenizer<'_>) -> Result<(String, String)> {
+    let saved = t.pos;
+    t.skip_trivia();
+    if let Some(word) = peek_ident(t) {
+        let _ = read_ident(t)?;
+        let mut type_token = word;
+        if t.rest().starts_with("[]") {
+            type_token.push_str("[]");
+            t.advance();
+            t.advance();
+        }
+        t.skip_trivia();
+        if matches!(t.peek_char(), Some('"' | '\'')) {
+            let key = read_quoted_string(t)?;
+            return Ok((type_token, key));
+        }
+    }
+    t.pos = saved;
+    read_type_then_name(t)
 }
 
 /// Read a §16.2.18.5 `{ </src> : </dst>, ... }` relocates map
@@ -1706,17 +2187,16 @@ fn parse_variant_set_body(t: &mut Tokenizer<'_>) -> Result<BTreeMap<String, Vari
         // glossary's simpleVariantSet.usd shows the common case
         // (one nested `def`); composition examples nest references
         // in the variant metadata which is also handled.
-        let (attrs, children, _nested_vsets) = parse_prim_body(t)?;
-        // Per the USD spec a variant can itself declare nested
-        // variantSets. We don't surface them through `Variant`'s
-        // shape (avoids unbounded recursion in the public type) —
-        // documented limitation.
+        let (attrs, children, variant_sets, order) = parse_prim_body(t)?;
+        let mut metadata = metadata;
+        metadata.extend(order);
         out.insert(
             variant_name,
             Variant {
                 metadata,
                 attrs,
                 children,
+                variant_sets,
             },
         );
     }
@@ -1750,7 +2230,7 @@ fn parse_prim(t: &mut Tokenizer<'_>) -> Result<Prim> {
         )));
     };
     t.skip_trivia();
-    let metadata = if t.eat('(') {
+    let mut metadata = if t.eat('(') {
         parse_metadata_block(t)?
     } else {
         BTreeMap::new()
@@ -1762,7 +2242,8 @@ fn parse_prim(t: &mut Tokenizer<'_>) -> Result<Prim> {
             t.pos_display()
         )));
     }
-    let (attrs, children, variant_sets) = parse_prim_body(t)?;
+    let (attrs, children, variant_sets, order) = parse_prim_body(t)?;
+    metadata.extend(order);
     Ok(Prim {
         spec,
         type_name,
@@ -1775,12 +2256,16 @@ fn parse_prim(t: &mut Tokenizer<'_>) -> Result<Prim> {
 }
 
 /// Return shape of [`parse_prim_body`] — `(attrs, children,
-/// variant_sets)`. Aliased to keep the function signature under
+/// variant_sets, ordering fields)`. The last map holds the
+/// `primOrder` / `propertyOrder` fields the body's `reorder …`
+/// statements author (§16.2.17.3); the caller folds it into the
+/// spec's metadata. Aliased to keep the function signature under
 /// clippy's `type_complexity` cap.
 type PrimBody = (
     BTreeMap<String, Attr>,
     Vec<Prim>,
     BTreeMap<String, BTreeMap<String, Variant>>,
+    BTreeMap<String, Value>,
 );
 
 /// Parse the inside of a `{ ... }` prim body — a mix of attribute
@@ -1790,10 +2275,15 @@ fn parse_prim_body(t: &mut Tokenizer<'_>) -> Result<PrimBody> {
     let mut attrs = BTreeMap::new();
     let mut children = Vec::new();
     let mut variant_sets: BTreeMap<String, BTreeMap<String, Variant>> = BTreeMap::new();
+    let mut order: BTreeMap<String, Value> = BTreeMap::new();
     loop {
         t.skip_trivia();
         if t.eat('}') {
-            return Ok((attrs, children, variant_sets));
+            return Ok((attrs, children, variant_sets, order));
+        }
+        // Statement separators (§16.2.17 `StatementSeparator`).
+        if t.eat(';') {
+            continue;
         }
         if t.eof() {
             return Err(invalid("EOF inside prim body"));
@@ -1845,6 +2335,31 @@ fn parse_prim_body(t: &mut Tokenizer<'_>) -> Result<PrimBody> {
             continue;
         }
         let _ = saved;
+        // §16.2.17.3 `reorder nameChildren = [...]` / `reorder
+        // properties = [...]` are the `primOrder` / `propertyOrder`
+        // fields; any other `reorder` (and `prepend` / `append` /
+        // `delete` / `add`) is a list-edit operator on the
+        // relationship or `.connect` statement that follows.
+        let mut edit: Option<ListEditOp> = None;
+        if matches!(
+            lead.as_str(),
+            "prepend" | "append" | "delete" | "add" | "reorder"
+        ) {
+            let _ = read_ident(t)?;
+            t.skip_trivia();
+            let next = peek_ident(t).unwrap_or_default();
+            if lead == "reorder" && matches!(next.as_str(), "nameChildren" | "properties") {
+                let _ = read_ident(t)?;
+                let field = if next == "nameChildren" {
+                    "primOrder"
+                } else {
+                    "propertyOrder"
+                };
+                order.insert(field.to_owned(), read_name_list(t)?);
+                continue;
+            }
+            edit = Some(ListEditOp::from_keyword(&lead));
+        }
         // Attribute / relationship — first read the type tokens up
         // to the attribute name. Examples:
         //   point3f[] points = ...
@@ -1865,7 +2380,19 @@ fn parse_prim_body(t: &mut Tokenizer<'_>) -> Result<PrimBody> {
                 spline.data_type = crate::spline::DataType::from_type_token(&type_token);
                 Value::Spline(Box::new(spline))
             } else {
-                parse_value(t)?
+                match parse_value(t)? {
+                    // §16.2.16.2: `int x = None` blocks the default —
+                    // not the same as authoring none. (Relationship
+                    // and connection lists read `None` as empty.)
+                    Value::None
+                        if !attr_name.contains('.')
+                            && type_token.rsplit(' ').next() != Some("rel") =>
+                    {
+                        Value::Block
+                    }
+                    Value::None => Value::Array(Vec::new()),
+                    other => other,
+                }
             }
         } else {
             // Attribute declared without a value (`token outputs:surface`).
@@ -1876,6 +2403,54 @@ fn parse_prim_body(t: &mut Tokenizer<'_>) -> Result<PrimBody> {
             parse_metadata_block(t)?
         } else {
             BTreeMap::new()
+        };
+        // A list-edited relationship / connection statement folds
+        // into the property's list op, one sublist per operator; an
+        // unqualified statement after one is its explicit sublist.
+        let value = match (edit, attrs.remove(&attr_name)) {
+            (Some(op), prev) => {
+                let (mut list, prev_meta) = match prev {
+                    Some(Attr {
+                        value: Value::ListOp(existing),
+                        metadata,
+                        ..
+                    }) => (*existing, metadata),
+                    Some(Attr {
+                        value: Value::None,
+                        metadata,
+                        ..
+                    }) => (ListOp::default(), metadata),
+                    Some(Attr {
+                        value: other,
+                        metadata,
+                        ..
+                    }) => (ListOp::single(ListEditOp::Explicit, other), metadata),
+                    None => (ListOp::default(), BTreeMap::new()),
+                };
+                list.set(op, value);
+                let mut merged = prev_meta;
+                merged.extend(metadata);
+                attrs.insert(
+                    attr_name,
+                    Attr {
+                        type_token,
+                        value: Value::ListOp(Box::new(list)),
+                        metadata: merged,
+                    },
+                );
+                continue;
+            }
+            (
+                None,
+                Some(Attr {
+                    value: Value::ListOp(mut existing),
+                    ..
+                }),
+            ) if !matches!(value, Value::None) => {
+                existing.set(ListEditOp::Explicit, value);
+                Value::ListOp(existing)
+            }
+            (None, _) => value,
         };
         attrs.insert(
             attr_name,

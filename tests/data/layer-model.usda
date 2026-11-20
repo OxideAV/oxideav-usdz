@@ -1,0 +1,189 @@
+#usda 1.0
+(
+    "layer comment"
+    defaultPrim = "W"
+    doc = "layer model reference"
+    endTimeCode = 24
+    metersPerUnit = 0.01
+    startTimeCode = 0
+    subLayers = [
+        @./a.usda@ (offset = 10; scale = 2),
+        @./b.usda@
+    ]
+    timeCodesPerSecond = 24
+    upAxis = "Y"
+    customLayerData = {
+        bool flag = true
+        double whole = 1
+        float narrow = 1.5
+        int count = 3
+        int64 big = 9007199254740993
+        token tk = "tok"
+        string st = "str"
+        int[] run = [1, 2]
+        double3 v = (1, 2, 3)
+        float3[] pts = [(0, 0.5, 1)]
+        string[] empty = []
+        dictionary nested = {
+            asset tex = @./t.png@
+        }
+    }
+)
+
+reorder rootPrims = ["W", "_Base"]
+
+class "_Base"
+{
+}
+
+def Xform "W" (
+    inherits = </_Base>
+    specializes = </_Base>
+    prepend references = [
+        @./asset.usd@</Asset> (offset = 5; scale = 0.5; customData = { int a = 1 }),
+        </_Base>
+    ]
+    payload = @./p.usd@</P> (offset = 3)
+    prepend apiSchemas = ["MaterialBindingAPI"]
+    kind = "component"
+    doc = "prim doc"
+    assetInfo = {
+        string name = "W"
+    }
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@./c1.usd@, @./c2.usd@]
+            double2[] times = [(0, 0), (10, 10)]
+            string primPath = "/W"
+        }
+    }
+    variants = {
+        string look = "red"
+    }
+    prepend variantSets = "look"
+)
+{
+    reorder nameChildren = ["B", "A"]
+    reorder properties = ["y", "x"]
+    int x = 1
+    int y = 2 (
+        doc = "attr doc"
+        displayName = "Why"
+        customData = {
+            int k = 1
+        }
+    )
+    int blocked = None
+    int declared
+    int64 id = 9007199254740993
+    uint64 uid = 18446744073709551615
+    custom rel plain = </W/A>
+    rel bare
+    rel emptied = None
+    prepend rel edited = [
+        </W/A>,
+        </W/B>,
+    ]
+    delete rel edited = </W/C>
+    add rel legacy = </W/A>
+    float conn
+    prepend float conn.connect = </W/A.out>
+    float off.connect = None
+    float ts.timeSamples = {
+        0: 1,
+        5: None,
+        10: 3,
+    }
+    uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+    double3 xformOp:translate.timeSamples = {
+        0: (0, 0, 0),
+        24: (1, 2, 3),
+    }
+    float3 xformOp:rotateXYZ = (0, 45.5, 0)
+
+    def Scope "A"
+    {
+        float out
+    }
+
+    def Scope "B" (
+        active = false
+        instanceable = true
+        hidden = true
+    )
+    {
+    }
+
+    def Mesh "Subdiv"
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0)]
+        uniform token subdivisionScheme = "catmullClark"
+        int[] cornerIndices = [0]
+        float[] cornerSharpnesses = [10]
+        int[] creaseIndices = [0, 1]
+        int[] creaseLengths = [2]
+        float[] creaseSharpnesses = [2.5]
+        int[] holeIndices = []
+        texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+            interpolation = "faceVarying"
+        )
+        int[] primvars:st:indices = [0, 1, 2, 3]
+        color3f[] primvars:displayColor = [(1, 0, 0)] (
+            interpolation = "constant"
+        )
+    }
+
+    def Camera "Cam"
+    {
+        float focalLength = 35
+        float2 clippingRange = (0.1, 1000)
+        token projection = "perspective"
+        float horizontalAperture.timeSamples = {
+            0: 20.955,
+            24: 36,
+        }
+    }
+
+    def SphereLight "Key"
+    {
+        float inputs:intensity = 500
+        color3f inputs:color = (1, 0.9, 0.8)
+        float inputs:radius = 0.5
+    }
+
+    def SkelRoot "Rig"
+    {
+        def Skeleton "Skel"
+        {
+            uniform token[] joints = ["Root", "Root/Arm"]
+            uniform matrix4d[] bindTransforms = [( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1) ), ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 2, 0, 1) )]
+        }
+
+        def SkelAnimation "Anim"
+        {
+            uniform token[] joints = ["Root", "Root/Arm"]
+            quatf[] rotations.timeSamples = {
+                0: [(1, 0, 0, 0), (1, 0, 0, 0)],
+                12: [(1, 0, 0, 0), (0.7071068, 0.7071068, 0, 0)],
+            }
+            half3[] scales = [(1, 1, 1), (1, 1, 1)]
+        }
+    }
+    variantSet "look" = {
+        "blue" {
+            color3f c = (0, 0, 1)
+        }
+        "red" (
+            kind = "group"
+        ) {
+            color3f c = (1, 0, 0)
+            variantSet "inner" = {
+                "x" {
+                    int n = 1
+                }
+            }
+        }
+    }
+}

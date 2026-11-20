@@ -553,6 +553,7 @@ pub mod spline;
 #[doc(hidden)] // internal — exposed for tests; not part of the stable API
 pub mod usd_to_scene;
 pub mod usda;
+pub mod usda_emit;
 pub mod usda_writer;
 #[doc(hidden)] // internal — exposed for tests; not part of the stable API
 pub mod usdc;

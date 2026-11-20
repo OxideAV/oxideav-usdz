@@ -44,7 +44,7 @@ use std::hash::{Hash, Hasher};
 use crate::Result;
 use crate::error::invalid;
 use crate::spline::Spline;
-use crate::usda::{Attr, Layer, ListEditOp, ListOp, Prim, Value, Variant};
+use crate::usda::{Attr, Layer, ListEditOp, ListOp, Prim, Reference, Value, Variant};
 use crate::usdc::{
     BOOTSTRAP_SIZE, ValueRep, ValueType, Version, encode_compressed_buffer, encode_int_coded,
     encode_int_coded64,
@@ -491,10 +491,14 @@ impl Encoder {
         {
             self.version = needed;
         }
+        // A blocked value (a `None` time sample, §16.2.16.3) is the
+        // ValueBlock sentinel whatever the attribute's type.
+        if matches!(v, Value::None | Value::Block) {
+            return Ok(Self::inline(ValueType::ValueBlock, 0));
+        }
         if is_array {
             let items: Vec<Value> = match v {
                 Value::Array(items) => items.clone(),
-                Value::None => Vec::new(),
                 other => vec![other.clone()],
             };
             return self.encode_array(vt, &items);
@@ -507,6 +511,8 @@ impl Encoder {
         let num = |v: &Value| -> Result<f64> {
             match v {
                 Value::Float(f) => Ok(*f),
+                Value::Integer(n) => Ok(*n as f64),
+                Value::Unsigned(n) => Ok(*n as f64),
                 Value::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
                 other => Err(invalid(format!(
                     "USDC encode: expected a number for {}, got {other:?}",
@@ -523,7 +529,7 @@ impl Encoder {
             VT::Int => Self::inline(vt, num(v)? as i32 as u32),
             VT::Uint => Self::inline(vt, num(v)? as u32),
             VT::Int64 => {
-                let n = num(v)? as i64;
+                let n = int_of(v)? as i64;
                 if let Ok(small) = i32::try_from(n) {
                     Self::inline(vt, small as u32)
                 } else {
@@ -531,7 +537,7 @@ impl Encoder {
                 }
             }
             VT::Uint64 => {
-                let n = num(v)? as u64;
+                let n = int_of(v)? as u64;
                 if let Ok(small) = u32::try_from(n) {
                     Self::inline(vt, small)
                 } else {
@@ -661,8 +667,8 @@ impl Encoder {
                 VT::Uchar => bytes.push(item.as_f32().unwrap_or(0.0) as u8),
                 VT::Int => bytes.extend_from_slice(&(scalar_f64(item)? as i32).to_le_bytes()),
                 VT::Uint => bytes.extend_from_slice(&(scalar_f64(item)? as u32).to_le_bytes()),
-                VT::Int64 => bytes.extend_from_slice(&(scalar_f64(item)? as i64).to_le_bytes()),
-                VT::Uint64 => bytes.extend_from_slice(&(scalar_f64(item)? as u64).to_le_bytes()),
+                VT::Int64 => bytes.extend_from_slice(&(int_of(item)? as i64).to_le_bytes()),
+                VT::Uint64 => bytes.extend_from_slice(&(int_of(item)? as u64).to_le_bytes()),
                 VT::Half => {
                     bytes.extend_from_slice(&f32_to_half(scalar_f64(item)? as f32).to_le_bytes())
                 }
@@ -716,10 +722,12 @@ impl Encoder {
                     self.encode_scalar(VT::Double, v)?
                 }
             }
+            Value::Integer(_) => self.encode_scalar(VT::Int64, v)?,
+            Value::Unsigned(_) => self.encode_scalar(VT::Uint64, v)?,
             Value::Token(_) => self.encode_scalar(VT::Token, v)?,
             Value::String(_) | Value::Raw(_) => self.encode_scalar(VT::String, v)?,
             Value::Asset(_) => self.encode_scalar(VT::Asset, v)?,
-            Value::AssetWithPath { .. } => self.encode_list_op(
+            Value::AssetWithPath { .. } | Value::Reference(_) => self.encode_list_op(
                 &ListOp::single(ListEditOp::Explicit, v.clone()),
                 VT::ReferenceListOp,
             )?,
@@ -757,6 +765,16 @@ impl Encoder {
                 let vt = match items.first() {
                     None => VT::Int,
                     Some(Value::Bool(_)) => VT::Bool,
+                    Some(Value::Integer(_) | Value::Unsigned(_) | Value::Float(_))
+                        if items.iter().any(|x| matches!(x, Value::Unsigned(_))) =>
+                    {
+                        VT::Uint64
+                    }
+                    Some(Value::Integer(_) | Value::Float(_))
+                        if items.iter().any(|x| matches!(x, Value::Integer(_))) =>
+                    {
+                        VT::Int64
+                    }
                     Some(Value::Float(_)) => {
                         if items.iter().all(|x| matches!(x, Value::Float(f) if *f == f.trunc() && f.abs() < 2_147_483_648.0)) {
                             VT::Int
@@ -770,7 +788,7 @@ impl Encoder {
                     Some(Value::Path(_)) => {
                         return self.encode_list_op(&ListOp::single(ListEditOp::Explicit, v.clone()), VT::PathListOp)
                     }
-                    Some(Value::AssetWithPath { .. }) => {
+                    Some(Value::AssetWithPath { .. }) | Some(Value::Reference(_)) => {
                         return self.encode_list_op(&ListOp::single(ListEditOp::Explicit, v.clone()), VT::ReferenceListOp)
                     }
                     Some(Value::Tuple(t)) => match t.len() {
@@ -795,7 +813,8 @@ impl Encoder {
             }
             Value::Relocates(pairs) => self.encode_relocates(pairs)?,
             Value::Spline(s) => self.encode_spline(s)?,
-            Value::None => Self::inline(VT::ValueBlock, 0),
+            Value::Typed(t) => self.encode_typed(&t.value, Some(&t.type_name))?,
+            Value::None | Value::Block => Self::inline(VT::ValueBlock, 0),
         })
     }
 
@@ -871,19 +890,13 @@ impl Encoder {
         }
         // Sublists follow in the fixed wire order.
         let ordered = [
-            (ADD, &op.appended, true),
-            (PREPEND, &op.prepended, false),
-            (APPEND, &op.appended, false),
-            (DELETE, &op.deleted, false),
-            (REORDER, &op.reordered, false),
+            (ADD, &op.added),
+            (PREPEND, &op.prepended),
+            (APPEND, &op.appended),
+            (DELETE, &op.deleted),
+            (REORDER, &op.reordered),
         ];
-        for (bit, slot, is_add_legacy) in ordered {
-            // `add` (legacy) and `append` share the typed slot; the
-            // parser folds `add` into `appended`, so it re-emits as
-            // `append`.
-            if is_add_legacy {
-                continue;
-            }
+        for (bit, slot) in ordered {
             if let Some(v) = slot {
                 header |= bit;
                 body.push((bit, items(v)));
@@ -930,15 +943,30 @@ impl Encoder {
                 out.extend_from_slice(&(scalar_f64(item)? as i32 as u32).to_le_bytes());
             }
             VT::Int64ListOp | VT::UInt64ListOp => {
-                out.extend_from_slice(&(scalar_f64(item)? as i64).to_le_bytes());
+                out.extend_from_slice(&(int_of(item)? as i64).to_le_bytes());
             }
             VT::ReferenceListOp | VT::PayloadListOp => {
-                let (asset, prim_path) = match item {
-                    Value::AssetWithPath { asset, prim_path } => (asset.clone(), prim_path.clone()),
-                    Value::Asset(a) => (a.clone(), String::new()),
-                    Value::Path(p) => (String::new(), p.clone()),
-                    other => (text_of(other)?, String::new()),
+                let plain;
+                let record = match item {
+                    Value::Reference(r) => &**r,
+                    Value::AssetWithPath { asset, prim_path } => {
+                        plain = Reference::new(asset.clone(), prim_path.clone());
+                        &plain
+                    }
+                    Value::Asset(a) => {
+                        plain = Reference::new(a.clone(), String::new());
+                        &plain
+                    }
+                    Value::Path(p) => {
+                        plain = Reference::new(String::new(), p.clone());
+                        &plain
+                    }
+                    other => {
+                        plain = Reference::new(text_of(other)?, String::new());
+                        &plain
+                    }
                 };
+                let (asset, prim_path) = (record.asset.clone(), record.prim_path.clone());
                 out.extend_from_slice(&self.string(&asset).to_le_bytes());
                 let path_idx = if prim_path.is_empty() {
                     0
@@ -947,12 +975,21 @@ impl Encoder {
                 };
                 refs.push(out.len());
                 out.extend_from_slice(&path_idx.to_le_bytes());
-                // §16.3.10.20 layer offset: identity (offset 0, scale 1).
-                out.extend_from_slice(&0.0f64.to_le_bytes());
-                out.extend_from_slice(&1.0f64.to_le_bytes());
+                // §16.3.10.20 layer offset: time offset, then scale.
+                out.extend_from_slice(&record.offset.to_le_bytes());
+                out.extend_from_slice(&record.scale.to_le_bytes());
                 if vt == VT::ReferenceListOp {
-                    // Empty custom-data dictionary.
-                    out.extend_from_slice(&0u64.to_le_bytes());
+                    // Custom data: an in-line dictionary table whose
+                    // members are stored ahead of the record (every
+                    // link the fixed +8 to the rep word beside it).
+                    out.extend_from_slice(&(record.custom_data.len() as u64).to_le_bytes());
+                    for (k, v) in &record.custom_data {
+                        let key = self.string(k);
+                        let rep = self.encode_by_shape(v)?;
+                        out.extend_from_slice(&key.to_le_bytes());
+                        out.extend_from_slice(&8i64.to_le_bytes());
+                        out.extend_from_slice(&rep.to_le_bytes());
+                    }
                 }
             }
             other => {
@@ -1101,17 +1138,30 @@ impl Encoder {
                         other => other.as_text().map(str::to_owned).into_iter().collect(),
                     };
                     // §16.3.10.27: the parallel offsets vector every
-                    // sublayer entry needs (identity: offset 0, scale 1).
+                    // sublayer entry needs — the authored
+                    // `subLayerOffsets` pairs, identity (offset 0,
+                    // scale 1) where none is authored.
+                    let authored: &[Value] = match layer.metadata.get("subLayerOffsets") {
+                        Some(Value::Array(pairs)) => pairs,
+                        _ => &[],
+                    };
                     let mut offsets = Vec::with_capacity(8 + items.len() * 16);
                     offsets.extend_from_slice(&(items.len() as u64).to_le_bytes());
-                    for _ in &items {
-                        offsets.extend_from_slice(&0.0f64.to_le_bytes());
-                        offsets.extend_from_slice(&1.0f64.to_le_bytes());
+                    for i in 0..items.len() {
+                        let (offset, scale) = match authored.get(i).and_then(Value::as_seq) {
+                            Some([Value::Float(o), Value::Float(s)]) => (*o, *s),
+                            _ => (0.0, 1.0),
+                        };
+                        offsets.extend_from_slice(&offset.to_le_bytes());
+                        offsets.extend_from_slice(&scale.to_le_bytes());
                     }
                     let rep = self.stored(ValueType::LayerOffsetVector, &offsets);
                     fields.push(("subLayerOffsets".to_owned(), rep));
                     ("subLayers".to_owned(), self.string_vector(&items))
                 }
+                // Written with `subLayers` above.
+                "subLayerOffsets" if layer.metadata.contains_key("subLayers") => continue,
+                "primOrder" => (k.clone(), self.name_vector(v)),
                 "relocates" => ("layerRelocates".to_owned(), self.encode_by_shape(v)?),
                 "doc" => (
                     "documentation".to_owned(),
@@ -1201,14 +1251,40 @@ impl Encoder {
                     "references".to_owned(),
                     self.encode_list_op(&as_list_op(v), ValueType::ReferenceListOp)?,
                 ),
+                // A lone unedited payload is the scalar `Payload`
+                // value (§16.3.10.21) — the form files in circulation
+                // carry for `payload = @a.usd@</P>`; anything
+                // list-edited or plural is the list operation.
+                "payload"
+                    if matches!(
+                        v,
+                        Value::Asset(_)
+                            | Value::AssetWithPath { .. }
+                            | Value::Reference(_)
+                            | Value::Path(_)
+                    ) =>
+                {
+                    let mut bytes = Vec::with_capacity(24);
+                    let mut refs = Vec::new();
+                    self.encode_list_item(ValueType::PayloadListOp, v, &mut bytes, &mut refs)?;
+                    let off = self.intern(&bytes, &refs, false);
+                    ("payload".to_owned(), Self::rep(ValueType::Payload, 0, off))
+                }
                 "payload" => (
                     "payload".to_owned(),
                     self.encode_list_op(&as_list_op(v), ValueType::PayloadListOp)?,
                 ),
-                "inherits" | "specializes" => (
+                // §16.2.17.4: `inherits` is the `inheritPaths` field.
+                "inherits" => (
+                    "inheritPaths".to_owned(),
+                    self.encode_list_op(&as_list_op(v), ValueType::PathListOp)?,
+                ),
+                "specializes" => (
                     k.clone(),
                     self.encode_list_op(&as_list_op(v), ValueType::PathListOp)?,
                 ),
+                "primOrder" | "propertyOrder" => (k.clone(), self.name_vector(v)),
+                "permission" => (k.clone(), self.encode_scalar(ValueType::Permission, v)?),
                 "apiSchemas" => (
                     "apiSchemas".to_owned(),
                     self.encode_list_op(&as_list_op(v), ValueType::TokenListOp)?,
@@ -1289,13 +1365,10 @@ impl Encoder {
                         &variant.metadata,
                         &variant.attrs,
                         &variant.children,
-                        &BTreeMap::new(),
+                        &variant.variant_sets,
                         &mut vfields,
                     )?;
                     self.nodes[var_node].spec = Some((FORM_VARIANT, vfields));
-                    for child in &variant.children {
-                        self.build_prim(var_node, child)?;
-                    }
                 }
             }
         }
@@ -1318,14 +1391,16 @@ impl Encoder {
         let custom = modifiers.contains(&"custom");
         let uniform = modifiers.contains(&"uniform");
         if base_type == "rel" {
-            let targets = match &attr.value {
-                Value::None => ListOp::single(ListEditOp::Explicit, Value::Array(Vec::new())),
-                other => as_list_op(other),
-            };
-            fields.push((
-                "targetPaths".to_owned(),
-                self.encode_list_op(&targets, ValueType::PathListOp)?,
-            ));
+            // A bare `rel name` authors no targets at all; `rel name =
+            // None` (an empty array here) authors the explicit empty
+            // list.
+            if !matches!(attr.value, Value::None) {
+                let targets = as_list_op(&attr.value);
+                fields.push((
+                    "targetPaths".to_owned(),
+                    self.encode_list_op(&targets, ValueType::PathListOp)?,
+                ));
+            }
             fields.push((
                 "variability".to_owned(),
                 Self::inline(ValueType::Variability, 1),
@@ -1334,7 +1409,7 @@ impl Encoder {
                 fields.push(("custom".to_owned(), Self::inline(ValueType::Bool, 1)));
             }
             for (k, v) in &attr.metadata {
-                fields.push((k.clone(), self.encode_by_shape(v)?));
+                fields.push(self.property_metadata_field(k, v)?);
             }
             self.nodes[node].spec = Some((FORM_RELATIONSHIP, fields));
             return Ok(());
@@ -1357,9 +1432,15 @@ impl Encoder {
                 Self::inline(ValueType::Variability, 1),
             ));
         }
-        if !matches!(attr.value, Value::None) {
-            let rep = self.encode_typed(&attr.value, Some(type_name))?;
-            fields.push(("default".to_owned(), rep));
+        match &attr.value {
+            Value::None => {}
+            Value::Block => {
+                fields.push(("default".to_owned(), Self::inline(ValueType::ValueBlock, 0)))
+            }
+            value => {
+                let rep = self.encode_typed(value, Some(type_name))?;
+                fields.push(("default".to_owned(), rep));
+            }
         }
         if let Some(Attr {
             value: Value::TimeSamples(samples),
@@ -1388,15 +1469,51 @@ impl Encoder {
             fields.push(("spline".to_owned(), rep));
         }
         for (k, v) in &attr.metadata {
-            let rep = match k.as_str() {
-                "interpolation" => self.encode_scalar(ValueType::Token, v)?,
-                "elementSize" => self.encode_scalar(ValueType::Int, v)?,
-                _ => self.encode_by_shape(v)?,
-            };
-            fields.push((k.clone(), rep));
+            fields.push(self.property_metadata_field(k, v)?);
         }
         self.nodes[node].spec = Some((FORM_ATTRIBUTE, fields));
         Ok(())
+    }
+
+    /// One property-metadata entry as its Crate field: the text
+    /// spelling mapped to the field name, and the fields whose type
+    /// the text form does not spell (§7.6.3 / §7.6.4) given it.
+    fn property_metadata_field(&mut self, key: &str, v: &Value) -> Result<(String, u64)> {
+        Ok(match key {
+            "doc" => (
+                "documentation".to_owned(),
+                self.encode_scalar(ValueType::String, v)?,
+            ),
+            "interpolation" | "colorSpace" => {
+                (key.to_owned(), self.encode_scalar(ValueType::Token, v)?)
+            }
+            "elementSize" => (key.to_owned(), self.encode_scalar(ValueType::Int, v)?),
+            "allowedTokens" => {
+                let items: Vec<Value> = match v {
+                    Value::Array(items) => items.clone(),
+                    other => vec![other.clone()],
+                };
+                (key.to_owned(), self.encode_array(ValueType::Token, &items)?)
+            }
+            "permission" => (
+                key.to_owned(),
+                self.encode_scalar(ValueType::Permission, v)?,
+            ),
+            _ => (key.to_owned(), self.encode_by_shape(v)?),
+        })
+    }
+
+    /// A name vector field (`primOrder`, `propertyOrder`) — a token
+    /// vector, whichever text spelling its items arrived in.
+    fn name_vector(&mut self, v: &Value) -> u64 {
+        let names: Vec<String> = match v {
+            Value::Array(items) => items
+                .iter()
+                .filter_map(|x| x.as_text().map(str::to_owned))
+                .collect(),
+            other => other.as_text().map(str::to_owned).into_iter().collect(),
+        };
+        self.token_vector(&names)
     }
 
     // ---- sections -------------------------------------------------------
@@ -1573,9 +1690,25 @@ fn text_of(v: &Value) -> Result<String> {
     }
 }
 
+/// A 64-bit integer element, exact on both sides of 2⁵³ (the cast to
+/// the wire type wraps an unsigned value into its bit pattern).
+fn int_of(v: &Value) -> Result<i128> {
+    match v {
+        Value::Integer(n) => Ok(i128::from(*n)),
+        Value::Unsigned(n) => Ok(i128::from(*n)),
+        Value::Float(f) => Ok(*f as i128),
+        Value::Bool(b) => Ok(i128::from(*b)),
+        other => Err(invalid(format!(
+            "USDC encode: expected an integer, got {other:?}"
+        ))),
+    }
+}
+
 fn scalar_f64(v: &Value) -> Result<f64> {
     match v {
         Value::Float(f) => Ok(*f),
+        Value::Integer(n) => Ok(*n as f64),
+        Value::Unsigned(n) => Ok(*n as f64),
         Value::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
         other => Err(invalid(format!(
             "USDC encode: expected a number, got {other:?}"
@@ -1602,9 +1735,13 @@ fn list_op_type_for(op: &ListOp, fallback: ValueType) -> ValueType {
         .next();
     match first {
         Some(Value::Path(_)) => ValueType::PathListOp,
-        Some(Value::AssetWithPath { .. }) | Some(Value::Asset(_)) => ValueType::ReferenceListOp,
+        Some(Value::AssetWithPath { .. }) | Some(Value::Asset(_)) | Some(Value::Reference(_)) => {
+            ValueType::ReferenceListOp
+        }
         Some(Value::String(_)) => ValueType::StringListOp,
         Some(Value::Float(f)) if *f == f.trunc() => ValueType::Int64ListOp,
+        Some(Value::Integer(_)) => ValueType::Int64ListOp,
+        Some(Value::Unsigned(_)) => ValueType::UInt64ListOp,
         Some(Value::Token(_)) => ValueType::TokenListOp,
         _ => fallback,
     }

@@ -307,6 +307,49 @@ typed matrices; `f32` data prints the shortest round-trip digits and
 `f64` values (timeCodes included) the §16.2.5 double-precision
 spelling, `-0` normalised.
 
+### Layer model: text ↔ Crate without loss
+
+`usda::parse` and `usdc_layer::layer_from_usdc` build the same
+layer model, and both writers take it back:
+`usda_emit::layer_to_usda(&layer)` prints any layer as `#usda 1.0`
+text and `usdc_encode::encode_layer(&layer)` as a Crate file. The
+`layer_sweep` suite reads every staged fixture and the in-tree
+reference layer (`tests/data/layer-model.usda` and the Crate file a
+black-box encoder made from it), writes each as Crate and as text,
+reads both again and pins:
+
+- the Crate form is a byte-stable fixed point and re-reads to the
+  identical model;
+- the text form parses and encodes to the *same Crate bytes*, and
+  printing that again gives the same text;
+- a text layer and its black-box Crate twin print and encode
+  identically;
+- where `usdcat` is installed, it prints our Crate and our text
+  exactly as it prints the source file.
+
+What the model carries beyond values and time samples:
+
+| Construct | Text form | Model |
+|---|---|---|
+| layer offsets on sublayers | `@a.usda@ (offset = 10; scale = 2)` | `subLayerOffsets` beside `subLayers` |
+| layer offsets / custom data on references and payloads | `@a.usd@</P> (offset = 5; customData = {…})` | `Value::Reference` |
+| list-edited relationships and connections | `prepend rel x = …`, `delete float y.connect = …` | `Value::ListOp` on the property |
+| the deprecated `add` operator | `add rel x = …` | `ListOp::added` |
+| blocked default vs. no default | `int x = None` / `int x` | `Value::Block` / `Value::None` |
+| emptied vs. bare relationship | `rel x = None` / `rel x` | empty array / `Value::None` |
+| child and property order | `reorder nameChildren`, `reorder properties`, `reorder rootPrims` | `primOrder` / `propertyOrder` |
+| typed dictionary members | `double d = 1`, `float f = 1.5`, `string[] s = []` | `Value::Typed` when the value alone would not tell |
+| 64-bit integers past 2⁵³ | `int64 id = 9007199254740993` | `Value::Integer` |
+| nested variant sets | `variantSet` inside a variant | `Variant::variant_sets` |
+| spec comment | a bare string in the metadata block | `comment` |
+
+`inherits` is the Crate field `inheritPaths` and `doc` the field
+`documentation` on prims *and* properties; a lone unedited payload
+is the scalar `Payload` value. Schema families with no typed slot
+(`Camera`, the light types) read generically: type name, every
+typed attribute, time samples and metadata are preserved and
+written back, with no schema semantics applied.
+
 ## USDC (binary crate file) — full reader + typed writer
 
 A clean-room Crate reader implemented from the AOUSD *USD Core
@@ -441,8 +484,14 @@ message.
 
 ## Not yet supported
 
-- `UsdGeomCamera` / `UsdLux` light schemas — unstaged in
-  `docs/3d/usd/` (GAP-TRACKER Round F: on demand).
+- A typed mapping for `UsdGeomCamera` / `UsdLux` prims: they are
+  read and written generically (every attribute, time sample and
+  metadata field preserved) with no schema semantics applied.
+- `UnregisteredValueListOp` Crate payloads (refused with a precise
+  message), and layer offsets on the *typed scene* — the layer
+  model keeps them, the scene has no slot for retimed arcs.
+- The deprecated `add` / `reorder` list operators compose as plain
+  additions / no-ops; both formats carry them through unchanged.
 
 ## Standalone build
 

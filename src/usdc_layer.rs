@@ -187,10 +187,8 @@ pub fn layer_from_usdc(bytes: &[u8]) -> Result<Layer> {
         // selector folds into the parent's `variant_sets` instead of
         // its child list. The empty-selection form (`{set=}`, the
         // VariantSet spec) declares the set; a named selection is a
-        // Variant body. When the *parent* is itself a variant, its
-        // own conversion to `Variant` below drops the nested sets —
-        // the same documented structural limitation as the text
-        // parser.
+        // Variant body. A parent that is itself a variant carries the
+        // nested sets along into its own `Variant`.
         if let Some((set, sel)) = variant_element(&path) {
             let Some(parent) = prims.get_mut(&parent_path) else {
                 return Err(invalid(format!(
@@ -205,6 +203,7 @@ pub fn layer_from_usdc(bytes: &[u8]) -> Result<Layer> {
                         metadata: build.metadata,
                         attrs: build.attrs,
                         children: finish_children(build.children, &build.child_order),
+                        variant_sets: build.variant_sets,
                     },
                 );
             }
@@ -348,6 +347,13 @@ fn build_prim(path: &str, spec: &NamedSpec, decoder: &ValueDecoder<'_>) -> Resul
                     .metadata
                     .insert("doc".to_owned(), decoder.decode(rep)?);
             }
+            // §16.2.17.4: the text form's `inherits` is the
+            // `inheritPaths` field.
+            "inheritPaths" => {
+                build
+                    .metadata
+                    .insert("inherits".to_owned(), decoder.decode(rep)?);
+            }
             other => {
                 build
                     .metadata
@@ -419,7 +425,15 @@ fn attach_attribute(
             "variability" => {
                 uniform = decoder.decode(rep)? == Value::Token("uniform".to_owned());
             }
+            // §16.2.16.2: a blocked default (`int x = None`) is the
+            // ValueBlock sentinel — not the absence of a default.
+            "default" if rep.value_type() == Some(crate::usdc::ValueType::ValueBlock) => {
+                default = Value::Block;
+            }
             "default" => default = decoder.decode(rep)?,
+            "documentation" => {
+                metadata.insert("doc".to_owned(), decoder.decode(rep)?);
+            }
             "timeSamples" => time_samples = Some(decoder.decode(rep)?),
             // §16.2.16.5 `.spline` companion.
             "spline" => spline = Some(decoder.decode(rep)?),
@@ -514,13 +528,12 @@ fn attach_relationship(
     for (fname, rep) in &spec.fields {
         let rep = ValueRep::from_raw(*rep);
         match fname.as_str() {
-            "targetPaths" => {
-                targets = match flatten_path_listop(decoder.decode(rep)?) {
-                    // An explicit empty target list is the text form's
-                    // bare `rel name` declaration.
-                    Value::Array(items) if items.is_empty() => Value::None,
-                    other => other,
-                }
+            // An explicit empty target list (`rel name = None`)
+            // stays an empty array; a relationship with no
+            // `targetPaths` field at all is the bare `rel name`.
+            "targetPaths" => targets = flatten_path_listop(decoder.decode(rep)?),
+            "documentation" => {
+                metadata.insert("doc".to_owned(), decoder.decode(rep)?);
             }
             // Relationships are uniform by definition (§16.2.16.7);
             // the authored variability adds nothing to the text form.
@@ -558,6 +571,7 @@ fn flatten_path_listop(v: Value) -> Value {
     let ListOp {
         prepended: None,
         appended: None,
+        added: None,
         deleted: None,
         explicit: Some(explicit),
         reordered: None,

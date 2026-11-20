@@ -9,12 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `usda_emit::layer_to_usda` — a generic text writer for the layer model (§16.2): any `usda::Layer`, read from text or from a Crate file, prints as `#usda 1.0`, numbers at the shortest digits that read back exactly at the attribute's precision.
+- Layer model: `Value::Reference` (reference / payload items with a layer offset or custom data), `Value::Block` (a blocked attribute default, distinct from no default), `Value::Typed` (dictionary members whose declared type their value does not imply), `Value::Integer` (64-bit integers past 2⁵³), `ListOp::added` (the deprecated `add` operator kept apart from `append`), `Variant::variant_sets` (nested variant sets), and the `subLayerOffsets` / `primOrder` / `propertyOrder` / `comment` fields.
+- Text parser: layer offsets on `subLayers`, reference and payload items (`(offset = …; scale = …; customData = {…})`), list-edited relationship and `.connect` statements, `reorder nameChildren` / `reorder properties` / `reorder rootPrims`, the bare comment string of a metadata block, quoted dictionary keys, `;` statement separators, nested `variantSet` blocks, exact 64-bit integer literals.
+- `tests/layer_sweep.rs`: every staged fixture and the in-tree reference layer through read → write (Crate and text) → read, with byte-level fixed points and black-box agreement.
+
 - Crate writer array coding: integral arrays take the §16.3.9.3.1 compressed-integer form and scalar `half` / `float` / `double` arrays the §16.3.9.3.2 all-integral (`i`) or lookup-table (`t`) form whenever that is smaller than the raw run; uncompressed arrays sit on 8-byte boundaries. Identical values, time-code vectors, time-sample records, dictionaries and field sets are stored once. The staged Elephant fixture re-encodes to 736 462 B (raw writer 2 932 917 B, source file 851 298 B). `usdc_encode::encode_layer_with` + `ArrayCoding::{Smallest, Raw}` select the policy; `encode_layer` uses `Smallest`.
 - `pathExpression` attribute type on the Crate writer.
 - `Default` on `composition::SourceLayer`, `composition::SourceAsset`, `EncodeReport`, `usda::Prim`, `usda::Layer` and `usda_writer::EmittedAsset`; `usda::Attr::new(..)` (every field, in declaration order); `with_<field>` setters on `usda_writer::WriteOptions` and `point_instancer::ExpandOptions`.
 
 ### Fixed
 
+- Crate `inheritPaths` is the `inherits` arc: the reader left it under its field name (so a Crate-authored inherit never composed) and the writer emitted a field named `inherits` that no other reader looks for.
+- Crate `documentation` on attributes and relationships maps to `doc`, as it already did on prims and layers; `primOrder` / `propertyOrder` are written as token vectors and `permission` as its enumeration.
+- Crate reader keeps reference / payload layer offsets and reference custom data instead of dropping them, and non-identity sublayer offsets survive the text form.
+- A relationship without targets (`rel x`) no longer gains an explicit empty target list in the Crate form; `rel x = None` keeps it.
+- A blocked time sample (`5: None`) on a typed attribute encodes as the value block instead of failing with *expected a number*.
+- A variant body's child prims were encoded twice into the Crate value region.
+- 64-bit integers beyond ±2⁵³ (`int64` / `uint64` values, arrays and list operations) round-trip exactly instead of through a double.
 - Crate dictionary keys are STRINGS-section indices on read and write. Keys were resolved through TOKENS, which misnamed every member of a dictionary written by another encoder and made a black-box reader print ours with empty keys.
 - The Crate writer stamps 0.9.0 for `timecode` values and 0.10.0 for `pathExpression` values instead of 0.8.0.
 - A property authored only through a companion statement (`float x.timeSamples = {…}`) takes its place in name order, so a text layer and its re-read Crate form encode to the same bytes.

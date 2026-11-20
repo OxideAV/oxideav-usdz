@@ -1248,6 +1248,13 @@ fn collect_arc_targets(v: Option<&Value>) -> Vec<ArcTarget> {
                 asset: asset.clone(),
                 prim_path: prim_path.clone(),
             }),
+            // An item with a layer offset / custom data targets the
+            // same layer and prim; the offset retimes samples, which
+            // the typed scene has no slot for.
+            Value::Reference(r) if !r.asset.is_empty() => Some(ArcTarget {
+                asset: r.asset.clone(),
+                prim_path: r.prim_path.clone(),
+            }),
             _ => None,
         }
     }
@@ -3337,9 +3344,11 @@ fn strip_skel_binding_api(v: &Value) -> Option<Value> {
                 deleted: list.deleted.clone(),
                 explicit: strip(&list.explicit),
                 reordered: list.reordered.clone(),
+                added: strip(&list.added),
             };
             if out.prepended.is_none()
                 && out.appended.is_none()
+                && out.added.is_none()
                 && out.deleted.is_none()
                 && out.explicit.is_none()
                 && out.reordered.is_none()
@@ -5634,6 +5643,7 @@ fn value_to_json(v: &Value) -> Option<serde_json::Value> {
         // for the JSON view; consumers wanting the parts can walk
         // the prim tree directly.
         Value::AssetWithPath { asset, prim_path } => J::String(format!("{asset}<{prim_path}>")),
+        Value::Reference(r) => J::String(format!("{}<{}>", r.asset, r.prim_path)),
         // A list-edited field flattens to a JSON object keyed by
         // operator so an extras consumer can still see each authored
         // sublist (`{"prepend": …, "delete": …}`).
@@ -5655,7 +5665,12 @@ fn value_to_json(v: &Value) -> Option<serde_json::Value> {
                 .map(|(a, b)| (a.clone(), J::String(b.clone())))
                 .collect(),
         ),
-        Value::None => J::Null,
+        Value::Typed(t) => return value_to_json(&t.value),
+        // JSON numbers past 2^53 lose digits in most readers; the
+        // decimal string keeps them.
+        Value::Integer(n) => J::String(n.to_string()),
+        Value::Unsigned(n) => J::String(n.to_string()),
+        Value::None | Value::Block => J::Null,
     })
 }
 

@@ -110,6 +110,9 @@ fn encode_variant(v: &Variant) -> JValue {
             JValue::Array(v.children.iter().map(encode_prim).collect()),
         );
     }
+    if let Some(nested) = encode_variant_sets(&v.variant_sets) {
+        o.insert("variant_sets".into(), nested);
+    }
     JValue::Object(o)
 }
 
@@ -129,6 +132,10 @@ fn decode_variant(value: &JValue) -> Variant {
                 JValue::Array(arr) => Some(arr.iter().map(decode_prim).collect()),
                 _ => None,
             })
+            .unwrap_or_default(),
+        variant_sets: obj
+            .get("variant_sets")
+            .map(decode_variant_sets)
             .unwrap_or_default(),
     }
 }
@@ -309,6 +316,36 @@ fn encode_value(v: &Value) -> JValue {
             o.insert("prim_path".into(), JValue::String(prim_path.clone()));
             JValue::Object(o)
         }
+        Value::Reference(r) => {
+            let mut o = JMap::new();
+            o.insert("t".into(), JValue::String("Reference".into()));
+            o.insert("asset".into(), JValue::String(r.asset.clone()));
+            o.insert("prim_path".into(), JValue::String(r.prim_path.clone()));
+            if let Some(n) = serde_json::Number::from_f64(r.offset) {
+                o.insert("offset".into(), JValue::Number(n));
+            }
+            if let Some(n) = serde_json::Number::from_f64(r.scale) {
+                o.insert("scale".into(), JValue::Number(n));
+            }
+            if !r.custom_data.is_empty() {
+                o.insert("custom_data".into(), encode_btree_value(&r.custom_data));
+            }
+            JValue::Object(o)
+        }
+        Value::Block => {
+            let mut o = JMap::new();
+            o.insert("t".into(), JValue::String("Block".into()));
+            JValue::Object(o)
+        }
+        Value::Integer(n) => tagged("Integer", JValue::String(n.to_string())),
+        Value::Unsigned(n) => tagged("Integer", JValue::String(n.to_string())),
+        Value::Typed(t) => {
+            let mut o = JMap::new();
+            o.insert("t".into(), JValue::String("Typed".into()));
+            o.insert("type".into(), JValue::String(t.type_name.clone()));
+            o.insert("v".into(), encode_value(&t.value));
+            JValue::Object(o)
+        }
         Value::Raw(s) => tagged("Raw", JValue::String(s.clone())),
         Value::Spline(spline) => tagged("Spline", spline.to_json()),
         Value::Relocates(pairs) => tagged(
@@ -351,6 +388,7 @@ fn encode_value(v: &Value) -> JValue {
             };
             put("prepended", &list.prepended);
             put("appended", &list.appended);
+            put("added", &list.added);
             put("deleted", &list.deleted);
             put("explicit", &list.explicit);
             put("reordered", &list.reordered);
@@ -383,6 +421,27 @@ fn decode_value(v: &JValue) -> Value {
             asset: read_str(obj, "asset"),
             prim_path: read_str(obj, "prim_path"),
         },
+        "Reference" => Value::Reference(Box::new(
+            crate::usda::Reference::new(read_str(obj, "asset"), read_str(obj, "prim_path"))
+                .with_layer_offset(
+                    obj.get("offset").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    obj.get("scale").and_then(|v| v.as_f64()).unwrap_or(1.0),
+                )
+                .with_custom_data(
+                    obj.get("custom_data")
+                        .map(decode_btree_value)
+                        .unwrap_or_default(),
+                ),
+        )),
+        "Block" => Value::Block,
+        "Integer" => read_str(obj, "v")
+            .parse::<i128>()
+            .map(crate::usda::integer_value)
+            .unwrap_or(Value::None),
+        "Typed" => Value::Typed(Box::new(crate::usda::TypedValue::new(
+            read_str(obj, "type"),
+            obj.get("v").map(decode_value).unwrap_or(Value::None),
+        ))),
         "Raw" => Value::Raw(read_str(obj, "v")),
         "Spline" => Value::Spline(Box::new(
             obj.get("v")
@@ -427,6 +486,7 @@ fn decode_value(v: &JValue) -> Value {
             Value::ListOp(Box::new(crate::usda::ListOp {
                 prepended: sub("prepended"),
                 appended: sub("appended"),
+                added: sub("added"),
                 deleted: sub("deleted"),
                 explicit: sub("explicit"),
                 reordered: sub("reordered"),
@@ -484,6 +544,7 @@ mod tests {
             metadata: variant_meta,
             attrs: BTreeMap::new(),
             children: vec![child],
+            ..Default::default()
         };
         let mut inner = BTreeMap::new();
         inner.insert("Capsule".into(), variant);
@@ -493,6 +554,7 @@ mod tests {
                 metadata: BTreeMap::new(),
                 attrs: BTreeMap::new(),
                 children: Vec::new(),
+                ..Default::default()
             },
         );
         let mut outer = BTreeMap::new();
@@ -549,6 +611,7 @@ mod tests {
             metadata: BTreeMap::new(),
             attrs: BTreeMap::new(),
             children: Vec::new(),
+            ..Default::default()
         };
         let mut inner_set = BTreeMap::new();
         inner_set.insert("only".into(), inner_variant);
@@ -568,6 +631,7 @@ mod tests {
             metadata: BTreeMap::new(),
             attrs: BTreeMap::new(),
             children: vec![nested_child],
+            ..Default::default()
         };
         let mut outer_set = BTreeMap::new();
         outer_set.insert("v".into(), outer_variant);

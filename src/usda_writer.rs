@@ -1349,6 +1349,11 @@ fn render_value(v: &crate::usda::Value) -> Option<String> {
             buf
         }
         V::AssetWithPath { asset, prim_path } => format!("@{asset}@<{prim_path}>"),
+        V::Reference(_) => crate::usda_emit::metadata_value_text(v),
+        V::Block => "None".into(),
+        V::Integer(n) => n.to_string(),
+        V::Unsigned(n) => n.to_string(),
+        V::Typed(t) => return render_value(&t.value),
         V::TimeSamples(samples) => format_time_samples(samples, render_value),
         V::Raw(s) => s.clone(),
         // A list-edited field has no single literal body; render the
@@ -4327,6 +4332,11 @@ pub(crate) fn format_metadata_value(value: &Value) -> String {
             s
         }
         Value::AssetWithPath { asset, prim_path } => format!("@{asset}@<{prim_path}>"),
+        Value::Reference(_) => crate::usda_emit::metadata_value_text(value),
+        Value::Block => "None".into(),
+        Value::Integer(n) => n.to_string(),
+        Value::Unsigned(n) => n.to_string(),
+        Value::Typed(t) => format_metadata_value(&t.value),
         Value::TimeSamples(samples) => {
             format_time_samples(samples, |v| Some(format_metadata_value(v)))
         }
@@ -4364,7 +4374,10 @@ fn format_metadata_dict(map: &BTreeMap<String, Value>) -> String {
         if i > 0 {
             s.push_str("; ");
         }
-        let ty = guess_usda_type(v);
+        let ty = match v {
+            Value::Typed(t) => t.type_name.as_str(),
+            other => guess_usda_type(other),
+        };
         let body = format_metadata_value(v);
         if matches!(v, Value::None) {
             s.push_str(&format!("{ty} {k}"));
@@ -4380,9 +4393,11 @@ fn guess_usda_type(v: &Value) -> &'static str {
     match v {
         Value::Token(_) => "token",
         Value::String(_) => "string",
-        Value::Asset(_) | Value::AssetWithPath { .. } => "asset",
+        Value::Asset(_) | Value::AssetWithPath { .. } | Value::Reference(_) => "asset",
         Value::Path(_) => "rel",
         Value::Float(_) => "double",
+        Value::Integer(_) => "int64",
+        Value::Unsigned(_) => "uint64",
         Value::Bool(_) => "bool",
         Value::Tuple(_) => "double3",
         Value::Array(_) => "string[]",
@@ -4395,7 +4410,8 @@ fn guess_usda_type(v: &Value) -> &'static str {
             .unwrap_or("token"),
         Value::Relocates(_) => "dictionary",
         Value::Spline(_) => "double",
-        Value::Raw(_) | Value::None => "token",
+        Value::Typed(t) => guess_usda_type(&t.value),
+        Value::Raw(_) | Value::None | Value::Block => "token",
     }
 }
 
