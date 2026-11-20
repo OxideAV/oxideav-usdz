@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-usdz/compare/v0.0.5...v0.0.6) - 2026-11-20
+
+### Other
+
+- scene writer: replayed number runs stream at the attribute's precision
+- scene path keeps point caches, animated and untyped transform stacks; spline tangents are (slope, width)
+- speed and memory: decode a 1 M-point package in 232 ms / 1.4 GiB (was 2047 ms / 7.7 GiB)
+- usdz writer: well-formed alignment record, MaterialBindingAPI applied, container rules pinned
+- layer model round trip: generic text writer, text and Crate carry the same layer
+- usdc writer: smallest array coding, values stored once, dictionary keys through STRINGS
+- API hygiene: #[non_exhaustive] on growable enums + scene / composition records, Default and setters, hide Crate / zip plumbing modules
+- edition 2024, MSRV 1.95
+
 ### Added
 
 - `usda_emit::layer_to_usda` — a generic text writer for the layer model (§16.2): any `usda::Layer`, read from text or from a Crate file, prints as `#usda 1.0`, numbers at the shortest digits that read back exactly at the attribute's precision.
