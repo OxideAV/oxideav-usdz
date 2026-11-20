@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A mesh, curve or point set that authors `points` only through `.timeSamples` decodes (earliest sample as the rest pose) instead of failing with *missing `points`*, and the samples replay on encode — vertex animation no longer disappears in a package → scene → package round trip.
+- Transform stacks the typed transform cannot express (Euler rotations, pivots, suffixed or reordered ops) and animated transform ops are kept as authored and replayed verbatim; they were read as identity and dropped on write.
+- The extras stash stores numeric arrays as one flat number list instead of a tagged object per number.
+- Spline text tangents: a two-number tangent is `(slope, width)` as §16.2.16.5 states; it was read and written `(width, slope)`, swapping the two for every asymmetric bezier tangent between the text and Crate forms.
 - Mesh index arrays are read at double precision: indices past 2²⁴ were rounded through `f32`.
 - USDZ writer: the alignment padding in a local file header's extra field is a well-formed record (header id `0x1986`, body size, zero body) instead of bare zero bytes that no ZIP reader can parse as extra records.
 - A prim that authors `material:binding` applies `MaterialBindingAPI` in its `apiSchemas` (merged into any authored `prepend apiSchemas` line; `SkelBindingAPI` joins the same line instead of a second statement that replaced the first for other readers).

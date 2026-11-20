@@ -1918,7 +1918,8 @@ fn read_spline(t: &mut Tokenizer<'_>) -> Result<crate::spline::Spline> {
         }
     }
     /// `SplineTangent <- '(' Number [',' Number] ')'` — two numbers
-    /// are `(width, slope)`, one is a bare slope.
+    /// are `(slope, width)` (§16.2.16.5: "the slope of the tangent
+    /// and the width of the tangent"), one is a bare slope.
     fn tangent(t: &mut Tokenizer<'_>) -> Result<Tangent> {
         expect(t, '(')?;
         let a = number(t)?;
@@ -1926,8 +1927,8 @@ fn read_spline(t: &mut Tokenizer<'_>) -> Result<crate::spline::Spline> {
         let out = if t.eat(',') {
             let b = number(t)?;
             Tangent {
-                width: Some(a),
-                slope: b,
+                width: Some(b),
+                slope: a,
             }
         } else {
             Tangent {

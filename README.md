@@ -78,11 +78,12 @@ Full reader and symmetric writer for the `#usda 1.0` text format:
   oscillate`, `loop: (…)`, knots with `pre & post` dual values, pre /
   post tangents, per-segment interpolation, custom-data
   dictionaries; last-authored-wins per §16.2.16.5) into a typed
-  `spline::Spline` and re-emits as a one-cycle fixed point. Two
-  spellings the staged specification leaves open are inferred and
-  flagged: the text tangent pair is read as `(width, slope)` (the
-  §16.3.10.33.1 knot-table order) and the Crate 2-bit interpolation
-  code follows the §7.4.2.4.2 enumeration order.
+  `spline::Spline` and re-emits as a one-cycle fixed point. A
+  two-number text tangent is `(slope, width)` (§16.2.16.5); the
+  Crate knot table stores the same fields widths first. One
+  spelling the staged specification leaves open is inferred and
+  flagged: the Crate 2-bit interpolation code follows the
+  §7.4.2.4.2 enumeration order.
 - **Per-face material subsets (`UsdGeomSubset`)** — face-element
   subsets with material bindings split a mesh into one typed
   `Primitive` per bound material (shared vertex arrays, the subset's
@@ -172,6 +173,12 @@ Full reader and symmetric writer for the `#usda 1.0` text format:
   fixed point.
 - **Transforms** — per-node `UsdGeomXformable` xformOps round-trip
   (`translate` + `orient` quatf + `scale`, or a `matrix4d` transform).
+  Any other stack — Euler rotations, pivots and other suffixed ops,
+  a different order, and every *animated* op (`.timeSamples` /
+  `.spline`) — is kept as authored and replayed verbatim, op order
+  included; the typed node then holds the static part it can read
+  (a gprim's carrier node stays at identity so the stack is not
+  applied twice).
   `matrix4d` literals (row-vector, translation in the last row)
   transpose into the typed model's column-vector convention and back,
   so `Skeleton::inverse_bind_matrices` and node matrices satisfy the
@@ -292,7 +299,10 @@ body and children the same way. On gprims the same stash sits on
 (custom scalars, constant primvars); per-face / per-vertex primvars,
 hole / crease / corner tables and `extent` are left out because the
 writer emits re-triangulated topology those arrays would no longer
-describe.
+describe. Sampled points (`points.timeSamples` — a point cache) are
+indexed by point, which the writer preserves, so they replay as
+authored; a mesh that authors `points` *only* through time samples
+decodes with its earliest sample as the rest pose.
 
 ### Round-trip fidelity
 

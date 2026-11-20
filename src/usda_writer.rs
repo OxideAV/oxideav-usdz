@@ -986,7 +986,13 @@ fn write_node(w: &mut Out, scene: &Scene3D, id: NodeId, parent_path: &str) {
     // reader produces for unxformed prims). Anything non-identity
     // emits the opinion list + an `xformOpOrder` token array per the
     // UsdGeomXformable contract.
-    write_node_transform(w, &node.transform);
+    // A transform stack the decoder kept as authored (animated or
+    // not expressible as the typed transform) replays from the stash
+    // below; writing the typed transform too would author the same
+    // attributes twice.
+    if !stash_has_xform_ops(&node.extras) {
+        write_node_transform(w, &node.transform);
+    }
 
     // UsdGeomPointInstancer: the typed record re-emits its
     // relationship + §2.2 arrays (defaults and time samples).
@@ -1998,6 +2004,20 @@ fn write_material_binding(
         writeln!(w.s, "rel material:binding = </Materials/{mat_name}>").unwrap();
     }
     replay_attr_stash(w, extras, "usd:collections");
+}
+
+/// `true` when the `usd:attrs` stash holds transform-stack
+/// attributes (`xformOp:*`, `xformOpOrder`).
+fn stash_has_xform_ops(extras: &std::collections::HashMap<String, serde_json::Value>) -> bool {
+    extras
+        .get("usd:attrs")
+        .and_then(|stash| stash.get("attrs"))
+        .and_then(|attrs| attrs.as_object())
+        .is_some_and(|attrs| {
+            attrs
+                .keys()
+                .any(|k| k.starts_with("xformOp:") || k == "xformOpOrder")
+        })
 }
 
 /// `true` when [`write_material_binding`] will author a binding for

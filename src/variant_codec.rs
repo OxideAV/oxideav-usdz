@@ -302,10 +302,13 @@ fn encode_value(v: &Value) -> JValue {
             "Tuple",
             JValue::Array(seq.iter().map(encode_value).collect()),
         ),
-        Value::Array(seq) => tagged(
-            "Array",
-            JValue::Array(seq.iter().map(encode_value).collect()),
-        ),
+        Value::Array(seq) => match pack_numbers(seq) {
+            Some(packed) => packed,
+            None => tagged(
+                "Array",
+                JValue::Array(seq.iter().map(encode_value).collect()),
+            ),
+        },
         Value::Asset(s) => tagged("Asset", JValue::String(s.clone())),
         Value::Path(s) => tagged("Path", JValue::String(s.clone())),
         Value::Dict(map) => tagged("Dict", encode_btree_value(map)),
@@ -402,6 +405,71 @@ fn encode_value(v: &Value) -> JValue {
     }
 }
 
+/// A non-empty array of finite numbers, or of same-arity tuples of
+/// finite numbers, as one flat JSON number list (`Floats`, or
+/// `Tuples` with the arity `n`) instead of a tagged object per
+/// number — the shape a point or sample array would otherwise take
+/// costs several times the data it holds. `None` for any other
+/// array, which keeps the general tagged form.
+fn pack_numbers(seq: &[Value]) -> Option<JValue> {
+    let number = |f: &f64| serde_json::Number::from_f64(*f).map(JValue::Number);
+    let mut o = JMap::new();
+    match seq.first()? {
+        Value::Float(_) => {
+            let flat: Option<Vec<JValue>> = seq
+                .iter()
+                .map(|x| match x {
+                    Value::Float(f) => number(f),
+                    _ => None,
+                })
+                .collect();
+            o.insert("t".into(), JValue::String("Floats".into()));
+            o.insert("v".into(), JValue::Array(flat?));
+        }
+        Value::Tuple(first) if (2..=4).contains(&first.len()) => {
+            let arity = first.len();
+            let mut flat = Vec::with_capacity(seq.len() * arity);
+            for item in seq {
+                let Value::Tuple(row) = item else {
+                    return None;
+                };
+                if row.len() != arity {
+                    return None;
+                }
+                for x in row {
+                    let Value::Float(f) = x else {
+                        return None;
+                    };
+                    flat.push(number(f)?);
+                }
+            }
+            o.insert("t".into(), JValue::String("Tuples".into()));
+            o.insert("n".into(), JValue::from(arity as u64));
+            o.insert("v".into(), JValue::Array(flat));
+        }
+        _ => return None,
+    }
+    Some(JValue::Object(o))
+}
+
+/// The stash form of a set of authored properties: the same JSON
+/// [`encode_prim`] gives a nameless prim holding only these
+/// attributes, built from borrowed attributes.
+pub(crate) fn encode_attr_shell<'a>(attrs: impl Iterator<Item = (&'a String, &'a Attr)>) -> JValue {
+    let mut o = JMap::new();
+    for key in ["spec", "type_name", "name"] {
+        o.insert(key.into(), JValue::String(String::new()));
+    }
+    let mut map = JMap::new();
+    for (name, attr) in attrs {
+        map.insert(name.clone(), encode_attr(attr));
+    }
+    if !map.is_empty() {
+        o.insert("attrs".into(), JValue::Object(map));
+    }
+    JValue::Object(o)
+}
+
 fn decode_value(v: &JValue) -> Value {
     let JValue::Object(obj) = v else {
         return Value::None;
@@ -414,6 +482,37 @@ fn decode_value(v: &JValue) -> Value {
         "Bool" => Value::Bool(obj.get("v").and_then(|v| v.as_bool()).unwrap_or(false)),
         "Tuple" => Value::Tuple(decode_seq(obj.get("v"))),
         "Array" => Value::Array(decode_seq(obj.get("v"))),
+        // Packed forms of a homogeneous numeric array (see
+        // `pack_numbers`).
+        "Floats" => Value::Array(
+            obj.get("v")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|n| Value::Float(n.as_f64().unwrap_or(0.0)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ),
+        "Tuples" => {
+            let n = obj.get("n").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
+            Value::Array(
+                obj.get("v")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.chunks(n)
+                            .map(|row| {
+                                Value::Tuple(
+                                    row.iter()
+                                        .map(|x| Value::Float(x.as_f64().unwrap_or(0.0)))
+                                        .collect(),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            )
+        }
         "Asset" => Value::Asset(read_str(obj, "v")),
         "Path" => Value::Path(read_str(obj, "v")),
         "Dict" => Value::Dict(obj.get("v").map(decode_btree_value).unwrap_or_default()),

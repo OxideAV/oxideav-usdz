@@ -224,3 +224,31 @@ fn crate_spline_field_decodes_and_ceiling_admits_0_12() {
     let scene = UsdzDecoder::new().decode(&archive).expect("decode");
     assert!(scene.nodes.iter().any(|n| n.name.as_deref() == Some("A")));
 }
+
+/// §16.2.16.5: "If dual-valued, the values describe the slope of the
+/// tangent and the width of the tangent" — in that order.
+#[test]
+fn two_number_tangent_is_slope_then_width() {
+    use oxideav_usdz::usda::{Value, parse};
+    let text = "#usda 1.0\n\ndef Scope \"S\"\n{\n    double r.spline = {\n        bezier,\n        1: 0; pre (0.5, 2); post curve (3.6, -7.8),\n        6: 4; pre (1, 1); post curve (1, 1),\n    }\n}\n";
+    let layer = parse(text.as_bytes()).expect("parse");
+    let Value::Spline(spline) = &layer.prims[0].attrs["r.spline"].value else {
+        panic!("spline value");
+    };
+    let post = spline.knots[0].post_tangent.expect("post tangent");
+    assert_eq!((post.slope, post.width), (3.6, Some(-7.8)));
+    let pre = spline.knots[0].pre_tangent.expect("pre tangent");
+    assert_eq!((pre.slope, pre.width), (0.5, Some(2.0)));
+    // The text form prints the pair back in the same order, and the
+    // Crate form (widths first on the wire) reads back the same knot.
+    let printed = oxideav_usdz::usda_emit::layer_to_usda(&layer);
+    assert!(printed.contains("post curve (3.6, -7.8)"), "{printed}");
+    assert!(printed.contains("pre (0.5, 2)"), "{printed}");
+    let crate_bytes = oxideav_usdz::usdc_encode::encode_layer(&layer).expect("encode");
+    let back = oxideav_usdz::usdc_layer::layer_from_usdc(&crate_bytes).expect("read");
+    let Value::Spline(again) = &back.prims[0].attrs["r.spline"].value else {
+        panic!("spline value from the Crate form");
+    };
+    assert_eq!(again.knots[0].post_tangent, spline.knots[0].post_tangent);
+    assert_eq!(again.knots[0].pre_tangent, spline.knots[0].pre_tangent);
+}

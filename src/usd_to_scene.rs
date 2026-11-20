@@ -1954,12 +1954,13 @@ fn collect_unconsumed_attrs(prim: &Prim, type_name: &str) -> BTreeMap<String, At
         "angularVelocities",
         "accelerations",
     ];
+    let typed_xform = xform_stack_is_typed(prim);
     prim.attrs
         .iter()
         .filter(|(name, _)| {
             let base = name.split('.').next().unwrap_or(name);
-            let consumed = name.starts_with("xformOp:")
-                || base == "xformOpOrder"
+            let consumed = (typed_xform
+                && (name.starts_with("xformOp:") || base == "xformOpOrder"))
                 || base == "material:binding"
                 || name.starts_with("material:binding:")
                 || name.starts_with("collection:")
@@ -1973,8 +1974,29 @@ fn collect_unconsumed_attrs(prim: &Prim, type_name: &str) -> BTreeMap<String, At
         .collect()
 }
 
+/// The value the typed scene takes for an attribute it holds one
+/// state of: the default when one is authored, otherwise the
+/// earliest unblocked time sample (a point cache authors `points`
+/// through `.timeSamples` alone, and the scene still needs a rest
+/// pose).
+fn rest_value<'a>(prim: &'a Prim, name: &str) -> Option<&'a Value> {
+    if let Some(attr) = prim.attrs.get(name)
+        && !matches!(attr.value, Value::None | Value::Block)
+    {
+        return Some(&attr.value);
+    }
+    let Value::TimeSamples(samples) = &prim.attrs.get(&format!("{name}.timeSamples"))?.value else {
+        return None;
+    };
+    samples
+        .iter()
+        .filter(|(_, v)| !matches!(v, Value::None | Value::Block))
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, v)| v)
+}
+
 /// See [`apply_mesh_metadata_to_primitive`].
-fn collect_unconsumed_gprim_attrs(prim: &Prim) -> BTreeMap<String, Attr> {
+fn collect_unconsumed_gprim_attrs(prim: &Prim) -> Vec<(&String, &Attr)> {
     const CONSUMED: [&str; 22] = [
         "points",
         "normals",
@@ -1999,13 +2021,23 @@ fn collect_unconsumed_gprim_attrs(prim: &Prim) -> BTreeMap<String, Attr> {
         "orientation",
         "ids",
     ];
+    let typed_xform = xform_stack_is_typed(prim);
     prim.attrs
         .iter()
         .filter(|(name, attr)| {
+            // A transform stack the typed `Transform` does not fully
+            // express replays as authored (see `xform_stack_is_typed`).
+            if name.starts_with("xformOp:") || name.as_str() == "xformOpOrder" {
+                return !typed_xform;
+            }
+            // Sampled points are indexed by point, and the writer
+            // keeps the point order: the samples replay as authored
+            // beside the rest pose the typed primitive carries.
+            if name.as_str() == "points.timeSamples" {
+                return true;
+            }
             let base = name.split('.').next().unwrap_or(name);
             if CONSUMED.contains(&base)
-                || name.starts_with("xformOp:")
-                || base == "xformOpOrder"
                 || base == "material:binding"
                 || name.starts_with("material:binding:")
                 || name.starts_with("collection:")
@@ -2029,7 +2061,6 @@ fn collect_unconsumed_gprim_attrs(prim: &Prim) -> BTreeMap<String, Attr> {
             }
             true
         })
-        .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
 }
 
@@ -3020,7 +3051,7 @@ fn build_mesh_group(
     }
     let mesh_id = ctx.scene.add_mesh(seed_mesh);
     let mut node = Node::new().with_name(head.name.clone()).with_mesh(mesh_id);
-    node.transform = read_node_transform(head);
+    node.transform = gprim_node_transform(head);
     node.skin = skel_skin_for_prim(ctx, head);
     stash_extras(&mut node.extras, head);
     Ok(ctx.scene.add_node(node))
@@ -3039,7 +3070,7 @@ fn build_standalone_mesh_node(
     let mesh = build_mesh(ctx, &path, prim)?;
     let mesh_id = ctx.scene.add_mesh(mesh);
     let mut node = Node::new().with_name(prim.name.clone()).with_mesh(mesh_id);
-    node.transform = read_node_transform(prim);
+    node.transform = gprim_node_transform(prim);
     node.skin = skel_skin_for_prim(ctx, prim);
     stash_extras(&mut node.extras, prim);
     Ok(ctx.scene.add_node(node))
@@ -3295,6 +3326,70 @@ fn read_node_transform(prim: &Prim) -> Transform {
         translation,
         rotation,
         scale,
+    }
+}
+
+/// `true` when the typed [`Transform`] says everything the prim's
+/// transform stack does, so the writer can re-author the stack from
+/// it: no op is sampled, splined or connected, every authored op is
+/// listed in `xformOpOrder`, and the listed ops are a lone
+/// `xformOp:transform` or translate → orient → scale in that order.
+/// Any other stack — Euler rotations, pivots, suffixed or repeated
+/// ops, a reset marker, an animated op — is kept as authored on the
+/// `usd:attrs` stash and replayed verbatim instead.
+fn xform_stack_is_typed(prim: &Prim) -> bool {
+    let mut ops: Vec<&str> = Vec::new();
+    for name in prim.attrs.keys().filter(|k| k.starts_with("xformOp:")) {
+        if name.contains('.') {
+            return false;
+        }
+        ops.push(name);
+    }
+    let order: Vec<&str> = match prim.attrs.get("xformOpOrder").map(|a| &a.value) {
+        None | Some(Value::None) => Vec::new(),
+        Some(Value::Array(items)) => {
+            let names: Vec<&str> = items.iter().filter_map(Value::as_text).collect();
+            if names.len() != items.len() {
+                return false;
+            }
+            names
+        }
+        Some(_) => return false,
+    };
+    if prim.attrs.contains_key("xformOpOrder.timeSamples") || ops.iter().any(|o| !order.contains(o))
+    {
+        return false;
+    }
+    match order.as_slice() {
+        [] => true,
+        ["xformOp:transform"] => prim
+            .attrs
+            .get("xformOp:transform")
+            .is_some_and(|a| read_matrix4(&a.value).is_some()),
+        listed => {
+            const CANONICAL: [&str; 3] = ["xformOp:translate", "xformOp:orient", "xformOp:scale"];
+            let mut next = 0usize;
+            listed.iter().all(
+                |op| match CANONICAL[next.min(3)..].iter().position(|c| c == op) {
+                    Some(found) => {
+                        next += found + 1;
+                        true
+                    }
+                    None => false,
+                },
+            )
+        }
+    }
+}
+
+/// The carrier-node transform of a gprim. A stack the typed model
+/// cannot re-author replays on the prim itself, so the carrier stays
+/// at identity rather than apply a second, partial copy of it.
+fn gprim_node_transform(prim: &Prim) -> Transform {
+    if xform_stack_is_typed(prim) {
+        read_node_transform(prim)
+    } else {
+        Transform::identity()
     }
 }
 
@@ -3801,11 +3896,9 @@ fn apply_geom_subsets(
 fn build_triangle_primitive(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Primitive> {
     let mut prim_out = Primitive::new(Topology::Triangles);
 
-    let positions = prim
-        .attrs
-        .get("points")
+    let positions = rest_value(prim, "points")
         .ok_or_else(|| invalid(format!("Mesh `{path}` is missing `points` attribute")))?;
-    prim_out.positions = read_vec3_array(&positions.value)
+    prim_out.positions = read_vec3_array(positions)
         .ok_or_else(|| invalid(format!("Mesh `{path}` has malformed `points`")))?;
 
     let counts = prim
@@ -4768,12 +4861,12 @@ fn attach_blend_weight_channels(ctx: &mut Ctx) {
 /// Width (`widths` attribute) is currently dropped — the typed
 /// model has no per-point thickness slot.
 fn build_basis_curves_primitive(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Primitive> {
-    let positions = prim.attrs.get("points").ok_or_else(|| {
+    let positions = rest_value(prim, "points").ok_or_else(|| {
         invalid(format!(
             "BasisCurves `{path}` is missing `points` attribute"
         ))
     })?;
-    let positions = read_vec3_array(&positions.value)
+    let positions = read_vec3_array(positions)
         .ok_or_else(|| invalid(format!("BasisCurves `{path}` has malformed `points`")))?;
 
     let counts_attr = prim.attrs.get("curveVertexCounts").ok_or_else(|| {
@@ -4821,11 +4914,9 @@ fn build_basis_curves_primitive(ctx: &mut Ctx, path: &str, prim: &Prim) -> Resul
 /// Build a `Topology::Points` primitive from a USD `Points` prim.
 /// Inverse of [`crate::usda_writer::write_points_prim`].
 fn build_points_primitive(ctx: &mut Ctx, path: &str, prim: &Prim) -> Result<Primitive> {
-    let positions = prim
-        .attrs
-        .get("points")
+    let positions = rest_value(prim, "points")
         .ok_or_else(|| invalid(format!("Points `{path}` is missing `points` attribute")))?;
-    let positions = read_vec3_array(&positions.value)
+    let positions = read_vec3_array(positions)
         .ok_or_else(|| invalid(format!("Points `{path}` has malformed `points`")))?;
 
     let mut prim_out = Primitive::new(Topology::Points);
@@ -4910,8 +5001,10 @@ fn apply_mesh_metadata_to_primitive(prim: &Prim, out: &mut Primitive) {
     // no longer describe.
     let unconsumed = collect_unconsumed_gprim_attrs(prim);
     if !unconsumed.is_empty() {
-        out.extras
-            .insert("usd:attrs".into(), binding_stash_json(&unconsumed));
+        out.extras.insert(
+            "usd:attrs".into(),
+            crate::variant_codec::encode_attr_shell(unconsumed.into_iter()),
+        );
     }
     if prim_no_fold(prim) {
         out.extras

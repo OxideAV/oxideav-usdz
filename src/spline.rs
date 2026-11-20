@@ -18,10 +18,10 @@
 //! the §7.4.2.4.2 enumeration order (`none` 0, `held` 1, `linear` 2,
 //! `curve` 3), the same order the neighbouring extrapolation table
 //! pins for its first three names, and records the raw code alongside
-//! so nothing is lost if that inference is ever corrected. Likewise
-//! the text tangent pair `(a, b)` is taken as `(width, slope)` — the
-//! order the §16.3.10.33.1 knot table uses — with hermite knots
-//! carrying a bare `(slope)`.
+//! so nothing is lost if that inference is ever corrected. The text
+//! tangent pair `(a, b)` is `(slope, width)` (§16.2.16.5) — the Crate
+//! knot table (§16.3.10.33.1) orders the same fields widths first —
+//! with hermite knots carrying a bare `(slope)`.
 
 use std::collections::BTreeMap;
 
@@ -632,7 +632,7 @@ impl Spline {
 
 fn fmt_tangent(t: &Tangent) -> String {
     match t.width {
-        Some(w) => format!("({}, {})", fmt_f(w), fmt_f(t.slope)),
+        Some(w) => format!("({}, {})", fmt_f(t.slope), fmt_f(w)),
         None => format!("({})", fmt_f(t.slope)),
     }
 }
@@ -874,7 +874,7 @@ mod tests {
         assert_eq!(Spline::from_json(&s.to_json()), s);
         // Text rendering re-parses to the same knots.
         let text = s.to_usda();
-        assert!(text.starts_with("{ bezier, pre: sloped(0.5), post: held, loop: (1, 10, 2, 3, 0.25), 1: -1 & 0; pre (1, 2); post curve (1.5, 2.5), 5: 3.25; pre (0); post held (0); { string note = \"hi\" } }"), "{text}");
+        assert!(text.starts_with("{ bezier, pre: sloped(0.5), post: held, loop: (1, 10, 2, 3, 0.25), 1: -1 & 0; pre (2, 1); post curve (2.5, 1.5), 5: 3.25; pre (0); post held (0); { string note = \"hi\" } }"), "{text}");
     }
 
     #[test]
