@@ -1254,10 +1254,35 @@ fn write_attr_map(w: &mut Out, attrs: &std::collections::BTreeMap<String, crate:
                 metadata_lines_from_value_map(&attr.metadata).join(", ")
             )
         };
-        match render_value(&attr.value) {
+        let single = crate::usda_emit::is_single_precision(&attr.type_token);
+        match render_attr_value(&attr.value, single) {
             Some(rendered) => writeln!(w.s, "{type_token}{name} = {rendered}{meta}").unwrap(),
             None => writeln!(w.s, "{type_token}{name}{meta}").unwrap(),
         }
+    }
+}
+
+/// [`render_value`] for an attribute whose element type is known:
+/// the number runs of a single-precision attribute (and its time
+/// samples) print at that precision.
+fn render_attr_value(v: &crate::usda::Value, single: bool) -> Option<String> {
+    use crate::usda::Value as V;
+    if !single {
+        return render_value(v);
+    }
+    match v {
+        V::Float(_) | V::Tuple(_) | V::Array(_) => {
+            let mut run = String::new();
+            if push_number_run(&mut run, v, true) {
+                Some(run)
+            } else {
+                render_value(v)
+            }
+        }
+        V::TimeSamples(samples) => {
+            Some(format_time_samples(samples, |x| render_attr_value(x, true)))
+        }
+        other => render_value(other),
     }
 }
 
@@ -1312,20 +1337,32 @@ fn render_value(v: &crate::usda::Value) -> Option<String> {
         V::String(s) => format!("\"{}\"", escape_quoted(s)),
         V::Float(f) => format_float(*f),
         V::Bool(b) => if *b { "true" } else { "false" }.into(),
-        V::Tuple(seq) => format!(
-            "({})",
-            seq.iter()
-                .map(|x| render_value(x).unwrap_or_else(|| "none".into()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        V::Array(seq) => format!(
-            "[{}]",
-            seq.iter()
-                .map(|x| render_value(x).unwrap_or_else(|| "none".into()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        V::Tuple(seq) => {
+            let mut run = String::new();
+            if push_number_run(&mut run, v, false) {
+                return Some(run);
+            }
+            format!(
+                "({})",
+                seq.iter()
+                    .map(|x| render_value(x).unwrap_or_else(|| "none".into()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+        V::Array(seq) => {
+            let mut run = String::new();
+            if push_number_run(&mut run, v, false) {
+                return Some(run);
+            }
+            format!(
+                "[{}]",
+                seq.iter()
+                    .map(|x| render_value(x).unwrap_or_else(|| "none".into()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
         V::Asset(s) => format!("@{s}@"),
         V::Path(s) => format!("<{s}>"),
         V::Dict(map) => {
@@ -1379,6 +1416,50 @@ fn render_value(v: &crate::usda::Value) -> Option<String> {
         V::Spline(spline) => spline.to_usda(),
         V::None => return None,
     })
+}
+
+/// Append a tuple / array made only of numbers (nested to any depth)
+/// to `out`, in the spelling [`render_value`] gives it, without a
+/// string per number — replayed point samples run to millions of
+/// them. Returns `false`, leaving `out` to be discarded, at the first
+/// element that is not a number or such a tuple / array.
+fn push_number_run(out: &mut String, v: &crate::usda::Value, single: bool) -> bool {
+    use crate::usda::Value as V;
+    let (open, close, seq) = match v {
+        // A single-precision attribute prints the shortest digits
+        // that read back to the same `f32`.
+        V::Float(f) if single => {
+            crate::usda_emit::push_number(out, *f, true);
+            return true;
+        }
+        V::Float(f) => {
+            let f = *f;
+            if f.is_nan() {
+                out.push_str("nan");
+            } else if f.is_infinite() {
+                out.push_str(if f < 0.0 { "-inf" } else { "inf" });
+            } else if f == f.trunc() && f.abs() < 1e16 {
+                write!(out, "{}", f as i64).unwrap();
+            } else {
+                write!(out, "{f}").unwrap();
+            }
+            return true;
+        }
+        V::Tuple(seq) => ('(', ')', seq),
+        V::Array(seq) => ('[', ']', seq),
+        _ => return false,
+    };
+    out.push(open);
+    for (i, x) in seq.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        if !push_number_run(out, x, single) {
+            return false;
+        }
+    }
+    out.push(close);
+    true
 }
 
 /// §16.2.18.5 `{ </src> : </dst>, … }`.

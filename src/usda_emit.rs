@@ -703,8 +703,14 @@ fn number(f: f64, single: bool) -> String {
     out
 }
 
+/// `true` when an attribute type token names a single-precision (or
+/// half) element type.
+pub(crate) fn is_single_precision(type_token: &str) -> bool {
+    Shape::of_type(type_token).single
+}
+
 /// Append [`number`]'s spelling to `out`.
-fn push_number(out: &mut String, f: f64, single: bool) {
+pub(crate) fn push_number(out: &mut String, f: f64, single: bool) {
     if f.is_nan() {
         out.push_str("nan");
         return;

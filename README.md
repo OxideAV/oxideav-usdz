@@ -519,9 +519,15 @@ shared with other builds, before → after this round's work:
 | layer model → Crate (raw, 88.0 MB) | 554.7 ms | **81.9 ms** | 359 MiB | 320 MiB |
 | layer model → text (163.6 MB) | 1777.3 ms | **604.6 ms** | 434 MiB | 464 MiB |
 | text → layer model | 674.1 ms | 618.0 ms | 1627 MiB | **1284 MiB** |
-| package (Crate root) → scene | 2047.1 ms | **231.7 ms** | 7741 MiB | **1415 MiB** |
-| scene → package (text root, 105.6 MB) | 1093.6 ms | **370.9 ms** | 462 MiB | 462 MiB |
-| scene → package (Crate root, 32.0 MB) | 1572.9 ms | **941.5 ms** | 1679 MiB | **1136 MiB** |
+| package (Crate root) → scene | 2047.1 ms | **212.3 ms** | 7741 MiB | **1690 MiB** |
+| scene → package (text root) ¹ | 1093.6 ms | **728.3 ms** | 462 MiB | 967 MiB |
+| scene → package (Crate root) ¹ | 1572.9 ms | 1555.0 ms | 1679 MiB | 1937 MiB |
+
+¹ Not like for like: the scene now carries the three point samples
+(3 M points) the earlier pipeline dropped on decode, so the *after*
+packages are 182.4 MB (text) and 56.0 MB (Crate) against 105.6 MB
+and 32.0 MB *before*. Writing the same sample-less output took
+370.9 ms / 462 MiB (text) and 941.5 ms / 1136 MiB (Crate).
 
 | `SoC-ElephantWithMonochord.usdc` (851 kB) | time before | time after | peak heap after |
 |---|---:|---:|---:|
@@ -529,9 +535,9 @@ shared with other builds, before → after this round's work:
 | layer model → Crate (smallest coding) | 20.1 ms | **6.2 ms** | 3 MiB |
 | layer model → text (9.2 MB) | 90.6 ms | **45.0 ms** | 24 MiB |
 | text → layer model | 28.2 ms | 31.6 ms | 40 MiB |
-| package (Crate root) → scene | — | 21.9 ms | 62 MiB |
-| scene → package (text root) | — | 62.5 ms | 40 MiB |
-| scene → package (Crate root) | — | 99.0 ms | 52 MiB |
+| package (Crate root) → scene | — | 16.6 ms | 62 MiB |
+| scene → package (text root) | — | 50.2 ms | 39 MiB |
+| scene → package (Crate root) | — | 80.6 ms | 52 MiB |
 
 What changed: the decoder hands the layer to composition instead of
 copying it (five full copies of the layer model during a decode
