@@ -906,7 +906,14 @@ impl<'a> Tokenizer<'a> {
     }
 
     fn peek_char(&self) -> Option<char> {
-        self.rest().chars().next()
+        // Nearly every character of a layer is ASCII; those need no
+        // decoding.
+        let first = *self.src.as_bytes().get(self.pos)?;
+        if first.is_ascii() {
+            Some(first as char)
+        } else {
+            self.rest().chars().next()
+        }
     }
 
     fn advance(&mut self) -> Option<char> {
@@ -937,6 +944,11 @@ impl<'a> Tokenizer<'a> {
 
     /// Skip whitespace (any Unicode whitespace) and `#`-comments.
     fn skip_trivia(&mut self) {
+        // The common case between two values: at most one space.
+        let bytes = self.src.as_bytes();
+        while matches!(bytes.get(self.pos), Some(b' ' | b'\n' | b'\t' | b'\r')) {
+            self.pos += 1;
+        }
         loop {
             match self.peek_char() {
                 Some(c) if c.is_whitespace() => {
@@ -1480,10 +1492,13 @@ fn read_tuple(t: &mut Tokenizer<'_>) -> Result<Vec<Value>> {
     if !t.eat('(') {
         return Err(invalid("expected `(`"));
     }
-    let mut out = Vec::new();
+    // Most tuples are points, normals and colours; the model holds
+    // millions of them, so each keeps exactly the room it uses.
+    let mut out = Vec::with_capacity(3);
     loop {
         t.skip_trivia();
         if t.eat(')') {
+            out.shrink_to_fit();
             return Ok(out);
         }
         out.push(parse_value(t)?);
@@ -1492,6 +1507,7 @@ fn read_tuple(t: &mut Tokenizer<'_>) -> Result<Vec<Value>> {
             continue;
         }
         if t.eat(')') {
+            out.shrink_to_fit();
             return Ok(out);
         }
         return Err(invalid(format!(
@@ -1510,6 +1526,7 @@ fn read_array(t: &mut Tokenizer<'_>) -> Result<Vec<Value>> {
     loop {
         t.skip_trivia();
         if t.eat(']') {
+            out.shrink_to_fit();
             return Ok(out);
         }
         out.push(parse_value(t)?);
@@ -1518,6 +1535,7 @@ fn read_array(t: &mut Tokenizer<'_>) -> Result<Vec<Value>> {
             continue;
         }
         if t.eat(']') {
+            out.shrink_to_fit();
             return Ok(out);
         }
         return Err(invalid(format!(

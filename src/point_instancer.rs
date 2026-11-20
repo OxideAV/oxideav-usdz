@@ -888,7 +888,7 @@ fn fmt_f(f: f64) -> String {
 }
 
 fn fmt_f32(f: f32) -> String {
-    crate::usda_writer::format_f32(f)
+    crate::usda_writer::format_f32(f).to_string()
 }
 
 fn fmt_ints(v: &[u32]) -> String {

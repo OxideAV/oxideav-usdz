@@ -4539,17 +4539,30 @@ fn format_metadata_lines(key: &str, value: &Value) -> Vec<String> {
 /// `f64` path rounded `0.0013888899` to `0.001389`, a lossy channel
 /// on every encode → decode cycle. Rust's `Display` for `f32` prints
 /// the shortest digits that parse back to the same `f32`.
-pub(crate) fn format_f32(f: f32) -> String {
-    if f.is_nan() {
-        return "nan".to_owned();
+pub(crate) fn format_f32(f: f32) -> F32Text {
+    F32Text(f)
+}
+
+/// The spelling [`format_f32`] gives a value, written straight into
+/// whatever formats it — the geometry loops print millions of these
+/// and must not allocate a string for each.
+#[derive(Clone, Copy)]
+pub(crate) struct F32Text(f32);
+
+impl std::fmt::Display for F32Text {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let f = self.0;
+        if f.is_nan() {
+            return out.write_str("nan");
+        }
+        if f.is_infinite() {
+            return out.write_str(if f < 0.0 { "-inf" } else { "inf" });
+        }
+        if f == f.trunc() && f.abs() < 1e7 {
+            return write!(out, "{}", f as i64);
+        }
+        write!(out, "{f}")
     }
-    if f.is_infinite() {
-        return if f < 0.0 { "-inf" } else { "inf" }.to_owned();
-    }
-    if f == f.trunc() && f.abs() < 1e7 {
-        return format!("{}", f as i64);
-    }
-    format!("{f}")
 }
 
 pub(crate) fn format_float(f: f64) -> String {

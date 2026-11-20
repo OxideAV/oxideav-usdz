@@ -986,53 +986,63 @@ fn scalar_width(vt: ValueType) -> Option<usize> {
 /// Decode one fixed-width element of a dimensioned / numeric type.
 fn decode_element(vt: ValueType, bytes: &[u8]) -> Result<Value> {
     use ValueType as VT;
-    fn f32s(bytes: &[u8]) -> Vec<f64> {
+    // Each helper yields the element's components straight from the
+    // wire bytes; the tuple is collected once, at its final size.
+    fn f32s(bytes: &[u8]) -> impl ExactSizeIterator<Item = f64> + '_ {
         bytes
             .as_chunks::<4>()
             .0
             .iter()
             .map(|c| f64::from(f32::from_le_bytes(*c)))
-            .collect()
     }
-    fn f64s(bytes: &[u8]) -> Vec<f64> {
+    fn f64s(bytes: &[u8]) -> impl ExactSizeIterator<Item = f64> + '_ {
         bytes
             .as_chunks::<8>()
             .0
             .iter()
             .map(|c| f64::from_le_bytes(*c))
-            .collect()
     }
-    fn f16s(bytes: &[u8]) -> Vec<f64> {
+    fn f16s(bytes: &[u8]) -> impl ExactSizeIterator<Item = f64> + '_ {
         bytes
             .as_chunks::<2>()
             .0
             .iter()
             .map(|c| f64::from(half_to_f32(u16::from_le_bytes(*c))))
-            .collect()
     }
-    fn i32s(bytes: &[u8]) -> Vec<f64> {
+    fn i32s(bytes: &[u8]) -> impl ExactSizeIterator<Item = f64> + '_ {
         bytes
             .as_chunks::<4>()
             .0
             .iter()
             .map(|c| f64::from(i32::from_le_bytes(*c)))
-            .collect()
     }
-    fn tuple(vals: Vec<f64>) -> Value {
-        Value::Tuple(vals.into_iter().map(Value::Float).collect())
+    fn tuple(vals: impl ExactSizeIterator<Item = f64>) -> Value {
+        Value::Tuple(vals.map(Value::Float).collect())
     }
     /// §16.3.10.22: on disk the imaginary coefficients come first and
     /// the real coefficient last; the text form displays the real
     /// coefficient first, which is the order `usda::Value` carries.
-    fn quat(vals: Vec<f64>) -> Value {
-        let (im, re) = vals.split_at(3);
-        let mut out = vec![re[0]];
-        out.extend_from_slice(im);
-        tuple(out)
+    fn quat(vals: impl ExactSizeIterator<Item = f64>) -> Value {
+        let mut wire = [0f64; 4];
+        for (slot, v) in wire.iter_mut().zip(vals) {
+            *slot = v;
+        }
+        let [i, j, k, real] = wire;
+        Value::Tuple(vec![
+            Value::Float(real),
+            Value::Float(i),
+            Value::Float(j),
+            Value::Float(k),
+        ])
     }
     /// §16.3.10.24: row-major square matrix -> tuple of row tuples.
-    fn matrix(vals: Vec<f64>, n: usize) -> Value {
-        Value::Tuple(vals.chunks(n).map(|row| tuple(row.to_vec())).collect())
+    fn matrix(vals: impl ExactSizeIterator<Item = f64>, n: usize) -> Value {
+        let flat: Vec<f64> = vals.collect();
+        Value::Tuple(
+            flat.chunks(n)
+                .map(|row| Value::Tuple(row.iter().copied().map(Value::Float).collect()))
+                .collect(),
+        )
     }
     Ok(match vt {
         VT::Bool => Value::Bool(bytes[0] != 0),

@@ -491,6 +491,57 @@ across two namespace levels). Not yet implemented on the Crate
 path: `UnregisteredValueListOp` payloads refuse with a precise
 message.
 
+## Read / write speed
+
+`USDZ_PERF_SIDE=1000 cargo test --release --test perf_report -- --nocapture --test-threads=1`
+times every stage of both pipelines and reports the peak heap growth
+of one run (a counting allocator in the test). The synthetic layer is
+a 1000 × 1000 point grid — 1 M points, 1 M quads, normals, a UV set,
+three time samples of the points and a 240-sample transform — and the
+fixture is the staged production Crate. Medians (5 runs for the
+grid, 7 for the fixture; the slower of two invocations) on a machine
+shared with other builds, before → after this round's work:
+
+| 1 M-point grid | time before | time after | peak heap before | peak heap after |
+|---|---:|---:|---:|---:|
+| Crate → layer model | 219.7 ms | **68.2 ms** | 1281 MiB | 1281 MiB |
+| layer model → Crate (smallest coding, 56.0 MB) | 576.5 ms | **95.2 ms** | 252 MiB | 199 MiB |
+| layer model → Crate (raw, 88.0 MB) | 554.7 ms | **81.9 ms** | 359 MiB | 320 MiB |
+| layer model → text (163.6 MB) | 1777.3 ms | **604.6 ms** | 434 MiB | 464 MiB |
+| text → layer model | 674.1 ms | 618.0 ms | 1627 MiB | **1284 MiB** |
+| package (Crate root) → scene | 2047.1 ms | **231.7 ms** | 7741 MiB | **1415 MiB** |
+| scene → package (text root, 105.6 MB) | 1093.6 ms | **370.9 ms** | 462 MiB | 462 MiB |
+| scene → package (Crate root, 32.0 MB) | 1572.9 ms | **941.5 ms** | 1679 MiB | **1136 MiB** |
+
+| `SoC-ElephantWithMonochord.usdc` (851 kB) | time before | time after | peak heap after |
+|---|---:|---:|---:|
+| Crate → layer model | 7.7 ms | **3.6 ms** | 39 MiB |
+| layer model → Crate (smallest coding) | 20.1 ms | **6.2 ms** | 3 MiB |
+| layer model → text (9.2 MB) | 90.6 ms | **45.0 ms** | 24 MiB |
+| text → layer model | 28.2 ms | 31.6 ms | 40 MiB |
+| package (Crate root) → scene | — | 21.9 ms | 62 MiB |
+| scene → package (text root) | — | 62.5 ms | 40 MiB |
+| scene → package (Crate root) | — | 99.0 ms | 52 MiB |
+
+What changed: the decoder hands the layer to composition instead of
+copying it (five full copies of the layer model during a decode
+became one — the 7.7 GiB peak), the inherit / specialize snapshots
+are taken only when a prim authors those arcs, variant resolution
+moves prims instead of cloning them, array elements are read and
+written without a heap allocation each, the Crate writer borrows
+arrays instead of cloning them, the text writers format numbers
+straight into the output, the parser scans numbers and ASCII
+without per-character decoding, tuples keep exactly the room they
+use, the compressed-integer coder tallies deltas in a flat table,
+and the package CRC-32 folds eight bytes per step (it runs over
+every entry on both read and write). Output is byte-identical
+throughout.
+
+The layer model itself — one tagged value per number — is the
+remaining cost: about 224 bytes per point, which is what the
+1.28 GiB of the grid's four point arrays, normals, UVs and
+topology is.
+
 ## Not yet supported
 
 - A typed mapping for `UsdGeomCamera` / `UsdLux` prims: they are

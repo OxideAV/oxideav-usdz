@@ -497,11 +497,11 @@ impl Encoder {
             return Ok(Self::inline(ValueType::ValueBlock, 0));
         }
         if is_array {
-            let items: Vec<Value> = match v {
-                Value::Array(items) => items.clone(),
-                other => vec![other.clone()],
+            let items: &[Value] = match v {
+                Value::Array(items) => items,
+                other => std::slice::from_ref(other),
             };
-            return self.encode_array(vt, &items);
+            return self.encode_array(vt, items);
         }
         self.encode_scalar(vt, v)
     }
@@ -646,7 +646,7 @@ impl Encoder {
 
     fn encode_array(&mut self, vt: ValueType, items: &[Value]) -> Result<u64> {
         use ValueType as VT;
-        let mut bytes = Vec::new();
+        let mut bytes = Vec::with_capacity(items.len() * element_width(vt));
         for item in items {
             match vt {
                 VT::Token => {
@@ -677,8 +677,9 @@ impl Encoder {
                     bytes.extend_from_slice(&scalar_f64(item)?.to_le_bytes())
                 }
                 _ => {
-                    let comps = components(item, vt)?;
-                    bytes.extend_from_slice(&element_bytes(vt, &comps)?);
+                    let mut comps = [0f64; 16];
+                    let n = gather(item, vt, &mut comps)?;
+                    push_element(vt, &comps[..n], &mut bytes)?;
                 }
             }
         }
@@ -872,14 +873,14 @@ impl Encoder {
         const PREPEND: u8 = 0x20;
         const APPEND: u8 = 0x40;
         let mut header = 0u8;
-        let mut body: Vec<(u8, Vec<Value>)> = Vec::new();
-        let items = |v: &Value| -> Vec<Value> {
+        let mut body: Vec<(u8, &[Value])> = Vec::new();
+        fn items(v: &Value) -> &[Value] {
             match v {
-                Value::Array(seq) => seq.clone(),
-                Value::None => Vec::new(),
-                other => vec![other.clone()],
+                Value::Array(seq) => seq,
+                Value::None => &[],
+                other => std::slice::from_ref(other),
             }
-        };
+        }
         if let Some(v) = &op.explicit {
             header |= MAKE_EXPLICIT;
             let it = items(v);
@@ -906,7 +907,7 @@ impl Encoder {
         let mut refs: Vec<usize> = Vec::new();
         for (_, list) in &body {
             bytes.extend_from_slice(&(list.len() as u64).to_le_bytes());
-            for item in list {
+            for item in *list {
                 self.encode_list_item(vt, item, &mut bytes, &mut refs)?;
             }
         }
@@ -1804,26 +1805,43 @@ fn wire_type(token: &str) -> Option<(ValueType, bool)> {
 /// Flatten a tuple / matrix / quaternion value to its wire-ordered
 /// component list.
 fn components(v: &Value, vt: ValueType) -> Result<Vec<f64>> {
+    let mut comps = [0f64; 16];
+    let n = gather(v, vt, &mut comps)?;
+    Ok(comps[..n].to_vec())
+}
+
+/// Bytes of one array element of `vt` (0 for the index-valued and
+/// variable types, which only seeds a capacity).
+fn element_width(vt: ValueType) -> usize {
     use ValueType as VT;
-    let flat = |v: &Value| -> Result<Vec<f64>> {
-        match v {
-            Value::Tuple(seq) => seq
-                .iter()
-                .map(|x| match x {
-                    Value::Float(f) => Ok(*f),
-                    Value::Tuple(row) => Err(invalid(format!("USDC encode: nested tuple {row:?}"))),
-                    other => Err(invalid(format!(
-                        "USDC encode: non-numeric component {other:?}"
-                    ))),
-                })
-                .collect(),
-            Value::Float(f) => Ok(vec![*f]),
-            other => Err(invalid(format!(
-                "USDC encode: expected a tuple for {}, got {other:?}",
-                vt.name()
-            ))),
-        }
-    };
+    match vt {
+        VT::Bool | VT::Uchar => 1,
+        VT::Half => 2,
+        VT::Int | VT::Uint | VT::Float | VT::Token | VT::String | VT::Asset | VT::Half2 => 4,
+        VT::Half3 => 6,
+        VT::Int64
+        | VT::Uint64
+        | VT::Double
+        | VT::TimeCode
+        | VT::Float2
+        | VT::Int2
+        | VT::Half4
+        | VT::Quath => 8,
+        VT::Float3 | VT::Int3 => 12,
+        VT::Float4 | VT::Int4 | VT::Quatf | VT::Double2 => 16,
+        VT::Double3 => 24,
+        VT::Double4 | VT::Quatd | VT::Matrix2d => 32,
+        VT::Matrix3d => 72,
+        VT::Matrix4d => 128,
+        _ => 0,
+    }
+}
+
+/// Write a tuple / matrix / quaternion value's components into
+/// `out` in wire order and return how many there are — the
+/// allocation-free core of [`components`].
+fn gather(v: &Value, vt: ValueType, out: &mut [f64; 16]) -> Result<usize> {
+    use ValueType as VT;
     let n = match vt {
         VT::Half2 | VT::Float2 | VT::Double2 | VT::Int2 => 2,
         VT::Half3 | VT::Float3 | VT::Double3 | VT::Int3 => 3,
@@ -1833,32 +1851,62 @@ fn components(v: &Value, vt: ValueType) -> Result<Vec<f64>> {
         VT::Matrix4d => 16,
         _ => 0,
     };
-    let mut comps = match vt {
-        VT::Matrix2d | VT::Matrix3d | VT::Matrix4d => match v {
-            Value::Tuple(rows) => {
-                let mut out = Vec::with_capacity(n);
-                for row in rows {
-                    out.extend(flat(row)?);
-                }
-                out
-            }
-            other => flat(other)?,
-        },
-        _ => flat(v)?,
+    let mut len = 0usize;
+    let mut total = 0usize;
+    let mut push = |f: f64| {
+        if len < 16 {
+            out[len] = f;
+            len += 1;
+        }
+        total += 1;
     };
-    if comps.len() != n {
+    fn flat(v: &Value, vt: ValueType, push: &mut dyn FnMut(f64)) -> Result<()> {
+        match v {
+            Value::Tuple(seq) => {
+                for x in seq {
+                    match x {
+                        Value::Float(f) => push(*f),
+                        Value::Tuple(row) => {
+                            return Err(invalid(format!("USDC encode: nested tuple {row:?}")));
+                        }
+                        other => {
+                            return Err(invalid(format!(
+                                "USDC encode: non-numeric component {other:?}"
+                            )));
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Value::Float(f) => {
+                push(*f);
+                Ok(())
+            }
+            other => Err(invalid(format!(
+                "USDC encode: expected a tuple for {}, got {other:?}",
+                vt.name()
+            ))),
+        }
+    }
+    match (vt, v) {
+        (VT::Matrix2d | VT::Matrix3d | VT::Matrix4d, Value::Tuple(rows)) => {
+            for row in rows {
+                flat(row, vt, &mut push)?;
+            }
+        }
+        _ => flat(v, vt, &mut push)?,
+    }
+    if total != n {
         return Err(invalid(format!(
-            "USDC encode: {} needs {n} components, got {}",
-            vt.name(),
-            comps.len()
+            "USDC encode: {} needs {n} components, got {total}",
+            vt.name()
         )));
     }
     if matches!(vt, VT::Quath | VT::Quatf | VT::Quatd) {
         // Text `(real, i, j, k)` → wire imaginary-first.
-        let re = comps.remove(0);
-        comps.push(re);
+        out[..4].rotate_left(1);
     }
-    Ok(comps)
+    Ok(n)
 }
 
 /// §16.3.9.1 inline packing: int8 components for vectors (Vec2h
@@ -1923,8 +1971,14 @@ fn inline_vector(vt: ValueType, comps: &[f64]) -> Option<u32> {
 
 /// Fixed-width element bytes (§16.3.10.22–24).
 fn element_bytes(vt: ValueType, comps: &[f64]) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(comps.len() * 8);
+    push_element(vt, comps, &mut out)?;
+    Ok(out)
+}
+
+/// Append one fixed-width element (§16.3.10.22–24) to `out`.
+fn push_element(vt: ValueType, comps: &[f64], out: &mut Vec<u8>) -> Result<()> {
     use ValueType as VT;
-    let mut out = Vec::new();
     match vt {
         VT::Half2 | VT::Half3 | VT::Half4 | VT::Quath => {
             for &c in comps {
@@ -1959,7 +2013,7 @@ fn element_bytes(vt: ValueType, comps: &[f64]) -> Result<Vec<u8>> {
             )));
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// IEEE-754 binary16 from binary32, round-to-nearest-even

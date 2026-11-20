@@ -435,6 +435,54 @@ impl Emitter {
     // ---- values ----------------------------------------------------------
 
     fn value(&self, v: &Value, shape: Shape) -> String {
+        let mut out = String::new();
+        self.write_value(&mut out, v, shape);
+        out
+    }
+
+    /// Append a value's spelling to `out`. Numbers, tuples and arrays
+    /// — the bulk of any geometry layer — go straight into the
+    /// buffer; the structured kinds are composed and appended.
+    fn write_value(&self, out: &mut String, v: &Value, shape: Shape) {
+        match v {
+            Value::Float(f) => push_number(out, *f, shape.single),
+            Value::Tuple(items) => {
+                out.push('(');
+                for (i, x) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    self.write_value(out, x, shape);
+                }
+                out.push(')');
+            }
+            Value::Array(items) => {
+                out.push('[');
+                for (i, x) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    self.write_value(out, x, shape);
+                }
+                out.push(']');
+            }
+            Value::TimeSamples(samples) => {
+                out.push_str("{\n");
+                for (time, value) in samples {
+                    out.push_str("    ");
+                    push_number(out, *time, false);
+                    out.push_str(": ");
+                    self.write_value(out, value, shape);
+                    out.push_str(",\n");
+                }
+                out.push('}');
+            }
+            other => out.push_str(&self.structured(other, shape)),
+        }
+    }
+
+    /// The value kinds that are not plain number runs.
+    fn structured(&self, v: &Value, shape: Shape) -> String {
         match v {
             Value::Token(s) | Value::String(s) => {
                 if shape.bare {
@@ -450,14 +498,7 @@ impl Emitter {
             Value::Integer(n) => n.to_string(),
             Value::Unsigned(n) => n.to_string(),
             Value::Bool(b) => if *b { "true" } else { "false" }.to_owned(),
-            Value::Tuple(items) => {
-                let parts: Vec<String> = items.iter().map(|x| self.value(x, shape)).collect();
-                format!("({})", parts.join(", "))
-            }
-            Value::Array(items) => {
-                let parts: Vec<String> = items.iter().map(|x| self.value(x, shape)).collect();
-                format!("[{}]", parts.join(", "))
-            }
+            Value::Tuple(_) | Value::Array(_) | Value::TimeSamples(_) => self.value(v, shape),
             Value::Asset(s) => asset(s),
             Value::Path(p) => format!("<{p}>"),
             Value::AssetWithPath {
@@ -490,19 +531,6 @@ impl Emitter {
                 s
             }
             Value::Dict(map) => self.dictionary(map),
-            Value::TimeSamples(samples) => {
-                let mut s = String::from("{\n");
-                for (time, value) in samples {
-                    let _ = writeln!(
-                        s,
-                        "    {}: {},",
-                        number(*time, false),
-                        self.value(value, shape)
-                    );
-                }
-                s.push('}');
-                s
-            }
             Value::ListOp(op) => {
                 // A list op nested in a value position has no
                 // operator syntax; its strongest sublist stands in.
@@ -670,42 +698,56 @@ fn quoted(s: &str) -> String {
 /// single precision when the element type is and `f` is exactly a
 /// single-precision value.
 fn number(f: f64, single: bool) -> String {
+    let mut out = String::new();
+    push_number(&mut out, f, single);
+    out
+}
+
+/// Append [`number`]'s spelling to `out`.
+fn push_number(out: &mut String, f: f64, single: bool) {
     if f.is_nan() {
-        return "nan".to_owned();
+        out.push_str("nan");
+        return;
     }
     if f.is_infinite() {
-        return if f < 0.0 { "-inf" } else { "inf" }.to_owned();
+        out.push_str(if f < 0.0 { "-inf" } else { "inf" });
+        return;
     }
     if f == 0.0 {
-        return if f.is_sign_negative() { "-0" } else { "0" }.to_owned();
+        out.push_str(if f.is_sign_negative() { "-0" } else { "0" });
+        return;
     }
     let magnitude = f.abs();
     if f == f.trunc() && magnitude < 1e16 {
-        return format!("{}", f as i64);
+        let _ = write!(out, "{}", f as i64);
+        return;
     }
+    let exponent_form = !(1e-5..1e16).contains(&magnitude);
     if single {
         let narrow = f as f32;
         if f64::from(narrow) == f {
-            let text = if !(1e-5..1e16).contains(&magnitude) {
-                format!("{narrow:e}")
+            let start = out.len();
+            let _ = if exponent_form {
+                write!(out, "{narrow:e}")
             } else {
-                format!("{narrow}")
+                write!(out, "{narrow}")
             };
             // The reader parses at double precision and narrows; keep
             // the short spelling only when that lands on the same bits.
-            if text
+            if out[start..]
                 .parse::<f64>()
                 .is_ok_and(|back| (back as f32).to_bits() == narrow.to_bits())
             {
-                return text;
+                return;
             }
+            out.truncate(start);
         }
     }
-    if !(1e-5..1e16).contains(&magnitude) {
-        format!("{f:e}")
+    let _ = if exponent_form {
+        write!(out, "{f:e}")
     } else {
-        format!("{f}")
-    }
+        write!(out, "{f}")
+    };
 }
 
 #[cfg(test)]

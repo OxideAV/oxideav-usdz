@@ -19,8 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `pathExpression` attribute type on the Crate writer.
 - `Default` on `composition::SourceLayer`, `composition::SourceAsset`, `EncodeReport`, `usda::Prim`, `usda::Layer` and `usda_writer::EmittedAsset`; `usda::Attr::new(..)` (every field, in declaration order); `with_<field>` setters on `usda_writer::WriteOptions` and `point_instancer::ExpandOptions`.
 
+### Changed
+
+- Speed and memory (output byte-identical; 1 M-point grid, medians, before → after): package → scene 2047 → 232 ms and 7.7 → 1.4 GiB peak (composition edits the decoder's layer in place, class-arc snapshots only when a prim authors the arc, variant resolution by move); layer model → Crate 577 → 95 ms (arrays borrowed, elements written without per-element vectors, flat-table delta tally); Crate → layer model 220 → 68 ms (one allocation per element); layer model → text 1777 → 605 ms and scene → package 1094 → 371 ms (numbers formatted into the output, CRC-32 eight bytes per step); text → layer model peak 1.63 → 1.28 GiB (exact-size tuples, ASCII fast paths). `tests/perf_report.rs` prints the table (`USDZ_PERF_SIDE=1000` for the full-size mesh).
+
 ### Fixed
 
+- Mesh index arrays are read at double precision: indices past 2²⁴ were rounded through `f32`.
 - USDZ writer: the alignment padding in a local file header's extra field is a well-formed record (header id `0x1986`, body size, zero body) instead of bare zero bytes that no ZIP reader can parse as extra records.
 - A prim that authors `material:binding` applies `MaterialBindingAPI` in its `apiSchemas` (merged into any authored `prepend apiSchemas` line; `SkelBindingAPI` joins the same line instead of a second statement that replaced the first for other readers).
 - Crate `inheritPaths` is the `inherits` arc: the reader left it under its field name (so a Crate-authored inherit never composed) and the writer emitted a field named `inherits` that no other reader looks for.

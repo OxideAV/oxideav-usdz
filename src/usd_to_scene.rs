@@ -77,6 +77,24 @@ pub fn translate_with_root(
     entries: &[ZipEntry],
     root_layer_name: Option<&str>,
 ) -> Result<Scene3D> {
+    translate_owned(layer.clone(), archive, entries, root_layer_name)
+}
+
+/// [`translate_with_root`] for a caller that is done with the layer:
+/// composition edits it in place instead of working on a copy, so the
+/// largest allocation of a decode — the layer model — exists once.
+pub(crate) fn translate_owned(
+    layer: Layer,
+    archive: Arc<Vec<u8>>,
+    entries: &[ZipEntry],
+    root_layer_name: Option<&str>,
+) -> Result<Scene3D> {
+    // The local layer as authored (specs and arcs, no properties), for
+    // the composition record built once the arcs are resolved.
+    let mut record = crate::composition::CompositionRecord::from_local_layer(
+        root_layer_name.unwrap_or(crate::usda_writer::DEFAULT_ROOT_LAYER_NAME),
+        &layer,
+    );
     let mut entry_map: HashMap<String, ZipEntry> = entries
         .iter()
         .map(|e| (e.name.clone(), e.clone()))
@@ -129,13 +147,14 @@ pub fn translate_with_root(
     };
 
     apply_layer_metadata(&mut ctx.scene, &layer.metadata);
-    // SkelAnimation timeCodes → seconds conversion factor. USD's
-    // layer default when unauthored is 24 timeCodes per second.
-    if let Some(tcps) = layer
+    let layer_tcps = layer
         .metadata
         .get("timeCodesPerSecond")
         .or_else(|| layer.metadata.get("framesPerSecond"))
-        .and_then(|v| v.as_f32())
+        .and_then(|v| v.as_f32());
+    // SkelAnimation timeCodes → seconds conversion factor. USD's
+    // layer default when unauthored is 24 timeCodes per second.
+    if let Some(tcps) = layer_tcps
         && tcps > 0.0
     {
         ctx.time_codes_per_second = tcps as f64;
@@ -160,7 +179,7 @@ pub fn translate_with_root(
     // full USD runtime would perform before composition).
     let mut composed_paths: Vec<String> = Vec::new();
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut merged_layer = layer.clone();
+    let mut merged_layer = layer;
     compose_sublayers(
         &mut merged_layer,
         &archive,
@@ -178,9 +197,19 @@ pub fn translate_with_root(
     // (`</Class/Foo>`) and contributes its opinions to the inheriting
     // prim. Composed BEFORE references so a referenced opinion can't
     // overwrite an inherited one (LIVRPS: L > I > V > R > P > S).
-    let inherits_snapshot = merged_layer.prims.clone();
+    // The arcs read their targets from the tree as it stood before
+    // any of them was applied — a copy needed only when some prim
+    // authors the arc at all.
+    let inherits_snapshot = if any_prim_authors(&merged_layer.prims, "inherits") {
+        merged_layer.prims.clone()
+    } else {
+        Vec::new()
+    };
     let mut composed_inherits: Vec<String> = Vec::new();
     for prim in &mut merged_layer.prims {
+        if inherits_snapshot.is_empty() {
+            break;
+        }
         let prim_path = format!("/{}", prim.name);
         compose_class_arcs(
             prim,
@@ -264,9 +293,17 @@ pub fn translate_with_root(
     // refinable defaults. Composed AFTER references / payload so an
     // earlier-strength arc has already filled in opinions; only what
     // remains missing gets filled from the specialised target.
-    let specializes_snapshot = merged_layer.prims.clone();
+    let specializes_snapshot = if any_prim_authors(&merged_layer.prims, "specializes") {
+        merged_layer.prims.clone()
+    } else {
+        Vec::new()
+    };
+    drop(inherits_snapshot);
     let mut composed_specializes: Vec<String> = Vec::new();
     for prim in &mut merged_layer.prims {
+        if specializes_snapshot.is_empty() {
+            break;
+        }
         let prim_path = format!("/{}", prim.name);
         compose_class_arcs(
             prim,
@@ -310,11 +347,8 @@ pub fn translate_with_root(
     // in-archive layer the arcs above consumed, so the encoder can
     // re-author the composition instead of flattening it. Stashed
     // only when it would change the writer's output.
+    drop(specializes_snapshot);
     {
-        let mut record = crate::composition::CompositionRecord::from_local_layer(
-            root_layer_name.unwrap_or(crate::usda_writer::DEFAULT_ROOT_LAYER_NAME),
-            layer,
-        );
         let mut consumed: Vec<String> = Vec::new();
         // Sublayers are recorded as bare paths, references as the
         // `path|kind` audit shape.
@@ -375,7 +409,7 @@ pub fn translate_with_root(
     // translator never has to think about variant_sets again.
     let mut resolved: Vec<Prim> = merged_layer
         .prims
-        .iter()
+        .into_iter()
         .map(resolve_variants_recursive)
         .collect();
 
@@ -1393,14 +1427,34 @@ pub(crate) fn parse_layer_bytes(name: &str, bytes: &[u8]) -> Result<Layer> {
 /// Apply [`Prim::resolved_variants`](crate::usda::Prim::resolved_variants)
 /// at every depth of the prim tree, returning a new tree where
 /// every prim's variant selection (if any) has been composed in.
-fn resolve_variants_recursive(prim: &Prim) -> Prim {
-    let mut composed = prim.resolved_variants();
-    composed.children = composed
-        .children
-        .iter()
+fn resolve_variants_recursive(prim: Prim) -> Prim {
+    // Only a prim with both a selection and variant sets composes
+    // anything; every other prim is passed through as it is.
+    let selects = !prim.variant_sets.is_empty()
+        && matches!(prim.metadata.get("variants"), Some(Value::Dict(_)));
+    let mut composed = if selects {
+        prim.resolved_variants()
+    } else {
+        prim
+    };
+    composed.children = std::mem::take(&mut composed.children)
+        .into_iter()
         .map(resolve_variants_recursive)
         .collect();
     composed
+}
+
+/// `true` when any prim of the forest (variant bodies included)
+/// authors the metadata field `key`.
+fn any_prim_authors(prims: &[Prim], key: &str) -> bool {
+    prims.iter().any(|p| {
+        p.metadata.contains_key(key)
+            || any_prim_authors(&p.children, key)
+            || p.variant_sets.values().any(|set| {
+                set.values()
+                    .any(|v| v.metadata.contains_key(key) || any_prim_authors(&v.children, key))
+            })
+    })
 }
 
 struct Ctx {
@@ -4937,11 +4991,15 @@ fn read_int_array(v: &Value) -> Option<Vec<u32>> {
     let seq = v.as_seq()?;
     let mut out = Vec::with_capacity(seq.len());
     for item in seq {
-        let f = item.as_f32()?;
-        if f < 0.0 || f.fract() != 0.0 {
+        // Read at double precision: an `f32` holds integers only up
+        // to 2^24, and a mesh can index more points than that.
+        let Value::Float(f) = item else {
+            return None;
+        };
+        if *f < 0.0 || f.fract() != 0.0 || *f > f64::from(u32::MAX) {
             return None;
         }
-        out.push(f as u32);
+        out.push(*f as u32);
     }
     Some(out)
 }

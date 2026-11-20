@@ -1063,6 +1063,32 @@ pub fn encode_compressed_buffer(raw: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The most frequent value of a delta sequence — the §16.3.7.2.2
+/// common value. Ties go to the larger delta, so the choice does not
+/// depend on visiting order. Small deltas, which is nearly all of
+/// them in index and count arrays, are tallied in a flat table; the
+/// rest in a map.
+fn most_common_delta(deltas: impl Iterator<Item = i64>) -> i64 {
+    const HALF: i64 = 1024;
+    let mut near = [0usize; (2 * HALF) as usize];
+    let mut far: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+    for delta in deltas {
+        if (-HALF..HALF).contains(&delta) {
+            near[(delta + HALF) as usize] += 1;
+        } else {
+            *far.entry(delta).or_insert(0) += 1;
+        }
+    }
+    let near_best = near
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| **n > 0)
+        .map(|(slot, n)| (*n, slot as i64 - HALF))
+        .max();
+    let far_best = far.iter().map(|(delta, n)| (*n, *delta)).max();
+    near_best.max(far_best).map_or(0, |(_, delta)| delta)
+}
+
 /// Encode `values` as a §3b "compressed integer" stream — the exact
 /// inverse of [`decode_int_array`].
 ///
@@ -1088,16 +1114,11 @@ pub fn encode_int_coded(values: &[i32]) -> Vec<u8> {
     // delta so the maximum number of elements take the zero-payload
     // code `0`. Ties break toward the larger delta for determinism.
     let mut prev: i32 = 0;
-    let mut histogram: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
-    for &v in values {
-        *histogram.entry(v.wrapping_sub(prev)).or_insert(0) += 1;
+    let common_delta = most_common_delta(values.iter().map(|&v| {
+        let delta = v.wrapping_sub(prev);
         prev = v;
-    }
-    let common_delta = histogram
-        .iter()
-        .max_by_key(|(delta, n)| (**n, **delta))
-        .map(|(delta, _)| *delta)
-        .unwrap_or(0);
+        i64::from(delta)
+    })) as i32;
 
     let control_bytes = values.len().div_ceil(4);
     let mut control = vec![0u8; control_bytes];
@@ -1612,16 +1633,11 @@ pub fn encode_int_coded64(values: &[i64]) -> Vec<u8> {
         return Vec::new();
     }
     let mut prev: i64 = 0;
-    let mut histogram: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
-    for &v in values {
-        *histogram.entry(v.wrapping_sub(prev)).or_insert(0) += 1;
+    let common_delta = most_common_delta(values.iter().map(|&v| {
+        let delta = v.wrapping_sub(prev);
         prev = v;
-    }
-    let common_delta = histogram
-        .iter()
-        .max_by_key(|(delta, n)| (**n, **delta))
-        .map(|(delta, _)| *delta)
-        .unwrap_or(0);
+        delta
+    }));
 
     let control_bytes = values.len().div_ceil(4);
     let mut control = vec![0u8; control_bytes];

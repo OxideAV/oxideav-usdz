@@ -242,24 +242,60 @@ impl Writer {
 /// CRC-32/ISO-HDLC (poly = 0xEDB88320, init = ~0, xorout = ~0) —
 /// the variant PKZIP uses.
 ///
-/// Implemented as a hand-rolled bit-serial routine. USDZ payloads
-/// are large (multi-MiB textures), so this would normally be a
-/// table-driven implementation; we keep the bit-serial form because
-/// it stays under 30 LOC and avoids the 1 KiB lookup table that
-/// `forbid(unsafe_code)` would otherwise need to stash in a `static`.
-/// Throughput is fine for typical USDZ assets (tens of MB/s on a
-/// debug build, well under the I/O ceiling).
+/// Eight bytes per step: `CRC_TABLES[0]` is the remainder of each
+/// byte value under the reflected polynomial, and `CRC_TABLES[k]`
+/// that remainder carried through `k` further zero bytes, so the
+/// eight lookups of one step fold a whole 64-bit word into the
+/// register. Both the writer (every entry) and the reader (every
+/// entry verified) run this over whole payloads — a package's
+/// throughput is this loop's.
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
-    for &b in data {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
+    let (words, tail) = data.as_chunks::<8>();
+    for word in words {
+        let low = u32::from_le_bytes([word[0], word[1], word[2], word[3]]) ^ crc;
+        crc = CRC_TABLES[7][(low & 0xFF) as usize]
+            ^ CRC_TABLES[6][((low >> 8) & 0xFF) as usize]
+            ^ CRC_TABLES[5][((low >> 16) & 0xFF) as usize]
+            ^ CRC_TABLES[4][(low >> 24) as usize]
+            ^ CRC_TABLES[3][usize::from(word[4])]
+            ^ CRC_TABLES[2][usize::from(word[5])]
+            ^ CRC_TABLES[1][usize::from(word[6])]
+            ^ CRC_TABLES[0][usize::from(word[7])];
+    }
+    for &b in tail {
+        crc = (crc >> 8) ^ CRC_TABLES[0][((crc ^ u32::from(b)) & 0xFF) as usize];
     }
     !crc
 }
+
+/// See [`crc32`].
+const CRC_TABLES: [[u32; 256]; 8] = {
+    let mut tables = [[0u32; 256]; 8];
+    let mut byte = 0usize;
+    while byte < 256 {
+        let mut crc = byte as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            bit += 1;
+        }
+        tables[0][byte] = crc;
+        byte += 1;
+    }
+    let mut k = 1usize;
+    while k < 8 {
+        let mut byte = 0usize;
+        while byte < 256 {
+            let prev = tables[k - 1][byte];
+            tables[k][byte] = (prev >> 8) ^ tables[0][(prev & 0xFF) as usize];
+            byte += 1;
+        }
+        k += 1;
+    }
+    tables
+};
 
 #[cfg(test)]
 mod tests {
@@ -272,6 +308,28 @@ mod tests {
         assert_eq!(crc32(b""), 0x0000_0000);
         assert_eq!(crc32(b"a"), 0xE8B7_BE43);
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn crc32_matches_the_bitwise_definition_at_every_length() {
+        // The definition, one bit at a time.
+        fn bitwise(data: &[u8]) -> u32 {
+            let mut crc = 0xFFFF_FFFFu32;
+            for &b in data {
+                crc ^= u32::from(b);
+                for _ in 0..8 {
+                    let mask = (crc & 1).wrapping_neg();
+                    crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+                }
+            }
+            !crc
+        }
+        let data: Vec<u8> = (0..97u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        for len in 0..=data.len() {
+            assert_eq!(crc32(&data[..len]), bitwise(&data[..len]), "length {len}");
+        }
     }
 
     #[test]
